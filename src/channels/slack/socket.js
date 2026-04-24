@@ -310,9 +310,9 @@ class SlackSocketHandler {
         }
 
         // Fire the investigation via the regular command flow. Queue only holds PagerDuty alerts,
-        // so cliType follows ALERT_CLI (delay alerts bypass the queue).
-        const queueCliType = this.config.alertCli || 'claude';
-        this._processCommand(item.channel_id, item.message_ts, item.prompt, null, item.message_ts, item.message_ts, null, queueCliType)
+        // so the CLI chain follows ALERT_CLI (delay alerts bypass the queue).
+        const queueCliChain = this.config.alertCliChain || ['claude'];
+        this._processCommand(item.channel_id, item.message_ts, item.prompt, null, item.message_ts, item.message_ts, null, queueCliChain)
             .catch(err => {
                 this.logger.error(`Alert queue: failed to start investigation for id=${item.id}: ${err.message}`);
                 this._queueStmts.updateStatus.run('failed', Date.now(), item.id);
@@ -1230,11 +1230,14 @@ ${formatted}`
             ? ` Attached images (read these files for visual context): ${imagePaths.join(' ')}`
             : '';
 
-        // Build prompt via the selected CLI adapter (Claude by default; ALERT_CLI opts into a different CLI)
+        // Build prompt via the first CLI in the configured chain. The alert
+        // prompt syntax is identical across Claude and Codex (both use
+        // `execute X skill with argument Y`), so the first CLI in the chain
+        // is a safe stand-in even if we end up falling back to a later entry.
         const permalink = await this._getPermalink(channelId, messageTs);
         const alertSkill = this.config.alertSkill;
-        const alertCliType = this.config.alertCli || 'claude';
-        const alertAdapter = getCliAdapter(alertCliType);
+        const alertCliChain = this.config.alertCliChain || ['claude'];
+        const alertAdapter = getCliAdapter(alertCliChain[0]);
         const prompt = alertAdapter.buildAlertPrompt({
             skill: alertSkill,
             permalink,
@@ -1312,12 +1315,13 @@ ${formatted}`
             ? ` Attached images (read these files for visual context): ${imagePaths.join(' ')}`
             : '';
 
-        // Build prompt via the selected CLI adapter (DELAY_ALERT_CLI opts into a different CLI)
+        // Build prompt via the first CLI in DELAY_ALERT_CLI (prompt syntax is
+        // CLI-agnostic, so falling back later is safe).
         const text = event.text || '';
         const permalink = await this._getPermalink(channelId, messageTs);
         const skill = this.delayAlertMonitor.skill;
-        const delayCliType = this.config.delayAlertCli || 'claude';
-        const delayAdapter = getCliAdapter(delayCliType);
+        const delayCliChain = this.config.delayAlertCliChain || ['claude'];
+        const delayAdapter = getCliAdapter(delayCliChain[0]);
         const prompt = delayAdapter.buildAlertPrompt({
             skill,
             permalink,
@@ -1335,7 +1339,7 @@ ${formatted}`
         );
 
         // Use the regular command flow — messageTs as threadTs
-        await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs, null, delayCliType);
+        await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs, null, delayCliChain);
     }
 
     async _getPermalink(channelId, messageTs) {
@@ -1380,13 +1384,30 @@ ${formatted}`
 
     // ─── Command Processing ──────────────────────────────────────────
 
-    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliTypeHint = null) {
+    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliHint = null) {
         // Create a say function if one wasn't provided (e.g. alert triggers)
         if (!say) {
             say = async (msg) => {
                 await this.app.client.chat.postMessage({ channel: channelId, thread_ts: threadTs, ...msg });
             };
         }
+
+        // Normalise the CLI hint to a chain. Callers may pass:
+        //   - null / undefined (use @mention keyword or default)
+        //   - a single string (back-compat with pre-chain callers)
+        //   - an array of CLI names (e.g. ['codex', 'claude']) — first is tried
+        //     first; subsequent names are tried only if the previous one hits a
+        //     fatal startup error (codex quota exceeded, etc.).
+        const normaliseChain = (hint) => {
+            if (!hint) return null;
+            if (Array.isArray(hint)) {
+                const chain = hint.map(s => String(s || '').toLowerCase()).filter(Boolean);
+                return chain.length > 0 ? chain : null;
+            }
+            const single = String(hint).toLowerCase();
+            return single ? [single] : null;
+        };
+        const cliChainHint = normaliseChain(cliHint);
         const sessionKey = `${channelId}-${threadTs}`;
         let session = this._getSession(sessionKey);
         let threadContext = null; // Will hold formatted thread messages to prepend
@@ -1394,7 +1415,7 @@ ${formatted}`
         // Guard: slash commands on dead/missing sessions (user @mentions only;
         // alert flows auto-generate `/<skill>` as the first prompt of a new session).
         const isLiveSession = session && this._isTmuxSessionAlive(session.sessionName);
-        if (command.startsWith('/') && !isLiveSession && !(command === '/exit' && session) && !cliTypeHint) {
+        if (command.startsWith('/') && !isLiveSession && !(command === '/exit' && session) && !cliChainHint) {
             const cmd = command.split(/\s/)[0];
             await say({ text: `Session expired. \`${cmd}\` requires an active session — send a message first to start a new one, then use \`${cmd}\`.`, thread_ts: threadTs });
             return;
@@ -1409,23 +1430,45 @@ ${formatted}`
                 // No thread context needed — Claude is already in the conversation
                 this.logger.info(`Existing live session ${session.sessionName}, injecting command directly`);
             } else if (session && !this._isTmuxSessionAlive(session.sessionName)) {
-                // Session in DB but tmux died — recreate with original repo path + original CLI
-                const resumeCliType = session.cliType || 'claude';
-                const resumeAdapter = getCliAdapter(resumeCliType);
-                this.logger.warn(`Tmux session ${session.sessionName} is dead, recreating in ${session.repoPath} (cli=${resumeCliType})...`);
-                await say({ text: `Resuming ${resumeCliType} session in \`${session.repoPath}\`... :rocket:`, thread_ts: threadTs });
+                // Session in DB but tmux died — recreate. Respect the caller's
+                // chain hint if one was supplied (alerts pass the configured
+                // ALERT_CLI chain); otherwise rebuild a chain from the saved
+                // CLI with Claude appended as the unconditional fallback so
+                // the resume isn't stuck on a broken Codex quota.
+                const resumeSavedCli = session.cliType || 'claude';
+                const resumeChain = cliChainHint && cliChainHint.length > 0
+                    ? cliChainHint
+                    : (resumeSavedCli === 'claude' ? ['claude'] : [resumeSavedCli, 'claude']);
+                this.logger.warn(`Tmux session ${session.sessionName} is dead, recreating in ${session.repoPath} (chain=${resumeChain.join('→')})...`);
+                await say({ text: `Resuming session in \`${session.repoPath}\` (CLI chain: ${resumeChain.join(' → ')})... :rocket:`, thread_ts: threadTs });
 
-                const created = await this._createTmuxSession(
-                    session.sessionName,
-                    session.repoPath,
-                    resumeAdapter.buildLaunchCommand(session.sessionName, session.repoPath, sessionKey),
+                const resumeResult = await this._startCliWithFallback({
+                    sessionName: session.sessionName,
+                    repoPath: session.repoPath,
                     sessionKey,
-                    resumeCliType
-                );
-                if (!created) {
-                    await say({ text: 'Failed to create Claude session. Is tmux installed?', thread_ts: threadTs });
+                    cliChain: resumeChain,
+                    onFallback: async ({ failedCli, nextCli, reason }) => {
+                        const body = nextCli
+                            ? `:warning: \`${failedCli}\` failed to start (${reason}) — falling back to \`${nextCli}\`.`
+                            : `:x: \`${failedCli}\` failed to start (${reason}) and no fallback CLI is configured.`;
+                        await say({ text: body, thread_ts: threadTs });
+                    },
+                });
+                if (!resumeResult.ok) {
+                    await say({ text: `Failed to resume session — tried ${resumeChain.join(', ')}. Is tmux installed?`, thread_ts: threadTs });
                     this._deleteSession(sessionKey);
                     return;
+                }
+                // Persist the actually-running CLI on the row so subsequent
+                // polling / injection uses the correct adapter.
+                if (resumeResult.cliType !== resumeSavedCli) {
+                    try {
+                        this.db.prepare('UPDATE sessions SET cli_type = ?, updated_at = ? WHERE session_key = ?')
+                            .run(resumeResult.cliType, Date.now(), sessionKey);
+                        session.cliType = resumeResult.cliType;
+                    } catch (err) {
+                        this.logger.error(`Failed to update cli_type on resume: ${err.message}`);
+                    }
                 }
                 this._touchSession(sessionKey);
                 // Reset claude_session_id so the new session's SessionStart hook can register.
@@ -1447,11 +1490,27 @@ ${formatted}`
                 // Brand new conversation
                 const sessionName = this._generateSessionName(channelId, threadTs);
 
-                // Resolve CLI: alert handlers pass a hint; @mention chat detects per-message
-                // keyword (`start codex from …`). Defaults to 'claude' when neither is set.
-                const cliKeywordMatch = !cliTypeHint && command.match(CLI_KEYWORD_RE);
-                const cliType = cliTypeHint || (cliKeywordMatch ? cliKeywordMatch[1].toLowerCase() : 'claude');
-                const adapter = getCliAdapter(cliType);
+                // Resolve CLI chain. Priority:
+                //   1. Caller-supplied chain (alerts / delay alerts pass the
+                //      configured ALERT_CLI / DELAY_ALERT_CLI chain).
+                //   2. Per-message keyword in @mention chat ("start codex
+                //      from ..."). Keyword starts the chain; Claude is
+                //      appended as the last-resort fallback so users don't
+                //      get stuck on a broken Codex.
+                //   3. Default single-element ['claude'] chain.
+                let cliChain;
+                if (cliChainHint && cliChainHint.length > 0) {
+                    cliChain = cliChainHint;
+                } else {
+                    const cliKeywordMatch = command.match(CLI_KEYWORD_RE);
+                    if (cliKeywordMatch) {
+                        const typed = cliKeywordMatch[1].toLowerCase();
+                        cliChain = typed === 'claude' ? ['claude'] : [typed, 'claude'];
+                    } else {
+                        cliChain = ['claude'];
+                    }
+                }
+                const cliType = cliChain[0];
 
                 // Resolve repo path — check for project name patterns.
                 // Supported:  "start [cli] from root" → uses SLACK_REPO_ROOT directly
@@ -1492,8 +1551,6 @@ ${formatted}`
                     return;
                 }
 
-                const cliCmd = adapter.buildLaunchCommand(sessionName, repoPath, sessionKey);
-
                 // If no project detected from command, check if this is a thread continuation
                 // and use Gemini to detect the project from thread history
                 let prefetchedMessages = null;
@@ -1514,19 +1571,34 @@ ${formatted}`
                 }
 
                 if (!alertMessageTs) {
-                    await say({ text: `Starting ${cliType} session in \`${repoPath}\`... :rocket:`, thread_ts: threadTs });
+                    const chainLabel = cliChain.length > 1 ? `${cliType} (fallback: ${cliChain.slice(1).join(', ')})` : cliType;
+                    await say({ text: `Starting ${chainLabel} session in \`${repoPath}\`... :rocket:`, thread_ts: threadTs });
                 }
 
-                const created = await this._createTmuxSession(sessionName, repoPath, cliCmd, sessionKey, cliType);
-                if (!created) {
+                const startResult = await this._startCliWithFallback({
+                    sessionName,
+                    repoPath,
+                    sessionKey,
+                    cliChain,
+                    onFallback: async ({ failedCli, nextCli, reason }) => {
+                        const body = nextCli
+                            ? `:warning: \`${failedCli}\` failed to start (${reason}) — falling back to \`${nextCli}\`.`
+                            : `:x: \`${failedCli}\` failed to start (${reason}) and no fallback CLI is configured.`;
+                        await say({ text: body, thread_ts: threadTs });
+                    },
+                });
+                if (!startResult.ok) {
                     if (alertMessageTs) {
                         await this._removeReaction(channelId, alertMessageTs, 'eyes');
                         await this._addReaction(channelId, alertMessageTs, 'x');
                     } else {
-                        await say({ text: `Failed to create ${cliType} session. Is tmux installed?`, thread_ts: threadTs });
+                        await say({ text: `Failed to start any CLI. Tried: ${cliChain.join(', ')}.`, thread_ts: threadTs });
                     }
                     return;
                 }
+
+                // Resolved CLI — may differ from the first preference if we fell back.
+                const resolvedCliType = startResult.cliType;
 
                 session = {
                     sessionName,
@@ -1535,7 +1607,7 @@ ${formatted}`
                     repoPath,
                     createdAt: Date.now(),
                     alertMessageTs: alertMessageTs || null,
-                    cliType
+                    cliType: resolvedCliType
                 };
                 this._saveSession(session);
                 if (userId) this._updateLastUserId(`${channelId}-${threadTs}`, userId);
@@ -1658,11 +1730,23 @@ ${formatted}`
     }
 
     async _createTmuxSession(sessionName, repoPath, cliCmd, sessionKey = null, cliType = 'claude') {
+        const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType);
+        return result.ok;
+    }
+
+    // Detailed tmux creation with fatal-error detection. Returns:
+    //   { ok: true,  fatalError: null }    — session ready (or timed out, proceeded anyway)
+    //   { ok: false, fatalError: string }  — adapter's fatalErrorPatterns matched
+    //                                        (e.g. Codex quota exceeded). Tmux
+    //                                        session is killed so caller can retry
+    //                                        with the next CLI in the chain.
+    //   { ok: false, fatalError: null }    — tmux itself failed to launch.
+    async _createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey = null, cliType = 'claude') {
         try {
             execSync('which tmux', { stdio: 'ignore' });
         } catch {
             this.logger.error('tmux is not installed');
-            return false;
+            return { ok: false, fatalError: null };
         }
 
         // Kill existing session with same name if any
@@ -1681,7 +1765,7 @@ ${formatted}`
             exec(cmd, (error) => {
                 if (error) {
                     this.logger.error(`Failed to create tmux session: ${error.message}`);
-                    resolve(false);
+                    resolve({ ok: false, fatalError: null });
                     return;
                 }
                 // Poll until the CLI's TUI reports ready. Each adapter defines
@@ -1690,23 +1774,38 @@ ${formatted}`
                 // on the same line, and Codex may still be loading MCP servers).
                 const readyAdapter = getCliAdapter(cliType);
                 const maxWaitMs = readyAdapter.readinessTimeoutMs || 30000;
+                const fatalPatterns = readyAdapter.fatalErrorPatterns || [];
                 const pollIntervalMs = 1000;
                 let elapsed = 0;
                 const poll = () => {
                     elapsed += pollIntervalMs;
                     try {
-                        const output = execSync(`tmux capture-pane -t ${sessionName} -p -S -50`, {
+                        const output = execSync(`tmux capture-pane -t ${sessionName} -p -S -200`, {
                             encoding: 'utf8',
                             stdio: ['ignore', 'pipe', 'ignore']
                         });
+                        // Fatal error takes precedence over readiness — e.g. Codex
+                        // can render its prompt briefly before the quota banner
+                        // takes over. Abort fast so the fallback CLI can start.
+                        const fatal = fatalPatterns.find(p => p.regex.test(output));
+                        if (fatal) {
+                            this.logger.warn(`${cliType} fatal error detected (${fatal.reason}) after ${elapsed}ms — killing tmux session ${sessionName}`);
+                            try {
+                                execSync(`tmux kill-session -t ${sessionName} 2>/dev/null`);
+                            } catch {
+                                // Already dead
+                            }
+                            resolve({ ok: false, fatalError: fatal.reason });
+                            return;
+                        }
                         if (readyAdapter.isReady && readyAdapter.isReady(output)) {
                             this.logger.info(`${cliType} ready after ${elapsed}ms`);
                             const grace = readyAdapter.postReadyGraceMs || 0;
                             if (grace > 0) {
                                 this.logger.debug(`Post-ready grace: waiting ${grace}ms for ${cliType} TUI to settle`);
-                                setTimeout(() => resolve(true), grace);
+                                setTimeout(() => resolve({ ok: true, fatalError: null }), grace);
                             } else {
-                                resolve(true);
+                                resolve({ ok: true, fatalError: null });
                             }
                             return;
                         }
@@ -1715,7 +1814,7 @@ ${formatted}`
                     }
                     if (elapsed >= maxWaitMs) {
                         this.logger.warn(`${cliType} readiness timeout after ${maxWaitMs}ms, proceeding anyway`);
-                        resolve(true);
+                        resolve({ ok: true, fatalError: null });
                         return;
                     }
                     setTimeout(poll, pollIntervalMs);
@@ -1724,6 +1823,53 @@ ${formatted}`
                 setTimeout(poll, pollIntervalMs);
             });
         });
+    }
+
+    // Walk a CLI preference chain (e.g. ['codex', 'claude']) and try each in
+    // order until one boots cleanly. If a CLI hits a fatal startup error
+    // (quota exceeded, etc.) we kill its tmux session and fire onFallback so
+    // the caller can post a Slack notice before trying the next CLI.
+    //
+    // Returns:
+    //   { ok: true,  cliType: 'claude', fellBackFrom: 'codex' | null }
+    //   { ok: false, cliType: <last tried>, fatalError: string | null }
+    async _startCliWithFallback({ sessionName, repoPath, sessionKey, cliChain, onFallback }) {
+        const chain = (cliChain || []).filter(Boolean);
+        if (chain.length === 0) chain.push('claude');
+
+        let fellBackFrom = null;
+        for (let i = 0; i < chain.length; i++) {
+            const cliType = chain[i];
+            const adapter = getCliAdapter(cliType);
+            const cliCmd = adapter.buildLaunchCommand(sessionName, repoPath, sessionKey);
+            const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType);
+
+            if (result.ok) {
+                return { ok: true, cliType, fellBackFrom };
+            }
+
+            // Non-fatal failure (tmux not installed, launch error) — stop the
+            // chain. Only recover from adapter-declared fatal errors.
+            if (!result.fatalError) {
+                return { ok: false, cliType, fatalError: null };
+            }
+
+            // Fatal — notify caller so they can post a Slack note, then try next.
+            const next = chain[i + 1];
+            if (onFallback) {
+                try {
+                    await onFallback({ failedCli: cliType, nextCli: next || null, reason: result.fatalError });
+                } catch (err) {
+                    this.logger.error(`Fallback notifier threw: ${err.message}`);
+                }
+            }
+            if (!next) {
+                return { ok: false, cliType, fatalError: result.fatalError };
+            }
+            fellBackFrom = fellBackFrom || cliType;
+        }
+
+        return { ok: false, cliType: chain[chain.length - 1], fatalError: null };
     }
 
     async _injectCommand(sessionName, command, cliType = 'claude') {
@@ -2891,11 +3037,11 @@ ${formatted}`
                     ? ` Attached images (read these files for visual context): ${imagePaths.join(' ')}`
                     : '';
 
-                // Build prompt via the selected CLI adapter
+                // Build prompt via the first CLI in the configured chain
                 const permalink = await this._getPermalink(channelId, messageTs);
                 const alertSkill = this.config.alertSkill;
-                const triggerCliType = this.config.alertCli || 'claude';
-                const triggerAdapter = getCliAdapter(triggerCliType);
+                const triggerCliChain = this.config.alertCliChain || ['claude'];
+                const triggerAdapter = getCliAdapter(triggerCliChain[0]);
                 const prompt = triggerAdapter.buildAlertPrompt({
                     skill: alertSkill,
                     permalink,
@@ -2905,7 +3051,7 @@ ${formatted}`
                 });
 
                 // Manual trigger — bypass queue, process immediately
-                await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs, null, triggerCliType);
+                await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs, null, triggerCliChain);
                 res.json({ status: 'investigating', channelId, messageTs });
             } catch (error) {
                 this.logger.error(`Trigger alert error: ${error.message}`);
@@ -2964,11 +3110,11 @@ ${formatted}`
                     ? ` Attached images (read these files for visual context): ${imagePaths.join(' ')}`
                     : '';
 
-                // Build prompt via the selected CLI adapter (DELAY_ALERT_CLI opts into a different CLI)
+                // Build prompt via the first CLI in the DELAY_ALERT_CLI chain
                 const permalink = await this._getPermalink(channelId, messageTs);
                 const skill = this.delayAlertMonitor.skill;
-                const triggerDelayCliType = this.config.delayAlertCli || 'claude';
-                const triggerDelayAdapter = getCliAdapter(triggerDelayCliType);
+                const triggerDelayCliChain = this.config.delayAlertCliChain || ['claude'];
+                const triggerDelayAdapter = getCliAdapter(triggerDelayCliChain[0]);
                 const prompt = triggerDelayAdapter.buildAlertPrompt({
                     skill,
                     permalink,
@@ -2989,7 +3135,7 @@ ${formatted}`
                 );
 
                 // Use the regular command flow
-                await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs, null, triggerDelayCliType);
+                await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs, null, triggerDelayCliChain);
                 res.json({ status: 'investigating', channelId, messageTs, skill: skill || 'none' });
             } catch (error) {
                 this.logger.error(`Trigger delay alert error: ${error.message}`);
@@ -3199,8 +3345,8 @@ ${formatted}`
                         : '';
                     const text = message.text || '';
                     const alertSkill = this.config.alertSkill;
-                    const webhookCliType = this.config.alertCli || 'claude';
-                    const webhookAdapter = getCliAdapter(webhookCliType);
+                    const webhookCliChain = this.config.alertCliChain || ['claude'];
+                    const webhookAdapter = getCliAdapter(webhookCliChain[0]);
                     const prompt = webhookAdapter.buildAlertPrompt({
                         skill: alertSkill,
                         permalink,

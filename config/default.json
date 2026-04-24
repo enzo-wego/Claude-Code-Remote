@@ -13,7 +13,7 @@
     }
   },
   "cli": {
-    "alertCli": "claude",
-    "delayAlertCli": "claude"
+    "alertCliChain": ["claude"],
+    "delayAlertCliChain": ["claude"]
   }
 }

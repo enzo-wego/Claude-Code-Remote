@@ -157,6 +157,21 @@ module.exports = {
         /Starting MCP servers/i
     ],
 
+    // Fatal errors that should abort the tmux session immediately so the
+    // fallback CLI (if any) can take over. Detected during readiness polling
+    // in socket.js — on match, we kill the tmux session and try the next CLI
+    // in the configured chain instead of waiting for readinessTimeoutMs.
+    fatalErrorPatterns: [
+        {
+            // ChatGPT Plus / Pro quota exhaustion. Codex prints a banner like:
+            //   "You've hit your usage limit. To get more access now, send a
+            //    request to your admin or try again at 1:02 PM."
+            // No prompt is ever rendered after this, so the session hangs.
+            regex: /You['’]ve hit your usage limit/i,
+            reason: 'codex usage limit reached',
+        },
+    ],
+
     confirmationPrompts: [],
     handlesConfirmationPrompts: false,
 

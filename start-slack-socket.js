@@ -20,6 +20,29 @@ if (fs.existsSync(envPath)) {
 
 const logger = new Logger('Slack-Socket-Server');
 
+// Parse a CSV CLI chain like "codex,claude" into a deduped lowercased array.
+// Used for ALERT_CLI / DELAY_ALERT_CLI so the bot can fall back to the next
+// CLI in the list when the preferred one fails to start (e.g. Codex quota
+// exceeded). A single value ("codex") still works — it's just a one-element
+// chain with no fallback. Empty / unset → default chain.
+function parseCliChain(raw, defaultChain = ['claude']) {
+    const parts = (raw || '')
+        .toLowerCase()
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+    if (parts.length === 0) return defaultChain.slice();
+    const seen = new Set();
+    const chain = [];
+    for (const p of parts) {
+        if (!seen.has(p)) {
+            seen.add(p);
+            chain.push(p);
+        }
+    }
+    return chain;
+}
+
 // Load configuration
 const config = {
     botToken: process.env.SLACK_BOT_TOKEN,
@@ -34,7 +57,9 @@ const config = {
     // Alert monitoring
     monitorChannels: process.env.MONITOR_CHANNELS || '',
     alertSkill: process.env.ALERT_SKILL || '',
-    alertCli: (process.env.ALERT_CLI || '').toLowerCase() || 'claude',
+    // CSV chain: `ALERT_CLI=codex,claude` → try Codex first, fall back to Claude
+    // on fatal startup errors (e.g. quota exceeded). Single value still works.
+    alertCliChain: parseCliChain(process.env.ALERT_CLI),
     sessionInactivityTimeoutMs: parseInt(process.env.SESSION_INACTIVITY_TIMEOUT_MS) || 300000,
     pollerTimeoutMs: parseInt(process.env.POLLER_TIMEOUT_MS) || 1800000, // 30 min
     alertMaxConcurrent: parseInt(process.env.ALERT_MAX_CONCURRENT) || 1,
@@ -47,7 +72,8 @@ const config = {
     delayAlertWindowMs: process.env.DELAY_ALERT_WINDOW_MS || '3600000',
     delayAlertTaskPatterns: process.env.DELAY_ALERT_TASK_PATTERNS || '',
     delayAlertSkill: process.env.DELAY_ALERT_SKILL || 'one:pay-ops-tax-production',
-    delayAlertCli: (process.env.DELAY_ALERT_CLI || '').toLowerCase() || 'claude',
+    // CSV chain, same semantics as ALERT_CLI.
+    delayAlertCliChain: parseCliChain(process.env.DELAY_ALERT_CLI),
     // Daily summary
     dailySummaryChannels: process.env.DAILY_SUMMARY_CHANNELS || '',
     dailySummaryTime: process.env.DAILY_SUMMARY_TIME || '07:00',
@@ -167,14 +193,14 @@ async function start() {
     logger.info(`- HTTP Port: ${config.httpPort}`);
     logger.info(`- Monitor Channels: ${config.monitorChannels || 'None'}`);
     logger.info(`- Alert Skill: ${config.alertSkill || 'None'}`);
-    logger.info(`- Alert CLI: ${config.alertCli}`);
+    logger.info(`- Alert CLI chain: ${config.alertCliChain.join(' → ')}`);
     logger.info(`- Alert Max Concurrent: ${config.alertMaxConcurrent}`);
     logger.info(`- PagerDuty: ${config.pagerdutyApiToken ? 'Configured' : 'Not configured'}`);
     logger.info(`- Session Inactivity Timeout: ${config.sessionInactivityTimeoutMs}ms`);
     logger.info(`- Poller Timeout: ${config.pollerTimeoutMs}ms`);
     logger.info(`- Delay Monitor Channels: ${config.monitorDelayChannels || 'None'}`);
     logger.info(`- Delay Alert Skill: ${config.delayAlertSkill}`);
-    logger.info(`- Delay Alert CLI: ${config.delayAlertCli}`);
+    logger.info(`- Delay Alert CLI chain: ${config.delayAlertCliChain.join(' → ')}`);
     logger.info(`- Delay Alert Threshold: ${config.delayAlertThreshold} alerts in ${config.delayAlertWindowMs}ms`);
     logger.info(`- Daily Summary: ${config.dailySummaryChannels ? `${config.dailySummaryTime} → ${config.dailySummaryChannels}` : 'Not configured'}`);
     logger.info(`- App Mode: ${config.appMode}`);

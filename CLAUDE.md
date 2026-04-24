@@ -126,9 +126,9 @@ The filtering happens in `_setupListeners()` in `src/channels/slack/socket.js`. 
 
 The bot runs Claude Code by default but can run Codex CLI (or any future adapter) **per feature**:
 
-- `ALERT_CLI=claude|codex` — which CLI to launch for PagerDuty alert investigations (default `claude`)
-- `DELAY_ALERT_CLI=claude|codex` — which CLI to launch for Airflow delay alert investigations (default `claude`)
-- **Per-message override** in @mention chat: `start codex from project xxx`, `start claude from root`, `start codex`. The CLI keyword is stripped before the prompt is sent, and the chosen CLI is saved on the session row (`cli_type`) so follow-up messages in the same thread reuse it.
+- `ALERT_CLI=<csv chain>` — CLI(s) to launch for PagerDuty alert investigations. Accepts a single name (`claude`) or a comma-separated fallback chain (`codex,claude`). The first CLI is tried first; if it hits a fatal startup error (e.g. Codex quota exceeded — pattern declared on each adapter's `fatalErrorPatterns`), the bot kills tmux, posts a Slack notice, and retries with the next CLI. Default: `claude`.
+- `DELAY_ALERT_CLI=<csv chain>` — same semantics, for Airflow delay investigations. Default: `claude`.
+- **Per-message override** in @mention chat: `start codex from project xxx`, `start claude from root`, `start codex`. The CLI keyword is stripped before the prompt is sent; the resolved CLI (after any fallback) is saved on the session row (`cli_type`) so follow-up messages in the same thread reuse it. When the user types a non-Claude CLI keyword, Claude is automatically appended as the final fallback.
 - **Daily summary** stays on `@anthropic-ai/claude-agent-sdk` — no tmux, no Codex variant.
 
 Unknown CLI names fall back to Claude via `getCliAdapter`'s default, so a typo is safe. Skill names (`ALERT_SKILL`, `DELAY_ALERT_SKILL`) are shared across CLIs — the adapter only swaps the invocation syntax (`execute {skill} skill with argument …` vs `/{skill} …`).
@@ -138,7 +138,7 @@ Unknown CLI names fall back to Claude via `getCliAdapter`'s default, so a typo i
 Environment variables in `.env` (see `.env.example`):
 - **Slack**: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID`, `SLACK_REPO_PATH`, `SLACK_REPO_ROOT`, `SLACK_CLAUDE_COMMAND`, `SLACK_WHITELIST`, `SLACK_HTTP_PORT`
 - **App Mode**: `APP_MODE` (`local`, `cloud`, `all`)
-- **CLI Selection**: `ALERT_CLI`, `DELAY_ALERT_CLI` (both default `claude`); optional `CODEX_COMMAND` overrides the default `codex --dangerously-bypass-approvals-and-sandbox`
+- **CLI Selection**: `ALERT_CLI`, `DELAY_ALERT_CLI` accept a single CLI or a CSV fallback chain (e.g. `codex,claude`). Both default to `claude`. `CODEX_COMMAND` overrides the default `codex --dangerously-bypass-approvals-and-sandbox`
 - **Alert Monitoring**: `MONITOR_CHANNELS`, `ALERT_SKILL`, `PAGERDUTY_API_TOKEN`, `PAGERDUTY_FROM_EMAIL`
 - **Daily Summary**: `DAILY_SUMMARY_CHANNELS`, `DAILY_SUMMARY_TIME`, `DAILY_SUMMARY_MODEL`, `SLACK_XOXC_TOKEN`, `SLACK_XOXD_TOKEN`
 - **Session**: `SESSION_INACTIVITY_TIMEOUT_MS`, `POLLER_TIMEOUT_MS`
