@@ -119,8 +119,23 @@ module.exports = {
     // budget is generous.
     readinessTimeoutMs: 90000,
 
+    // After isReady() returns true, wait this long before pasting. Codex prints
+    // late banners ("Under-development features enabled", etc.) asynchronously
+    // after the prompt is first rendered; a paste that lands during that
+    // redraw can end up with the first Enter silently dropped. This grace
+    // window lets the TUI settle.
+    postReadyGraceMs: 2000,
+
     isReady(output) {
         if (/Starting MCP servers/.test(output)) return false;
+        // Under-development warning is printed asynchronously after MCP boot.
+        // Only mark ready once the warning has fully printed AND a blank line
+        // separates it from the prompt — otherwise a paste racing the warning
+        // redraw can sit unsubmitted in the input box.
+        if (/Under-development features enabled/.test(output)
+            && !/suppress_unstable_features_warning[^\n]*\n\s*\n/.test(output)) {
+            return false;
+        }
         return /\n\s*› /.test(output);
     },
 

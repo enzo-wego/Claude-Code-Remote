@@ -1701,7 +1701,13 @@ ${formatted}`
                         });
                         if (readyAdapter.isReady && readyAdapter.isReady(output)) {
                             this.logger.info(`${cliType} ready after ${elapsed}ms`);
-                            resolve(true);
+                            const grace = readyAdapter.postReadyGraceMs || 0;
+                            if (grace > 0) {
+                                this.logger.debug(`Post-ready grace: waiting ${grace}ms for ${cliType} TUI to settle`);
+                                setTimeout(() => resolve(true), grace);
+                            } else {
+                                resolve(true);
+                            }
                             return;
                         }
                     } catch {
@@ -1799,7 +1805,7 @@ ${formatted}`
                 const isWorking = indicatorHit(output);
                 // Also check if the CLI already finished (prompt visible again) — means it
                 // processed the command very quickly (e.g. "hi") before we could detect working state
-                const hasPrompt = /^[)❯>]\s*$/m.test(output);
+                const hasPrompt = /^[)❯>›]\s*$/m.test(output);
                 if (isWorking) {
                     if (attempt > 0) {
                         this.logger.info(`Enter accepted on attempt ${attempt + 1} for ${sessionName}`);
@@ -1831,10 +1837,21 @@ ${formatted}`
             }
             // After all retries, check one final time — if Claude shows prompt, it processed the command
             const finalOutput = this._captureOutput(sessionName);
-            const finalHasPrompt = /^[)❯>]\s*$/m.test(finalOutput);
+            const finalHasPrompt = /^[)❯>›]\s*$/m.test(finalOutput);
             if (finalHasPrompt) {
                 this.logger.info(`Prompt visible after all Enter attempts — Claude likely already responded for ${sessionName}`);
                 return;
+            }
+            // Silent-drop detection: our literal first line is still visible in
+            // the pane and the CLI never started working. This is the Codex
+            // failure mode where paste lands but Enter never submits (a late
+            // banner redraw swallowed it). Clear the stuck input and fail
+            // loudly so the alert reaction flips to ✗ and the user knows.
+            const finalFirstLine = command.split('\n')[0].substring(0, 40);
+            if (finalFirstLine && finalOutput.includes(finalFirstLine) && !indicatorHit(finalOutput)) {
+                try { execSync(`tmux send-keys -t ${sessionName} C-u`); } catch { /* ignore */ }
+                this.logger.error(`Enter dropped — command still in ${cliType} input box after ${maxAttempts} attempts for ${sessionName}`);
+                throw new Error(`${cliType} did not accept Enter — command left unsent. CLI may still be initializing.`);
             }
             this.logger.error(`Enter may not have been accepted after ${maxAttempts} attempts for ${sessionName}`);
         } finally {
