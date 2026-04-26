@@ -1688,7 +1688,13 @@ ${formatted}`
             let lastInjectError = null;
             while (!injected) {
                 try {
-                    await this._injectCommand(session.sessionName, fullCommand, session.cliType);
+                    const baseline = await this._injectCommand(session.sessionName, fullCommand, session.cliType);
+                    // Guard against silent rejection (Codex at usage limit, Enter
+                    // dropped by late banner redraw, etc.). _injectCommand can
+                    // succeed because paste landed, but the CLI may never start
+                    // a turn — without this check the poller would sit idle for
+                    // 30 min and no fallback would fire.
+                    await this._verifyTurnProgress(session.sessionName, session.cliType, baseline);
                     injected = true;
                 } catch (injectError) {
                     lastInjectError = injectError;
@@ -2038,7 +2044,7 @@ ${formatted}`
                     if (attempt > 0) {
                         this.logger.info(`Enter accepted on attempt ${attempt + 1} for ${sessionName}`);
                     }
-                    return;
+                    return preInjectOutput;
                 }
                 if (hasPrompt && attempt >= 1) {
                     // Prompt visible after at least 2 Enter attempts — Claude likely processed
@@ -2059,7 +2065,7 @@ ${formatted}`
                         continue;
                     }
                     this.logger.info(`Prompt visible after Enter attempt ${attempt + 1} — Claude likely already responded for ${sessionName}`);
-                    return;
+                    return preInjectOutput;
                 }
                 this.logger.warn(`Enter not confirmed (attempt ${attempt + 1}/${maxAttempts}), retrying for ${sessionName}`);
             }
@@ -2068,7 +2074,7 @@ ${formatted}`
             const finalHasPrompt = /^[)❯>›]\s*$/m.test(finalOutput);
             if (finalHasPrompt) {
                 this.logger.info(`Prompt visible after all Enter attempts — Claude likely already responded for ${sessionName}`);
-                return;
+                return preInjectOutput;
             }
             // Silent-drop detection: a paste is still sitting in the input
             // box and the CLI never started working. This is the failure mode
@@ -2090,9 +2096,62 @@ ${formatted}`
                 throw new Error(`${cliType} did not accept Enter — command left unsent. CLI may still be initializing.`);
             }
             this.logger.error(`Enter may not have been accepted after ${maxAttempts} attempts for ${sessionName}`);
+            return preInjectOutput;
         } finally {
             // Clean up temp file
             try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+        }
+    }
+
+    // After _injectCommand returns "successfully" (paste landed, Enter sent),
+    // verify the CLI actually started a turn. Catches silent input rejection
+    // — e.g. Codex at usage limit accepts the bracketed-paste indicator and
+    // then drops Enter, leaving an empty prompt that would otherwise sit
+    // until the 30-min poller timeout. Throws so the inject-fail fallback in
+    // _processCommand can switch to the next CLI in injectChain.
+    //
+    // Signal we trust: scrollback ABOVE the live TUI grew. Real turn output
+    // streams into scrollback; transient banners (usage-limit modal, paste
+    // placeholder, "esc to interrupt" flashes) all live in the bottom rows
+    // of the pane and don't commit to scrollback. The bottom 10 lines also
+    // contain the input box, footer (time/context %), and rotating hint
+    // line — too noisy to compare against baseline. Strip them and compare
+    // only the upper region.
+    async _verifyTurnProgress(sessionName, cliType, baseline, timeoutMs = 90000) {
+        const adapter = getCliAdapter(cliType);
+        const fatalPatterns = adapter.fatalErrorPatterns || [];
+        const aboveTui = (text) => {
+            const lines = (text || '').split('\n');
+            return lines.slice(0, Math.max(0, lines.length - 10))
+                .join('\n')
+                .replace(/\s+/g, ' ')
+                .trim();
+        };
+        const baselineUpper = aboveTui(baseline);
+        const start = Date.now();
+        const intervalMs = 2000;
+        // Initial settle — paste retries and Enter keystrokes leave the TUI
+        // briefly noisy.
+        await new Promise(r => setTimeout(r, intervalMs));
+        while (true) {
+            const output = this._captureOutput(sessionName);
+            // Authoritative signal first: the CLI itself prints a fatal error
+            // banner (e.g. Codex's "You've hit your usage limit"). When at
+            // quota, Codex still echoes the pasted prompt into the pane,
+            // which would otherwise look like real scrollback growth and
+            // hide the failure.
+            const fatal = fatalPatterns.find(p => p.regex.test(output));
+            if (fatal) {
+                throw new Error(`${cliType} ${fatal.reason}`);
+            }
+            const currentUpper = aboveTui(output);
+            if (currentUpper.length > baselineUpper.length + 50 && currentUpper !== baselineUpper) {
+                return;
+            }
+            if (Date.now() - start >= timeoutMs) {
+                throw new Error(`${cliType} accepted the paste but never produced output within ${Math.round(timeoutMs / 1000)}s — input was silently rejected (likely usage limit or dropped Enter)`);
+            }
+            await new Promise(r => setTimeout(r, intervalMs));
         }
     }
 
