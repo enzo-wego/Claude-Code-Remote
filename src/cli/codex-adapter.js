@@ -150,6 +150,11 @@ module.exports = {
     ],
     workingRegexes: [],
 
+    // Codex collapses bracketed pastes behind a "[Pasted Content N chars]"
+    // placeholder, so checking for the literal command text never matches.
+    // _injectCommand uses these to confirm the paste landed.
+    pasteLandedIndicators: [/\[Pasted Content \d+ chars?\]/i],
+
     // Lines matching these patterns are stripped from the working-state
     // detection window. Used to suppress the MCP startup banner that would
     // otherwise look like a live turn.

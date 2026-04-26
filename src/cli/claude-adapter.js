@@ -96,6 +96,11 @@ module.exports = {
         return `${fallbackIntro}: ${snippet}${imageInstruction}`;
     },
 
+    // Patterns the bracketed-paste handler renders into the pane on success.
+    // _injectCommand checks these to confirm a paste actually landed before
+    // sending Enter. Claude shows "[Pasted text +N lines]" for multi-line input.
+    pasteLandedIndicators: [/Pasted text/i],
+
     // Substrings checked (case-insensitive) against tmux output to detect "the CLI is busy".
     // Used both by _injectCommand (paste/Enter verification) and by _pollForResponse.
     workingIndicators: [

@@ -1411,6 +1411,12 @@ ${formatted}`
         const sessionKey = `${channelId}-${threadTs}`;
         let session = this._getSession(sessionKey);
         let threadContext = null; // Will hold formatted thread messages to prepend
+        // Tracks the still-untried CLIs starting at the currently-running one.
+        // Set after _startCliWithFallback succeeds; consulted on inject failure
+        // so a paste-rejecting CLI can hand off to the next one in the chain.
+        // Stays null on existing-live-session injects (no fallback there —
+        // mid-conversation CLI swap would lose context).
+        let injectChain = null;
 
         // Guard: slash commands on dead/missing sessions (user @mentions only;
         // alert flows auto-generate `/<skill>` as the first prompt of a new session).
@@ -1470,6 +1476,10 @@ ${formatted}`
                         this.logger.error(`Failed to update cli_type on resume: ${err.message}`);
                     }
                 }
+                // Surface the remaining chain so a paste-rejection on the
+                // first inject can fall back further (e.g. resumed Codex
+                // accepted readiness but won't take input → switch to Claude).
+                injectChain = resumeResult.remainingChain || [resumeResult.cliType];
                 this._touchSession(sessionKey);
                 // Reset claude_session_id so the new session's SessionStart hook can register.
                 // Without this, COALESCE preserves the dead session's ID and the Stop hook
@@ -1599,6 +1609,9 @@ ${formatted}`
 
                 // Resolved CLI — may differ from the first preference if we fell back.
                 const resolvedCliType = startResult.cliType;
+                // Surface the remaining chain so the inject step can fall back
+                // further if the resolved CLI accepts readiness but rejects paste.
+                injectChain = startResult.remainingChain || [resolvedCliType];
 
                 session = {
                     sessionName,
@@ -1663,17 +1676,74 @@ ${formatted}`
                 fullCommand = `Here is the Slack thread discussion for context:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
             }
 
-            // Inject the command into the tmux session
-            try {
-                await this._injectCommand(session.sessionName, fullCommand, session.cliType);
-            } catch (injectError) {
-                this.logger.error(`Injection failed for ${session.sessionName}: ${injectError.message}`);
+            // Inject the command into the tmux session.
+            //
+            // If injection fails (e.g. the CLI accepted readiness but rejects
+            // the paste — Codex's slow-startup race) and we have remaining
+            // CLIs in the chain from the start step, kill tmux, restart with
+            // the next CLI, and retry the inject. Skipped for existing live
+            // sessions (injectChain stays null there) so a mid-conversation
+            // failure doesn't silently lose context by switching CLIs.
+            let injected = false;
+            let lastInjectError = null;
+            while (!injected) {
+                try {
+                    await this._injectCommand(session.sessionName, fullCommand, session.cliType);
+                    injected = true;
+                } catch (injectError) {
+                    lastInjectError = injectError;
+                    this.logger.error(`Injection failed for ${session.sessionName} (cli=${session.cliType}): ${injectError.message}`);
+
+                    const nextCli = injectChain && injectChain.length > 1 ? injectChain[1] : null;
+                    if (!nextCli) break;
+
+                    const failedCli = session.cliType;
+                    try { execSync(`tmux kill-session -t ${session.sessionName} 2>/dev/null`); } catch { /* already gone */ }
+
+                    await say({
+                        text: `:repeat: \`${failedCli}\` couldn't accept the prompt (${injectError.message}) — retrying with \`${nextCli}\`...`,
+                        thread_ts: threadTs,
+                    });
+
+                    const retryChain = injectChain.slice(1);
+                    const retryResult = await this._startCliWithFallback({
+                        sessionName: session.sessionName,
+                        repoPath: session.repoPath,
+                        sessionKey,
+                        cliChain: retryChain,
+                        onFallback: async ({ failedCli: fc, nextCli: nc, reason }) => {
+                            const body = nc
+                                ? `:warning: \`${fc}\` failed to start (${reason}) — falling back to \`${nc}\`.`
+                                : `:x: \`${fc}\` failed to start (${reason}) and no fallback CLI is configured.`;
+                            await say({ text: body, thread_ts: threadTs });
+                        },
+                    });
+
+                    if (!retryResult.ok) {
+                        lastInjectError = new Error(`Fallback CLI \`${nextCli}\` failed to start: ${retryResult.fatalError || 'launch error'}`);
+                        break;
+                    }
+
+                    // Update DB + in-memory session to the newly-running CLI.
+                    try {
+                        this.db.prepare('UPDATE sessions SET cli_type = ?, updated_at = ? WHERE session_key = ?')
+                            .run(retryResult.cliType, Date.now(), sessionKey);
+                    } catch (err) {
+                        this.logger.error(`Failed to update cli_type after inject fallback: ${err.message}`);
+                    }
+                    session.cliType = retryResult.cliType;
+                    injectChain = retryResult.remainingChain || [retryResult.cliType];
+                    // Loop continues with the new CLI.
+                }
+            }
+
+            if (!injected) {
+                const message = lastInjectError ? lastInjectError.message : 'unknown error';
                 if (session.alertMessageTs) {
                     await this._removeReaction(channelId, session.alertMessageTs, 'eyes');
                     await this._addReaction(channelId, session.alertMessageTs, 'x');
                 }
-                await say({ text: `:warning: ${injectError.message}. Try sending your message again.`, thread_ts: threadTs });
-                // Restart session timeout so it gets cleaned up
+                await say({ text: `:warning: ${message}. Try sending your message again.`, thread_ts: threadTs });
                 this._startSessionTimeout(sessionKey);
                 return;
             }
@@ -1831,8 +1901,12 @@ ${formatted}`
     // the caller can post a Slack notice before trying the next CLI.
     //
     // Returns:
-    //   { ok: true,  cliType: 'claude', fellBackFrom: 'codex' | null }
+    //   { ok: true,  cliType: 'claude', fellBackFrom: 'codex' | null, remainingChain: ['claude', ...] }
     //   { ok: false, cliType: <last tried>, fatalError: string | null }
+    //
+    // `remainingChain` starts at the resolved CLI and includes any CLIs that
+    // weren't tried yet. The caller can use it to fall back further if the
+    // resolved CLI later fails to accept input (e.g. paste rejection).
     async _startCliWithFallback({ sessionName, repoPath, sessionKey, cliChain, onFallback }) {
         const chain = (cliChain || []).filter(Boolean);
         if (chain.length === 0) chain.push('claude');
@@ -1845,7 +1919,7 @@ ${formatted}`
             const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType);
 
             if (result.ok) {
-                return { ok: true, cliType, fellBackFrom };
+                return { ok: true, cliType, fellBackFrom, remainingChain: chain.slice(i) };
             }
 
             // Non-fatal failure (tmux not installed, launch error) — stop the
@@ -1917,13 +1991,21 @@ ${formatted}`
                 await new Promise(r => setTimeout(r, baseDelay + perLineDelay));
 
                 // Verify paste appeared in the pane — check multiple indicators:
-                // 1. Claude shows "[Pasted text" banner for multi-line pastes
-                // 2. The first line of the command appears in the visible pane
-                // 3. The CLI already started working (paste + auto-submit succeeded)
+                // 1. Adapter-declared paste banner (Claude: "Pasted text",
+                //    Codex: "[Pasted Content N chars]" — different TUIs render
+                //    different placeholders, so each adapter declares its own).
+                // 2. The first line of the command appears verbatim in the
+                //    visible pane (works only when the TUI doesn't collapse
+                //    pastes behind a placeholder; harmless when it does).
+                // 3. The CLI already started working (paste + auto-submit succeeded).
                 const output = this._captureOutput(sessionName);
                 const firstLine = command.split('\n')[0].substring(0, 40);
                 const isAlreadyWorking = indicatorHit(output);
-                if (output.includes('Pasted text') || output.includes(firstLine) || isAlreadyWorking) {
+                const pasteIndicators = adapter.pasteLandedIndicators || [/Pasted text/i];
+                const pasteIndicatorMatched = pasteIndicators.some(p =>
+                    typeof p === 'string' ? output.includes(p) : p.test(output)
+                );
+                if (pasteIndicatorMatched || output.includes(firstLine) || isAlreadyWorking) {
                     if (attempt > 0) {
                         this.logger.info(`Paste landed on attempt ${attempt + 1} for ${sessionName}${isAlreadyWorking ? ' (already working)' : ''}`);
                     }
@@ -1988,13 +2070,21 @@ ${formatted}`
                 this.logger.info(`Prompt visible after all Enter attempts — Claude likely already responded for ${sessionName}`);
                 return;
             }
-            // Silent-drop detection: our literal first line is still visible in
-            // the pane and the CLI never started working. This is the Codex
-            // failure mode where paste lands but Enter never submits (a late
-            // banner redraw swallowed it). Clear the stuck input and fail
-            // loudly so the alert reaction flips to ✗ and the user knows.
+            // Silent-drop detection: a paste is still sitting in the input
+            // box and the CLI never started working. This is the failure mode
+            // where paste lands but Enter never submits (a late banner redraw
+            // swallowed it). Detect via adapter-declared paste indicators or
+            // the literal first line — Codex hides the content behind a
+            // placeholder, so the indicator regex is the only signal there.
+            // Clear the stuck input and fail loudly so the alert reaction
+            // flips to ✗ and the user knows.
             const finalFirstLine = command.split('\n')[0].substring(0, 40);
-            if (finalFirstLine && finalOutput.includes(finalFirstLine) && !indicatorHit(finalOutput)) {
+            const finalPasteIndicators = adapter.pasteLandedIndicators || [/Pasted text/i];
+            const finalPasteVisible = finalPasteIndicators.some(p =>
+                typeof p === 'string' ? finalOutput.includes(p) : p.test(finalOutput)
+            );
+            const stuckInInput = finalPasteVisible || (finalFirstLine && finalOutput.includes(finalFirstLine));
+            if (stuckInInput && !indicatorHit(finalOutput)) {
                 try { execSync(`tmux send-keys -t ${sessionName} C-u`); } catch { /* ignore */ }
                 this.logger.error(`Enter dropped — command still in ${cliType} input box after ${maxAttempts} attempts for ${sessionName}`);
                 throw new Error(`${cliType} did not accept Enter — command left unsent. CLI may still be initializing.`);
