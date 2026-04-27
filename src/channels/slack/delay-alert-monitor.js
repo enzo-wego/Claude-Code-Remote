@@ -207,6 +207,14 @@ class DelayAlertMonitor {
         const existing = this._counterStmts.get.get(dagName);
 
         if (existing) {
+            // Defense-in-depth dedup: Slack can redeliver the same event; if the
+            // caller forgets to dedup at the listener, we still don't double-count
+            // the same message_ts.
+            if (existing.last_message_ts === messageTs) {
+                this.logger.info(`Counter for ${dagName}: ignoring redelivery of ts=${messageTs} (count stays at ${existing.count}/${this.threshold})`);
+                return { count: existing.count, triggered: false };
+            }
+
             const elapsed = now - existing.first_seen_at;
 
             if (elapsed > this.windowMs) {

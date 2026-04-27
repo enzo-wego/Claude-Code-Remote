@@ -1288,6 +1288,19 @@ ${formatted}`
 
         const messageTs = event.ts;
 
+        // Dedup: Slack Socket Mode can redeliver the same event (WebSocket reconnect,
+        // multiple connections, retry-on-no-ACK). Without this guard a single Airflow
+        // alert can be counted multiple times and falsely trip the threshold.
+        if (!this._handledDelayTs) this._handledDelayTs = new Set();
+        if (this._handledDelayTs.has(messageTs)) {
+            this.logger.info(`Delay alert dedup: skipping redelivery of ts=${messageTs}`);
+            return;
+        }
+        this._handledDelayTs.add(messageTs);
+        if (this._handledDelayTs.size > 200) {
+            this._handledDelayTs = new Set([...this._handledDelayTs].slice(-100));
+        }
+
         // Increment counter (persisted to SQLite) — incrementCounter logs the N/threshold progress
         const { count, triggered } = this.delayAlertMonitor.incrementCounter(alertInfo.dag, channelId, messageTs);
 
