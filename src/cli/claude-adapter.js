@@ -103,17 +103,22 @@ module.exports = {
 
     // Substrings checked (case-insensitive) against tmux output to detect "the CLI is busy".
     // Used both by _injectCommand (paste/Enter verification) and by _pollForResponse.
+    // Generic English words ('thinking', 'working', 'processing') are deliberately
+    // omitted — they false-match in answer bodies (e.g. "blocking re-processing"
+    // → matches 'processing' → poller stuck working=true forever, never flushes).
+    // The timer regex below is the reliable signal; verbs only catch the brief
+    // window before the first `· ↑/↓ N tokens` chunk renders.
     workingIndicators: [
-        'brewing', 'thinking', 'working', 'clauding', 'processing',
-        'flibbertigibbeting', 'esc to interrupt', '● skill(', 'crunching',
-        'metamorphosing', 'burrowing', 'running…', '⏳'
+        'brewing', 'clauding', 'flibbertigibbeting', 'esc to interrupt',
+        '● skill(', 'crunching', 'metamorphosing', 'burrowing', 'running…', '⏳'
     ],
 
     // Extra regexes evaluated against lowercased tail text. Claude Code renders a
-    // per-turn timer like "(54s · ↓ 331 tokens)" that always shows while the
-    // agent is thinking — a reliable signal even when the verb words rotate.
+    // per-turn timer like "(54s · ↑ 12 tokens)" or "(54s · ↓ 331 tokens)" that
+    // always shows while the agent is active — a reliable signal even when the
+    // verb words rotate. Match either arrow so we cover the input phase too.
     workingRegexes: [
-        /\(\d+[sm]\d*s?\s+·\s+↓/
+        /\(\d+[sm]\d*s?\s+·\s+[↑↓]/
     ],
 
     // Substrings that indicate the CLI is waiting for numbered-choice / yes-no confirmation.
@@ -146,10 +151,18 @@ module.exports = {
 
         const script = hookScriptPath();
         const quoted = script.includes(' ') ? `"${script}"` : script;
+        // Pin to the absolute path of the node binary running this installer so
+        // hooks can't pick up a different node from the user's PATH at runtime.
+        // Claude Code spawns hook commands via the pane's shell, where `node`
+        // may resolve to a newer version than the one that compiled
+        // better-sqlite3 — the require() throws ABI-mismatch and the hook
+        // exits silently, dropping every Slack notification.
+        const nodeBin = process.execPath;
+        const nodeQuoted = nodeBin.includes(' ') ? `"${nodeBin}"` : nodeBin;
         const commands = {
-            SessionStart: `node ${quoted} session_start`,
-            Stop: `node ${quoted} completed`,
-            SubagentStop: `node ${quoted} waiting`,
+            SessionStart: `${nodeQuoted} ${quoted} session_start`,
+            Stop: `${nodeQuoted} ${quoted} completed`,
+            SubagentStop: `${nodeQuoted} ${quoted} waiting`,
         };
 
         let changed = false;

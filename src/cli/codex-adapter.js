@@ -186,7 +186,13 @@ module.exports = {
 
         const script = hookScriptPath();
         const quoted = script.includes(' ') ? `"${script}"` : script;
-        const command = `node ${quoted} completed`;
+        // Pin to the installer's node binary — same reason as in
+        // claude-adapter.js: a different `node` on the user's PATH at runtime
+        // (e.g. after a Node upgrade) breaks better-sqlite3's native binding
+        // and the hook exits silently before posting to Slack.
+        const nodeBin = process.execPath;
+        const nodeQuoted = nodeBin.includes(' ') ? `"${nodeBin}"` : nodeBin;
+        const command = `${nodeQuoted} ${quoted} completed`;
 
         const before = JSON.stringify(doc.hooks.Stop || []);
         doc.hooks.Stop = upsertHook(doc.hooks.Stop, command);
