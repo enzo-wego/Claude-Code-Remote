@@ -16,6 +16,19 @@ const Logger = require('../../core/logger');
 const AlertMonitor = require('./alert-monitor');
 const DelayAlertMonitor = require('./delay-alert-monitor');
 const { runDailySummary, parseChannelsConfig } = require('../../services/daily-summary');
+const { getCliAdapter, adapterNames } = require('../../cli');
+
+// Alternation like "claude|codex" derived from registered adapters, so adding a
+// new adapter entry auto-enables its keyword in @mention chat regexes below.
+const CLI_NAMES_ALT = adapterNames().join('|');
+const CLI_KEYWORD_RE = new RegExp(`\\bstart\\s+(${CLI_NAMES_ALT})\\b`, 'i');
+const CLI_PREFIX_GROUP = `(?:(?:${CLI_NAMES_ALT})\\s+)?`;
+const ROOT_COMMAND_RE = new RegExp(`start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+root\\s*$`, 'i');
+const PROJECT_COMMAND_RE = new RegExp(`(?:start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+)?project\\s+(\\S+)(?:\\s+from\\s+root)?`, 'i');
+const START_FROM_RE = new RegExp(`start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+(\\S+?)(?:\\s+project)?\\s*$`, 'i');
+// Strips used to remove the CLI/project suffix before sending the prompt to the CLI
+const PROJECT_STRIP_RE = new RegExp(`(?:start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+)?project\\s+\\S+(?:\\s+from\\s+root)?[,.]?\\s*`, 'i');
+const START_FROM_STRIP_RE = new RegExp(`start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+\\S+?(?:\\s+project)?\\s*$`, 'i');
 
 class SlackSocketHandler {
     constructor(config = {}) {
@@ -112,6 +125,11 @@ class SlackSocketHandler {
         } catch {
             // Column already exists
         }
+        try {
+            this.db.exec("ALTER TABLE sessions ADD COLUMN cli_type TEXT DEFAULT 'claude'");
+        } catch {
+            // Column already exists
+        }
         this.db.exec('CREATE INDEX IF NOT EXISTS idx_claude_session_id ON sessions(claude_session_id)');
 
         // Alert investigation queue — process alerts sequentially to avoid resource contention
@@ -132,10 +150,11 @@ class SlackSocketHandler {
 
         this._stmts = {
             upsert: this.db.prepare(`
-                INSERT INTO sessions (session_key, session_name, channel_id, thread_ts, repo_path, created_at, updated_at, alert_message_ts)
-                VALUES (@session_key, @session_name, @channel_id, @thread_ts, @repo_path, @created_at, @updated_at, @alert_message_ts)
+                INSERT INTO sessions (session_key, session_name, channel_id, thread_ts, repo_path, created_at, updated_at, alert_message_ts, cli_type)
+                VALUES (@session_key, @session_name, @channel_id, @thread_ts, @repo_path, @created_at, @updated_at, @alert_message_ts, @cli_type)
                 ON CONFLICT(session_key) DO UPDATE SET
                     updated_at = @updated_at,
+                    cli_type = @cli_type,
                     claude_session_id = NULL
             `),
             get: this.db.prepare('SELECT * FROM sessions WHERE session_key = ?'),
@@ -188,7 +207,8 @@ class SlackSocketHandler {
             repo_path: session.repoPath,
             created_at: session.createdAt,
             updated_at: Date.now(),
-            alert_message_ts: session.alertMessageTs || null
+            alert_message_ts: session.alertMessageTs || null,
+            cli_type: session.cliType || 'claude'
         });
     }
 
@@ -204,7 +224,8 @@ class SlackSocketHandler {
             lastBotTs: row.last_bot_ts || null,
             alertMessageTs: row.alert_message_ts || null,
             lastUserId: row.last_user_id || null,
-            claudeSessionId: row.claude_session_id || null
+            claudeSessionId: row.claude_session_id || null,
+            cliType: row.cli_type || 'claude'
         };
     }
 
@@ -288,8 +309,10 @@ class SlackSocketHandler {
             }).catch(err => this.logger.error(`Failed to post queue start notice: ${err.message}`));
         }
 
-        // Fire the investigation via the regular command flow
-        this._processCommand(item.channel_id, item.message_ts, item.prompt, null, item.message_ts, item.message_ts)
+        // Fire the investigation via the regular command flow. Queue only holds PagerDuty alerts,
+        // so the CLI chain follows ALERT_CLI (delay alerts bypass the queue).
+        const queueCliChain = this.config.alertCliChain || ['claude'];
+        this._processCommand(item.channel_id, item.message_ts, item.prompt, null, item.message_ts, item.message_ts, null, queueCliChain)
             .catch(err => {
                 this.logger.error(`Alert queue: failed to start investigation for id=${item.id}: ${err.message}`);
                 this._queueStmts.updateStatus.run('failed', Date.now(), item.id);
@@ -1207,19 +1230,21 @@ ${formatted}`
             ? ` Attached images (read these files for visual context): ${imagePaths.join(' ')}`
             : '';
 
-        // Build prompt — use "execute skill" so Claude invokes the skill directly
+        // Build prompt via the first CLI in the configured chain. The alert
+        // prompt syntax is identical across Claude and Codex (both use
+        // `execute X skill with argument Y`), so the first CLI in the chain
+        // is a safe stand-in even if we end up falling back to a later entry.
         const permalink = await this._getPermalink(channelId, messageTs);
         const alertSkill = this.config.alertSkill;
-        let prompt;
-        if (alertSkill && permalink) {
-            prompt = `execute ${alertSkill} skill with argument ${permalink}${imageInstruction}`;
-        } else if (alertSkill) {
-            prompt = `execute ${alertSkill} skill with argument Alert: ${text.substring(0, 500)}${imageInstruction}`;
-        } else if (permalink) {
-            prompt = `Investigate this PagerDuty alert: ${permalink}${imageInstruction}`;
-        } else {
-            prompt = `Investigate this PagerDuty alert: ${text.substring(0, 500)}${imageInstruction}`;
-        }
+        const alertCliChain = this.config.alertCliChain || ['claude'];
+        const alertAdapter = getCliAdapter(alertCliChain[0]);
+        const prompt = alertAdapter.buildAlertPrompt({
+            skill: alertSkill,
+            permalink,
+            fallbackText: text,
+            imageInstruction,
+            fallbackIntro: 'Investigate this PagerDuty alert',
+        });
 
         // Enqueue for sequential processing — prevents resource contention from concurrent sessions
         const position = this._enqueueAlert({ incidentId, channelId, messageTs, prompt, alertType: 'pagerduty' });
@@ -1263,6 +1288,19 @@ ${formatted}`
 
         const messageTs = event.ts;
 
+        // Dedup: Slack Socket Mode can redeliver the same event (WebSocket reconnect,
+        // multiple connections, retry-on-no-ACK). Without this guard a single Airflow
+        // alert can be counted multiple times and falsely trip the threshold.
+        if (!this._handledDelayTs) this._handledDelayTs = new Set();
+        if (this._handledDelayTs.has(messageTs)) {
+            this.logger.info(`Delay alert dedup: skipping redelivery of ts=${messageTs}`);
+            return;
+        }
+        this._handledDelayTs.add(messageTs);
+        if (this._handledDelayTs.size > 200) {
+            this._handledDelayTs = new Set([...this._handledDelayTs].slice(-100));
+        }
+
         // Increment counter (persisted to SQLite) — incrementCounter logs the N/threshold progress
         const { count, triggered } = this.delayAlertMonitor.incrementCounter(alertInfo.dag, channelId, messageTs);
 
@@ -1290,20 +1328,20 @@ ${formatted}`
             ? ` Attached images (read these files for visual context): ${imagePaths.join(' ')}`
             : '';
 
-        // Build prompt — use "execute skill" so Claude invokes the skill directly
+        // Build prompt via the first CLI in DELAY_ALERT_CLI (prompt syntax is
+        // CLI-agnostic, so falling back later is safe).
         const text = event.text || '';
         const permalink = await this._getPermalink(channelId, messageTs);
         const skill = this.delayAlertMonitor.skill;
-        let prompt;
-        if (skill && permalink) {
-            prompt = `execute ${skill} skill with argument ${permalink}${imageInstruction}`;
-        } else if (skill) {
-            prompt = `execute ${skill} skill with argument Alert: ${text.substring(0, 500)}${imageInstruction}`;
-        } else if (permalink) {
-            prompt = `Investigate this Airflow delay alert: ${permalink}${imageInstruction}`;
-        } else {
-            prompt = `Investigate this Airflow delay alert: ${text.substring(0, 500)}${imageInstruction}`;
-        }
+        const delayCliChain = this.config.delayAlertCliChain || ['claude'];
+        const delayAdapter = getCliAdapter(delayCliChain[0]);
+        const prompt = delayAdapter.buildAlertPrompt({
+            skill,
+            permalink,
+            fallbackText: text,
+            imageInstruction,
+            fallbackIntro: 'Investigate this Airflow delay alert',
+        });
 
         // Reset counter after triggering (so it can accumulate again)
         this.delayAlertMonitor.resetCounter(alertInfo.dag);
@@ -1314,7 +1352,7 @@ ${formatted}`
         );
 
         // Use the regular command flow — messageTs as threadTs
-        await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs);
+        await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs, null, delayCliChain);
     }
 
     async _getPermalink(channelId, messageTs) {
@@ -1359,20 +1397,44 @@ ${formatted}`
 
     // ─── Command Processing ──────────────────────────────────────────
 
-    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null) {
+    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliHint = null) {
         // Create a say function if one wasn't provided (e.g. alert triggers)
         if (!say) {
             say = async (msg) => {
                 await this.app.client.chat.postMessage({ channel: channelId, thread_ts: threadTs, ...msg });
             };
         }
+
+        // Normalise the CLI hint to a chain. Callers may pass:
+        //   - null / undefined (use @mention keyword or default)
+        //   - a single string (back-compat with pre-chain callers)
+        //   - an array of CLI names (e.g. ['codex', 'claude']) — first is tried
+        //     first; subsequent names are tried only if the previous one hits a
+        //     fatal startup error (codex quota exceeded, etc.).
+        const normaliseChain = (hint) => {
+            if (!hint) return null;
+            if (Array.isArray(hint)) {
+                const chain = hint.map(s => String(s || '').toLowerCase()).filter(Boolean);
+                return chain.length > 0 ? chain : null;
+            }
+            const single = String(hint).toLowerCase();
+            return single ? [single] : null;
+        };
+        const cliChainHint = normaliseChain(cliHint);
         const sessionKey = `${channelId}-${threadTs}`;
         let session = this._getSession(sessionKey);
         let threadContext = null; // Will hold formatted thread messages to prepend
+        // Tracks the still-untried CLIs starting at the currently-running one.
+        // Set after _startCliWithFallback succeeds; consulted on inject failure
+        // so a paste-rejecting CLI can hand off to the next one in the chain.
+        // Stays null on existing-live-session injects (no fallback there —
+        // mid-conversation CLI swap would lose context).
+        let injectChain = null;
 
-        // Guard: slash commands on dead/missing sessions
+        // Guard: slash commands on dead/missing sessions (user @mentions only;
+        // alert flows auto-generate `/<skill>` as the first prompt of a new session).
         const isLiveSession = session && this._isTmuxSessionAlive(session.sessionName);
-        if (command.startsWith('/') && !isLiveSession && !(command === '/exit' && session)) {
+        if (command.startsWith('/') && !isLiveSession && !(command === '/exit' && session) && !cliChainHint) {
             const cmd = command.split(/\s/)[0];
             await say({ text: `Session expired. \`${cmd}\` requires an active session — send a message first to start a new one, then use \`${cmd}\`.`, thread_ts: threadTs });
             return;
@@ -1387,21 +1449,50 @@ ${formatted}`
                 // No thread context needed — Claude is already in the conversation
                 this.logger.info(`Existing live session ${session.sessionName}, injecting command directly`);
             } else if (session && !this._isTmuxSessionAlive(session.sessionName)) {
-                // Session in DB but tmux died — recreate with original repo path
-                this.logger.warn(`Tmux session ${session.sessionName} is dead, recreating in ${session.repoPath}...`);
-                await say({ text: `Resuming Claude session in \`${session.repoPath}\`... :rocket:`, thread_ts: threadTs });
+                // Session in DB but tmux died — recreate. Respect the caller's
+                // chain hint if one was supplied (alerts pass the configured
+                // ALERT_CLI chain); otherwise rebuild a chain from the saved
+                // CLI with Claude appended as the unconditional fallback so
+                // the resume isn't stuck on a broken Codex quota.
+                const resumeSavedCli = session.cliType || 'claude';
+                const resumeChain = cliChainHint && cliChainHint.length > 0
+                    ? cliChainHint
+                    : (resumeSavedCli === 'claude' ? ['claude'] : [resumeSavedCli, 'claude']);
+                this.logger.warn(`Tmux session ${session.sessionName} is dead, recreating in ${session.repoPath} (chain=${resumeChain.join('→')})...`);
+                await say({ text: `Resuming session in \`${session.repoPath}\` (CLI chain: ${resumeChain.join(' → ')})... :rocket:`, thread_ts: threadTs });
 
-                const created = await this._createTmuxSession(
-                    session.sessionName,
-                    session.repoPath,
-                    this.config.claudeCommand || 'claude --dangerously-skip-permissions',
-                    sessionKey
-                );
-                if (!created) {
-                    await say({ text: 'Failed to create Claude session. Is tmux installed?', thread_ts: threadTs });
+                const resumeResult = await this._startCliWithFallback({
+                    sessionName: session.sessionName,
+                    repoPath: session.repoPath,
+                    sessionKey,
+                    cliChain: resumeChain,
+                    onFallback: async ({ failedCli, nextCli, reason }) => {
+                        const body = nextCli
+                            ? `:warning: \`${failedCli}\` failed to start (${reason}) — falling back to \`${nextCli}\`.`
+                            : `:x: \`${failedCli}\` failed to start (${reason}) and no fallback CLI is configured.`;
+                        await say({ text: body, thread_ts: threadTs });
+                    },
+                });
+                if (!resumeResult.ok) {
+                    await say({ text: `Failed to resume session — tried ${resumeChain.join(', ')}. Is tmux installed?`, thread_ts: threadTs });
                     this._deleteSession(sessionKey);
                     return;
                 }
+                // Persist the actually-running CLI on the row so subsequent
+                // polling / injection uses the correct adapter.
+                if (resumeResult.cliType !== resumeSavedCli) {
+                    try {
+                        this.db.prepare('UPDATE sessions SET cli_type = ?, updated_at = ? WHERE session_key = ?')
+                            .run(resumeResult.cliType, Date.now(), sessionKey);
+                        session.cliType = resumeResult.cliType;
+                    } catch (err) {
+                        this.logger.error(`Failed to update cli_type on resume: ${err.message}`);
+                    }
+                }
+                // Surface the remaining chain so a paste-rejection on the
+                // first inject can fall back further (e.g. resumed Codex
+                // accepted readiness but won't take input → switch to Claude).
+                injectChain = resumeResult.remainingChain || [resumeResult.cliType];
                 this._touchSession(sessionKey);
                 // Reset claude_session_id so the new session's SessionStart hook can register.
                 // Without this, COALESCE preserves the dead session's ID and the Stop hook
@@ -1421,25 +1512,43 @@ ${formatted}`
             } else {
                 // Brand new conversation
                 const sessionName = this._generateSessionName(channelId, threadTs);
-                const claudeCmd = this.config.claudeCommand || 'claude --dangerously-skip-permissions';
 
-                // Resolve repo path — check for project name patterns
-                // Supported: "start [claude] from root" (uses SLACK_REPO_ROOT directly),
-                //            "project XXX from root", "start [claude] from XXX project",
-                //            "start [claude] from XXX", "start [claude] in XXX project", etc.
+                // Resolve CLI chain. Priority:
+                //   1. Caller-supplied chain (alerts / delay alerts pass the
+                //      configured ALERT_CLI / DELAY_ALERT_CLI chain).
+                //   2. Per-message keyword in @mention chat ("start codex
+                //      from ..."). Keyword starts the chain; Claude is
+                //      appended as the last-resort fallback so users don't
+                //      get stuck on a broken Codex.
+                //   3. Default single-element ['claude'] chain.
+                let cliChain;
+                if (cliChainHint && cliChainHint.length > 0) {
+                    cliChain = cliChainHint;
+                } else {
+                    const cliKeywordMatch = command.match(CLI_KEYWORD_RE);
+                    if (cliKeywordMatch) {
+                        const typed = cliKeywordMatch[1].toLowerCase();
+                        cliChain = typed === 'claude' ? ['claude'] : [typed, 'claude'];
+                    } else {
+                        cliChain = ['claude'];
+                    }
+                }
+                const cliType = cliChain[0];
+
+                // Resolve repo path — check for project name patterns.
+                // Supported:  "start [cli] from root" → uses SLACK_REPO_ROOT directly
+                //             "project XXX from root", "start [cli] from XXX project"
+                //             "start [cli] from XXX", "start [cli] in XXX project"
+                // The `[cli]` slot accepts any registered adapter name (see CLI_NAMES_ALT).
                 let repoPath = this.config.repoPath || process.cwd();
-                const rootMatch = command.match(/start\s+(?:claude\s+)?(?:from|in)\s+root\s*$/i);
+                const rootMatch = command.match(ROOT_COMMAND_RE);
                 const projectMatch = !rootMatch && (
-                    command.match(
-                        /(?:start\s+(?:claude\s+)?(?:from|in)\s+)?project\s+(\S+)(?:\s+from\s+root)?/i
-                    ) || command.match(
-                        /start\s+(?:claude\s+)?(?:from|in)\s+(\S+?)(?:\s+project)?\s*$/i
-                    )
+                    command.match(PROJECT_COMMAND_RE) || command.match(START_FROM_RE)
                 );
                 if (rootMatch) {
                     if (this.config.repoRoot) {
                         repoPath = this.config.repoRoot;
-                        command = command.replace(/start\s+(?:claude\s+)?(?:from|in)\s+root\s*$/i, '').trim();
+                        command = command.replace(ROOT_COMMAND_RE, '').trim();
                         this.logger.info(`Using repo root: ${repoPath}`);
                     } else {
                         await say({ text: '`SLACK_REPO_ROOT` is not configured. Set it in `.env`.', thread_ts: threadTs });
@@ -1450,10 +1559,10 @@ ${formatted}`
                     const candidatePath = path.join(this.config.repoRoot, projectName);
                     if (fs.existsSync(candidatePath)) {
                         repoPath = candidatePath;
-                        // Strip the project resolution part so Claude gets a clean prompt
+                        // Strip the project resolution part so the CLI gets a clean prompt
                         command = command
-                            .replace(/(?:start\s+(?:claude\s+)?(?:from|in)\s+)?project\s+\S+(?:\s+from\s+root)?[,.]?\s*/i, '')
-                            .replace(/start\s+(?:claude\s+)?(?:from|in)\s+\S+?(?:\s+project)?\s*$/i, '')
+                            .replace(PROJECT_STRIP_RE, '')
+                            .replace(START_FROM_STRIP_RE, '')
                             .trim();
                         this.logger.info(`Resolved project "${projectName}" to ${repoPath}`);
                     } else {
@@ -1485,19 +1594,37 @@ ${formatted}`
                 }
 
                 if (!alertMessageTs) {
-                    await say({ text: `Starting Claude session in \`${repoPath}\`... :rocket:`, thread_ts: threadTs });
+                    const chainLabel = cliChain.length > 1 ? `${cliType} (fallback: ${cliChain.slice(1).join(', ')})` : cliType;
+                    await say({ text: `Starting ${chainLabel} session in \`${repoPath}\`... :rocket:`, thread_ts: threadTs });
                 }
 
-                const created = await this._createTmuxSession(sessionName, repoPath, claudeCmd, sessionKey);
-                if (!created) {
+                const startResult = await this._startCliWithFallback({
+                    sessionName,
+                    repoPath,
+                    sessionKey,
+                    cliChain,
+                    onFallback: async ({ failedCli, nextCli, reason }) => {
+                        const body = nextCli
+                            ? `:warning: \`${failedCli}\` failed to start (${reason}) — falling back to \`${nextCli}\`.`
+                            : `:x: \`${failedCli}\` failed to start (${reason}) and no fallback CLI is configured.`;
+                        await say({ text: body, thread_ts: threadTs });
+                    },
+                });
+                if (!startResult.ok) {
                     if (alertMessageTs) {
                         await this._removeReaction(channelId, alertMessageTs, 'eyes');
                         await this._addReaction(channelId, alertMessageTs, 'x');
                     } else {
-                        await say({ text: 'Failed to create Claude session. Is tmux installed?', thread_ts: threadTs });
+                        await say({ text: `Failed to start any CLI. Tried: ${cliChain.join(', ')}.`, thread_ts: threadTs });
                     }
                     return;
                 }
+
+                // Resolved CLI — may differ from the first preference if we fell back.
+                const resolvedCliType = startResult.cliType;
+                // Surface the remaining chain so the inject step can fall back
+                // further if the resolved CLI accepts readiness but rejects paste.
+                injectChain = startResult.remainingChain || [resolvedCliType];
 
                 session = {
                     sessionName,
@@ -1505,7 +1632,8 @@ ${formatted}`
                     threadTs,
                     repoPath,
                     createdAt: Date.now(),
-                    alertMessageTs: alertMessageTs || null
+                    alertMessageTs: alertMessageTs || null,
+                    cliType: resolvedCliType
                 };
                 this._saveSession(session);
                 if (userId) this._updateLastUserId(`${channelId}-${threadTs}`, userId);
@@ -1528,7 +1656,7 @@ ${formatted}`
             if (command === '/exit') {
                 if (this._isTmuxSessionAlive(session.sessionName)) {
                     try {
-                        await this._injectCommand(session.sessionName, command);
+                        await this._injectCommand(session.sessionName, command, session.cliType);
                     } catch {
                         // Expected — /exit kills the session before Enter-retry finishes
                     }
@@ -1561,17 +1689,80 @@ ${formatted}`
                 fullCommand = `Here is the Slack thread discussion for context:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
             }
 
-            // Inject the command into the tmux session
-            try {
-                await this._injectCommand(session.sessionName, fullCommand);
-            } catch (injectError) {
-                this.logger.error(`Injection failed for ${session.sessionName}: ${injectError.message}`);
+            // Inject the command into the tmux session.
+            //
+            // If injection fails (e.g. the CLI accepted readiness but rejects
+            // the paste — Codex's slow-startup race) and we have remaining
+            // CLIs in the chain from the start step, kill tmux, restart with
+            // the next CLI, and retry the inject. Skipped for existing live
+            // sessions (injectChain stays null there) so a mid-conversation
+            // failure doesn't silently lose context by switching CLIs.
+            let injected = false;
+            let lastInjectError = null;
+            while (!injected) {
+                try {
+                    const baseline = await this._injectCommand(session.sessionName, fullCommand, session.cliType);
+                    // Guard against silent rejection (Codex at usage limit, Enter
+                    // dropped by late banner redraw, etc.). _injectCommand can
+                    // succeed because paste landed, but the CLI may never start
+                    // a turn — without this check the poller would sit idle for
+                    // 30 min and no fallback would fire.
+                    await this._verifyTurnProgress(session.sessionName, session.cliType, baseline);
+                    injected = true;
+                } catch (injectError) {
+                    lastInjectError = injectError;
+                    this.logger.error(`Injection failed for ${session.sessionName} (cli=${session.cliType}): ${injectError.message}`);
+
+                    const nextCli = injectChain && injectChain.length > 1 ? injectChain[1] : null;
+                    if (!nextCli) break;
+
+                    const failedCli = session.cliType;
+                    try { execSync(`tmux kill-session -t ${session.sessionName} 2>/dev/null`); } catch { /* already gone */ }
+
+                    await say({
+                        text: `:repeat: \`${failedCli}\` couldn't accept the prompt (${injectError.message}) — retrying with \`${nextCli}\`...`,
+                        thread_ts: threadTs,
+                    });
+
+                    const retryChain = injectChain.slice(1);
+                    const retryResult = await this._startCliWithFallback({
+                        sessionName: session.sessionName,
+                        repoPath: session.repoPath,
+                        sessionKey,
+                        cliChain: retryChain,
+                        onFallback: async ({ failedCli: fc, nextCli: nc, reason }) => {
+                            const body = nc
+                                ? `:warning: \`${fc}\` failed to start (${reason}) — falling back to \`${nc}\`.`
+                                : `:x: \`${fc}\` failed to start (${reason}) and no fallback CLI is configured.`;
+                            await say({ text: body, thread_ts: threadTs });
+                        },
+                    });
+
+                    if (!retryResult.ok) {
+                        lastInjectError = new Error(`Fallback CLI \`${nextCli}\` failed to start: ${retryResult.fatalError || 'launch error'}`);
+                        break;
+                    }
+
+                    // Update DB + in-memory session to the newly-running CLI.
+                    try {
+                        this.db.prepare('UPDATE sessions SET cli_type = ?, updated_at = ? WHERE session_key = ?')
+                            .run(retryResult.cliType, Date.now(), sessionKey);
+                    } catch (err) {
+                        this.logger.error(`Failed to update cli_type after inject fallback: ${err.message}`);
+                    }
+                    session.cliType = retryResult.cliType;
+                    injectChain = retryResult.remainingChain || [retryResult.cliType];
+                    // Loop continues with the new CLI.
+                }
+            }
+
+            if (!injected) {
+                const message = lastInjectError ? lastInjectError.message : 'unknown error';
                 if (session.alertMessageTs) {
                     await this._removeReaction(channelId, session.alertMessageTs, 'eyes');
                     await this._addReaction(channelId, session.alertMessageTs, 'x');
                 }
-                await say({ text: `:warning: ${injectError.message}. Try sending your message again.`, thread_ts: threadTs });
-                // Restart session timeout so it gets cleaned up
+                await say({ text: `:warning: ${message}. Try sending your message again.`, thread_ts: threadTs });
                 this._startSessionTimeout(sessionKey);
                 return;
             }
@@ -1591,7 +1782,7 @@ ${formatted}`
                 }
             }
 
-            // Regular sessions: response posting is handled by claude-hook-notify.js (Stop hook)
+            // Regular sessions: response posting is handled by cli-hook-notify.js (Stop / Codex notify)
             // which reads the transcript for clean markdown output.
             // Alert sessions: start the poller to swap reactions (👀→✅) when Claude finishes.
             // The hook handles final posting — no stall detection needed.
@@ -1627,12 +1818,24 @@ ${formatted}`
         }
     }
 
-    async _createTmuxSession(sessionName, repoPath, claudeCmd, sessionKey = null) {
+    async _createTmuxSession(sessionName, repoPath, cliCmd, sessionKey = null, cliType = 'claude') {
+        const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType);
+        return result.ok;
+    }
+
+    // Detailed tmux creation with fatal-error detection. Returns:
+    //   { ok: true,  fatalError: null }    — session ready (or timed out, proceeded anyway)
+    //   { ok: false, fatalError: string }  — adapter's fatalErrorPatterns matched
+    //                                        (e.g. Codex quota exceeded). Tmux
+    //                                        session is killed so caller can retry
+    //                                        with the next CLI in the chain.
+    //   { ok: false, fatalError: null }    — tmux itself failed to launch.
+    async _createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey = null, cliType = 'claude') {
         try {
             execSync('which tmux', { stdio: 'ignore' });
         } catch {
             this.logger.error('tmux is not installed');
-            return false;
+            return { ok: false, fatalError: null };
         }
 
         // Kill existing session with same name if any
@@ -1645,38 +1848,62 @@ ${formatted}`
 
         return new Promise((resolve) => {
             const { buildTmuxCommand } = require('../../utils/tmux-helper');
-            const cmd = buildTmuxCommand(sessionName, repoPath, claudeCmd, sessionKey);
-            this.logger.info(`Creating tmux session: ${cmd}`);
+            const cmd = buildTmuxCommand(sessionName, repoPath, cliCmd, sessionKey, cliType);
+            this.logger.info(`Creating tmux session (cli=${cliType}): ${cmd}`);
 
             exec(cmd, (error) => {
                 if (error) {
                     this.logger.error(`Failed to create tmux session: ${error.message}`);
-                    resolve(false);
+                    resolve({ ok: false, fatalError: null });
                     return;
                 }
-                // Poll for Claude Code readiness instead of hardcoded wait
-                const maxWaitMs = 30000;
+                // Poll until the CLI's TUI reports ready. Each adapter defines
+                // its own readiness probe because Claude Code and Codex render
+                // very different footers (e.g. Codex's prompt is `› <placeholder>`
+                // on the same line, and Codex may still be loading MCP servers).
+                const readyAdapter = getCliAdapter(cliType);
+                const maxWaitMs = readyAdapter.readinessTimeoutMs || 30000;
+                const fatalPatterns = readyAdapter.fatalErrorPatterns || [];
                 const pollIntervalMs = 1000;
                 let elapsed = 0;
                 const poll = () => {
                     elapsed += pollIntervalMs;
                     try {
-                        const output = execSync(`tmux capture-pane -t ${sessionName} -p -S -50`, {
+                        const output = execSync(`tmux capture-pane -t ${sessionName} -p -S -200`, {
                             encoding: 'utf8',
                             stdio: ['ignore', 'pipe', 'ignore']
                         });
-                        // Claude Code shows ) or ❯ or > as input prompt when ready
-                        if (/^[)❯>]\s*$/m.test(output)) {
-                            this.logger.info(`Claude Code ready after ${elapsed}ms`);
-                            resolve(true);
+                        // Fatal error takes precedence over readiness — e.g. Codex
+                        // can render its prompt briefly before the quota banner
+                        // takes over. Abort fast so the fallback CLI can start.
+                        const fatal = fatalPatterns.find(p => p.regex.test(output));
+                        if (fatal) {
+                            this.logger.warn(`${cliType} fatal error detected (${fatal.reason}) after ${elapsed}ms — killing tmux session ${sessionName}`);
+                            try {
+                                execSync(`tmux kill-session -t ${sessionName} 2>/dev/null`);
+                            } catch {
+                                // Already dead
+                            }
+                            resolve({ ok: false, fatalError: fatal.reason });
+                            return;
+                        }
+                        if (readyAdapter.isReady && readyAdapter.isReady(output)) {
+                            this.logger.info(`${cliType} ready after ${elapsed}ms`);
+                            const grace = readyAdapter.postReadyGraceMs || 0;
+                            if (grace > 0) {
+                                this.logger.debug(`Post-ready grace: waiting ${grace}ms for ${cliType} TUI to settle`);
+                                setTimeout(() => resolve({ ok: true, fatalError: null }), grace);
+                            } else {
+                                resolve({ ok: true, fatalError: null });
+                            }
                             return;
                         }
                     } catch {
                         // capture failed, keep polling
                     }
                     if (elapsed >= maxWaitMs) {
-                        this.logger.warn(`Claude Code readiness timeout after ${maxWaitMs}ms, proceeding anyway`);
-                        resolve(true);
+                        this.logger.warn(`${cliType} readiness timeout after ${maxWaitMs}ms, proceeding anyway`);
+                        resolve({ ok: true, fatalError: null });
                         return;
                     }
                     setTimeout(poll, pollIntervalMs);
@@ -1687,9 +1914,75 @@ ${formatted}`
         });
     }
 
-    async _injectCommand(sessionName, command) {
+    // Walk a CLI preference chain (e.g. ['codex', 'claude']) and try each in
+    // order until one boots cleanly. If a CLI hits a fatal startup error
+    // (quota exceeded, etc.) we kill its tmux session and fire onFallback so
+    // the caller can post a Slack notice before trying the next CLI.
+    //
+    // Returns:
+    //   { ok: true,  cliType: 'claude', fellBackFrom: 'codex' | null, remainingChain: ['claude', ...] }
+    //   { ok: false, cliType: <last tried>, fatalError: string | null }
+    //
+    // `remainingChain` starts at the resolved CLI and includes any CLIs that
+    // weren't tried yet. The caller can use it to fall back further if the
+    // resolved CLI later fails to accept input (e.g. paste rejection).
+    async _startCliWithFallback({ sessionName, repoPath, sessionKey, cliChain, onFallback }) {
+        const chain = (cliChain || []).filter(Boolean);
+        if (chain.length === 0) chain.push('claude');
+
+        let fellBackFrom = null;
+        for (let i = 0; i < chain.length; i++) {
+            const cliType = chain[i];
+            const adapter = getCliAdapter(cliType);
+            const cliCmd = adapter.buildLaunchCommand(sessionName, repoPath, sessionKey);
+            const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType);
+
+            if (result.ok) {
+                return { ok: true, cliType, fellBackFrom, remainingChain: chain.slice(i) };
+            }
+
+            // Non-fatal failure (tmux not installed, launch error) — stop the
+            // chain. Only recover from adapter-declared fatal errors.
+            if (!result.fatalError) {
+                return { ok: false, cliType, fatalError: null };
+            }
+
+            // Fatal — notify caller so they can post a Slack note, then try next.
+            const next = chain[i + 1];
+            if (onFallback) {
+                try {
+                    await onFallback({ failedCli: cliType, nextCli: next || null, reason: result.fatalError });
+                } catch (err) {
+                    this.logger.error(`Fallback notifier threw: ${err.message}`);
+                }
+            }
+            if (!next) {
+                return { ok: false, cliType, fatalError: result.fatalError };
+            }
+            fellBackFrom = fellBackFrom || cliType;
+        }
+
+        return { ok: false, cliType: chain[chain.length - 1], fatalError: null };
+    }
+
+    async _injectCommand(sessionName, command, cliType = 'claude') {
         const os = require('os');
-        const tmpFile = path.join(os.tmpdir(), `claude-inject-${sessionName}-${Date.now()}.txt`);
+        const adapter = getCliAdapter(cliType);
+        const excludePatterns = adapter.workingExcludePatterns || [];
+        const indicatorHit = (text) => {
+            // Strip lines the adapter declares as chrome (e.g. Codex MCP startup
+            // banner) before matching — otherwise "esc to interrupt" in the
+            // banner makes the injector think Codex accepted Enter when it
+            // didn't, and the prompt is silently lost.
+            const filtered = (text || '')
+                .split('\n')
+                .filter(l => !excludePatterns.some(re => re.test(l)))
+                .join('\n')
+                .toLowerCase();
+            if (adapter.workingIndicators.some(ind => filtered.includes(ind))) return true;
+            return (adapter.workingRegexes || []).some(re => re.test(filtered));
+        };
+        const tmpFile = path.join(os.tmpdir(), `cli-inject-${sessionName}-${Date.now()}.txt`);
         try {
             // Write command to temp file to avoid shell argument length limits
             fs.writeFileSync(tmpFile, command);
@@ -1711,22 +2004,27 @@ ${formatted}`
                 execSync(`tmux load-buffer ${tmpFile}`);
                 execSync(`tmux paste-buffer -t ${sessionName}`);
 
-                // Wait for Claude Code to process the bracketed paste
+                // Wait for the TUI to process the bracketed paste
                 const baseDelay = 1000;
                 const perLineDelay = Math.min(command.split('\n').length * 100, 3000);
                 await new Promise(r => setTimeout(r, baseDelay + perLineDelay));
 
                 // Verify paste appeared in the pane — check multiple indicators:
-                // 1. Claude shows "[Pasted text" banner for multi-line pastes
-                // 2. The first line of the command appears in the visible pane
-                // 3. Claude already started working (paste + auto-submit succeeded)
+                // 1. Adapter-declared paste banner (Claude: "Pasted text",
+                //    Codex: "[Pasted Content N chars]" — different TUIs render
+                //    different placeholders, so each adapter declares its own).
+                // 2. The first line of the command appears verbatim in the
+                //    visible pane (works only when the TUI doesn't collapse
+                //    pastes behind a placeholder; harmless when it does).
+                // 3. The CLI already started working (paste + auto-submit succeeded).
                 const output = this._captureOutput(sessionName);
                 const firstLine = command.split('\n')[0].substring(0, 40);
-                const workingIndicators = ['brewing', 'thinking', 'working', 'clauding',
-                    'flibbertigibbeting', 'esc to interrupt', '● skill(', 'crunching'];
-                const outputLower = output.toLowerCase();
-                const isAlreadyWorking = workingIndicators.some(ind => outputLower.includes(ind));
-                if (output.includes('Pasted text') || output.includes(firstLine) || isAlreadyWorking) {
+                const isAlreadyWorking = indicatorHit(output);
+                const pasteIndicators = adapter.pasteLandedIndicators || [/Pasted text/i];
+                const pasteIndicatorMatched = pasteIndicators.some(p =>
+                    typeof p === 'string' ? output.includes(p) : p.test(output)
+                );
+                if (pasteIndicatorMatched || output.includes(firstLine) || isAlreadyWorking) {
                     if (attempt > 0) {
                         this.logger.info(`Paste landed on attempt ${attempt + 1} for ${sessionName}${isAlreadyWorking ? ' (already working)' : ''}`);
                     }
@@ -1739,12 +2037,10 @@ ${formatted}`
             }
 
             if (!pasteLanded) {
-                throw new Error(`Paste failed after ${pasteMaxAttempts} attempts — Claude may not be ready`);
+                throw new Error(`Paste failed after ${pasteMaxAttempts} attempts — ${cliType} may not be ready`);
             }
 
-            // Send Enter and verify Claude started processing.
-            const workingIndicators = ['brewing', 'thinking', 'working', 'clauding',
-                'flibbertigibbeting', 'esc to interrupt', '● skill(', 'crunching'];
+            // Send Enter and verify the CLI started processing.
             const maxAttempts = 5;
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
                 execSync(`tmux send-keys -t ${sessionName} Enter`);
@@ -1753,15 +2049,15 @@ ${formatted}`
                 await new Promise(r => setTimeout(r, waitMs));
 
                 const output = this._captureOutput(sessionName);
-                const isWorking = workingIndicators.some(ind => output.toLowerCase().includes(ind));
-                // Also check if Claude already finished (prompt visible again) — means it
+                const isWorking = indicatorHit(output);
+                // Also check if the CLI already finished (prompt visible again) — means it
                 // processed the command very quickly (e.g. "hi") before we could detect working state
-                const hasPrompt = /^[)❯>]\s*$/m.test(output);
+                const hasPrompt = /^[)❯>›]\s*$/m.test(output);
                 if (isWorking) {
                     if (attempt > 0) {
                         this.logger.info(`Enter accepted on attempt ${attempt + 1} for ${sessionName}`);
                     }
-                    return;
+                    return preInjectOutput;
                 }
                 if (hasPrompt && attempt >= 1) {
                     // Prompt visible after at least 2 Enter attempts — Claude likely processed
@@ -1782,21 +2078,93 @@ ${formatted}`
                         continue;
                     }
                     this.logger.info(`Prompt visible after Enter attempt ${attempt + 1} — Claude likely already responded for ${sessionName}`);
-                    return;
+                    return preInjectOutput;
                 }
                 this.logger.warn(`Enter not confirmed (attempt ${attempt + 1}/${maxAttempts}), retrying for ${sessionName}`);
             }
             // After all retries, check one final time — if Claude shows prompt, it processed the command
             const finalOutput = this._captureOutput(sessionName);
-            const finalHasPrompt = /^[)❯>]\s*$/m.test(finalOutput);
+            const finalHasPrompt = /^[)❯>›]\s*$/m.test(finalOutput);
             if (finalHasPrompt) {
                 this.logger.info(`Prompt visible after all Enter attempts — Claude likely already responded for ${sessionName}`);
-                return;
+                return preInjectOutput;
+            }
+            // Silent-drop detection: a paste is still sitting in the input
+            // box and the CLI never started working. This is the failure mode
+            // where paste lands but Enter never submits (a late banner redraw
+            // swallowed it). Detect via adapter-declared paste indicators or
+            // the literal first line — Codex hides the content behind a
+            // placeholder, so the indicator regex is the only signal there.
+            // Clear the stuck input and fail loudly so the alert reaction
+            // flips to ✗ and the user knows.
+            const finalFirstLine = command.split('\n')[0].substring(0, 40);
+            const finalPasteIndicators = adapter.pasteLandedIndicators || [/Pasted text/i];
+            const finalPasteVisible = finalPasteIndicators.some(p =>
+                typeof p === 'string' ? finalOutput.includes(p) : p.test(finalOutput)
+            );
+            const stuckInInput = finalPasteVisible || (finalFirstLine && finalOutput.includes(finalFirstLine));
+            if (stuckInInput && !indicatorHit(finalOutput)) {
+                try { execSync(`tmux send-keys -t ${sessionName} C-u`); } catch { /* ignore */ }
+                this.logger.error(`Enter dropped — command still in ${cliType} input box after ${maxAttempts} attempts for ${sessionName}`);
+                throw new Error(`${cliType} did not accept Enter — command left unsent. CLI may still be initializing.`);
             }
             this.logger.error(`Enter may not have been accepted after ${maxAttempts} attempts for ${sessionName}`);
+            return preInjectOutput;
         } finally {
             // Clean up temp file
             try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+        }
+    }
+
+    // After _injectCommand returns "successfully" (paste landed, Enter sent),
+    // verify the CLI actually started a turn. Catches silent input rejection
+    // — e.g. Codex at usage limit accepts the bracketed-paste indicator and
+    // then drops Enter, leaving an empty prompt that would otherwise sit
+    // until the 30-min poller timeout. Throws so the inject-fail fallback in
+    // _processCommand can switch to the next CLI in injectChain.
+    //
+    // Signal we trust: scrollback ABOVE the live TUI grew. Real turn output
+    // streams into scrollback; transient banners (usage-limit modal, paste
+    // placeholder, "esc to interrupt" flashes) all live in the bottom rows
+    // of the pane and don't commit to scrollback. The bottom 10 lines also
+    // contain the input box, footer (time/context %), and rotating hint
+    // line — too noisy to compare against baseline. Strip them and compare
+    // only the upper region.
+    async _verifyTurnProgress(sessionName, cliType, baseline, timeoutMs = 90000) {
+        const adapter = getCliAdapter(cliType);
+        const fatalPatterns = adapter.fatalErrorPatterns || [];
+        const aboveTui = (text) => {
+            const lines = (text || '').split('\n');
+            return lines.slice(0, Math.max(0, lines.length - 10))
+                .join('\n')
+                .replace(/\s+/g, ' ')
+                .trim();
+        };
+        const baselineUpper = aboveTui(baseline);
+        const start = Date.now();
+        const intervalMs = 2000;
+        // Initial settle — paste retries and Enter keystrokes leave the TUI
+        // briefly noisy.
+        await new Promise(r => setTimeout(r, intervalMs));
+        while (true) {
+            const output = this._captureOutput(sessionName);
+            // Authoritative signal first: the CLI itself prints a fatal error
+            // banner (e.g. Codex's "You've hit your usage limit"). When at
+            // quota, Codex still echoes the pasted prompt into the pane,
+            // which would otherwise look like real scrollback growth and
+            // hide the failure.
+            const fatal = fatalPatterns.find(p => p.regex.test(output));
+            if (fatal) {
+                throw new Error(`${cliType} ${fatal.reason}`);
+            }
+            const currentUpper = aboveTui(output);
+            if (currentUpper.length > baselineUpper.length + 50 && currentUpper !== baselineUpper) {
+                return;
+            }
+            if (Date.now() - start >= timeoutMs) {
+                throw new Error(`${cliType} accepted the paste but never produced output within ${Math.round(timeoutMs / 1000)}s — input was silently rejected (likely usage limit or dropped Enter)`);
+            }
+            await new Promise(r => setTimeout(r, intervalMs));
         }
     }
 
@@ -1817,7 +2185,8 @@ ${formatted}`
         const { sessionName, threadTs } = session;
         const pollKey = sessionName;
         const isAlertSession = !!session.alertMessageTs;
-        this.logger.info(`Poller starting for ${sessionName} (alert=${isAlertSession})`);
+        const adapter = getCliAdapter(session.cliType || 'claude');
+        this.logger.info(`Poller starting for ${sessionName} (alert=${isAlertSession}, cli=${adapter.type})`);
         let isFirstResponse = isAlertSession; // only true for the very first response of an alert
         let alertBuffer = '';
         let alertAccumulationCount = 0;
@@ -1919,25 +2288,20 @@ ${formatted}`
             const wideLines = lines.slice(-30);
             // Exclude OMC status bar lines (contain "[OMC#") from isWorking check —
             // the status bar can show stale "thinking" even when Claude is idle.
-            const nonStatusLines = wideLines.filter(l => !l.includes('[OMC#'));
+            // Adapter-specific excludes drop chrome that contains working-verb
+            // substrings (e.g. Codex's MCP startup banner has "esc to interrupt").
+            const excludePatterns = adapter.workingExcludePatterns || [];
+            const nonStatusLines = wideLines.filter(l => {
+                if (l.includes('[OMC#')) return false;
+                return !excludePatterns.some(re => re.test(l));
+            });
             const tailText = nonStatusLines.join(' ').toLowerCase();
-            // Keyword check — keep in sync with workingIndicators in _injectCommand.
-            // Claude Code uses many random verbs (Burrowing, Metamorphosing, etc.)
-            // so also match its timer pattern "(Ns · ↓" which always appears.
+            // Working-state detection comes from the adapter so each CLI has its own
+            // indicator set (Claude Code rotates verbs like "Burrowing" / "Metamorphosing";
+            // Codex uses a different spinner vocabulary).
             const isWorking =
-                tailText.includes('clauding') ||
-                tailText.includes('working') ||
-                tailText.includes('processing') ||
-                tailText.includes('⏳') ||
-                tailText.includes('thinking') ||
-                tailText.includes('crunching') ||
-                tailText.includes('brewing') ||
-                tailText.includes('metamorphosing') ||
-                tailText.includes('flibbertigibbeting') ||
-                tailText.includes('burrowing') ||
-                tailText.includes('esc to interrupt') ||
-                tailText.includes('running…') ||
-                /\(\d+[sm]\d*s?\s+·\s+↓/.test(tailText);
+                adapter.workingIndicators.some(ind => tailText.includes(ind)) ||
+                (adapter.workingRegexes || []).some(re => re.test(tailText));
 
             if (attempts % 10 === 0) {
                 const lastFiveLines = lines.slice(-5).map(l => l.trim()).join(' | ');
@@ -1975,7 +2339,7 @@ ${formatted}`
 
                             if (hasCompletionMarker || alertAccumulationCount >= 5) {
                                 // Completion detected — stop poller. Posting is handled by
-                                // claude-hook-notify.js (Stop hook) which reads the clean transcript.
+                                // cli-hook-notify.js (Stop / Codex notify) which reads the clean transcript.
                                 const reason = hasCompletionMarker ? 'completion marker found' : `fallback after ${alertAccumulationCount} cycles`;
                                 this.logger.info(`Alert poller done (${reason}): ${alertBuffer.length} chars for ${sessionName} — hook will post`);
                                 isFirstResponse = false;
@@ -2030,9 +2394,8 @@ ${formatted}`
                     return;
                 }
 
-                if (currentOutput.includes('Do you want to proceed?') ||
-                    currentOutput.includes('(y/n)') ||
-                    currentOutput.includes('1. Yes')) {
+                if (adapter.handlesConfirmationPrompts &&
+                    (adapter.confirmationPrompts || []).some(p => currentOutput.includes(p))) {
                     this._autoApprove(sessionName, currentOutput);
                     stableCount = 0;
                 }
@@ -2144,6 +2507,72 @@ ${formatted}`
                 this.logger.info(`Session sweep: ${orphaned} orphaned timers started, ${dead} dead sessions cleaned`);
             }
         }, SWEEP_INTERVAL);
+    }
+
+    /**
+     * Stall monitor — scans all live sessions every N seconds for adapter-defined
+     * stall patterns (e.g. Claude's "Context limit reached · /compact or /clear").
+     * When matched, pings the owner in the session's thread so they can unblock.
+     *
+     * Runs for ALL sessions (regular + alert). The in-turn poller in
+     * `_pollForResponse` only runs for alert sessions and only while Claude's
+     * turn is active — a context-limit stall happens when the turn is frozen,
+     * so neither that poller nor the Stop hook fire. This monitor is the single
+     * source of truth for stall detection.
+     */
+    _startStallMonitor() {
+        const INTERVAL_MS = 15 * 1000; // 15s — fast enough to alert early, slow enough not to thrash
+        this._stallState = this._stallState || new Map(); // sessionKey -> { notified: boolean, reason: string }
+
+        this._stallMonitorInterval = setInterval(async () => {
+            let sessions;
+            try {
+                sessions = this._getAllSessions();
+            } catch (err) {
+                this.logger.error(`Stall monitor: failed to list sessions: ${err.message}`);
+                return;
+            }
+
+            for (const s of sessions) {
+                try {
+                    if (!this._isTmuxSessionAlive(s.sessionName)) {
+                        this._stallState.delete(s.sessionKey);
+                        continue;
+                    }
+                    const adapter = getCliAdapter(s.cliType || 'claude');
+                    const patterns = adapter.stalledPatterns || [];
+                    if (patterns.length === 0) continue;
+
+                    const output = this._captureOutput(s.sessionName);
+                    const match = patterns.find(p => p.regex.test(output));
+                    const state = this._stallState.get(s.sessionKey) || { notified: false };
+
+                    if (match && !state.notified) {
+                        this._stallState.set(s.sessionKey, { notified: true, reason: match.reason });
+                        this.logger.warn(`Stall detected (${match.reason}) on ${s.sessionName} — notifying thread ${s.threadTs}`);
+                        const ownerId = this.config.ownerUserId;
+                        const mention = ownerId ? `<@${ownerId}> ` : '';
+                        const text = `${mention}:warning: ${match.hint || `${adapter.type} is stalled and needs input to continue.`}`;
+                        try {
+                            await this.app.client.chat.postMessage({
+                                channel: s.channelId,
+                                text,
+                                thread_ts: s.threadTs,
+                            });
+                        } catch (err) {
+                            this.logger.error(`Stall monitor: failed to post notice for ${s.sessionName}: ${err.message}`);
+                            // Don't keep notified=true if the post failed — allow retry next tick
+                            this._stallState.set(s.sessionKey, { notified: false });
+                        }
+                    } else if (!match && state.notified) {
+                        this._stallState.set(s.sessionKey, { notified: false });
+                        this.logger.info(`Stall cleared on ${s.sessionName} — re-armed`);
+                    }
+                } catch (err) {
+                    this.logger.error(`Stall monitor: error checking ${s.sessionName}: ${err.message}`);
+                }
+            }
+        }, INTERVAL_MS);
     }
 
     /**
@@ -2770,22 +3199,21 @@ ${formatted}`
                     ? ` Attached images (read these files for visual context): ${imagePaths.join(' ')}`
                     : '';
 
-                // Build prompt — use "execute skill" so Claude invokes the skill directly
+                // Build prompt via the first CLI in the configured chain
                 const permalink = await this._getPermalink(channelId, messageTs);
                 const alertSkill = this.config.alertSkill;
-                let prompt;
-                if (alertSkill && permalink) {
-                    prompt = `execute ${alertSkill} skill with argument ${permalink}${imageInstruction}`;
-                } else if (alertSkill) {
-                    prompt = `execute ${alertSkill} skill with argument Alert: ${text.substring(0, 500)}${imageInstruction}`;
-                } else if (permalink) {
-                    prompt = `Investigate this alert: ${permalink}${imageInstruction}`;
-                } else {
-                    prompt = `Investigate this alert: ${text.substring(0, 500)}${imageInstruction}`;
-                }
+                const triggerCliChain = this.config.alertCliChain || ['claude'];
+                const triggerAdapter = getCliAdapter(triggerCliChain[0]);
+                const prompt = triggerAdapter.buildAlertPrompt({
+                    skill: alertSkill,
+                    permalink,
+                    fallbackText: text,
+                    imageInstruction,
+                    fallbackIntro: 'Investigate this alert',
+                });
 
                 // Manual trigger — bypass queue, process immediately
-                await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs);
+                await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs, null, triggerCliChain);
                 res.json({ status: 'investigating', channelId, messageTs });
             } catch (error) {
                 this.logger.error(`Trigger alert error: ${error.message}`);
@@ -2844,19 +3272,18 @@ ${formatted}`
                     ? ` Attached images (read these files for visual context): ${imagePaths.join(' ')}`
                     : '';
 
-                // Build prompt using the delay alert skill
+                // Build prompt via the first CLI in the DELAY_ALERT_CLI chain
                 const permalink = await this._getPermalink(channelId, messageTs);
                 const skill = this.delayAlertMonitor.skill;
-                let prompt;
-                if (skill && permalink) {
-                    prompt = `execute ${skill} skill with argument ${permalink}${imageInstruction}`;
-                } else if (skill) {
-                    prompt = `execute ${skill} skill with argument Alert: ${text.substring(0, 500)}${imageInstruction}`;
-                } else if (permalink) {
-                    prompt = `Investigate this Airflow delay alert: ${permalink}${imageInstruction}`;
-                } else {
-                    prompt = `Investigate this Airflow delay alert: ${text.substring(0, 500)}${imageInstruction}`;
-                }
+                const triggerDelayCliChain = this.config.delayAlertCliChain || ['claude'];
+                const triggerDelayAdapter = getCliAdapter(triggerDelayCliChain[0]);
+                const prompt = triggerDelayAdapter.buildAlertPrompt({
+                    skill,
+                    permalink,
+                    fallbackText: text,
+                    imageInstruction,
+                    fallbackIntro: 'Investigate this Airflow delay alert',
+                });
 
                 // DM owner that investigation is starting (manual trigger)
                 const alertInfo = this.delayAlertMonitor.extractAlertInfo(message);
@@ -2870,7 +3297,7 @@ ${formatted}`
                 );
 
                 // Use the regular command flow
-                await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs);
+                await this._processCommand(channelId, messageTs, prompt, null, messageTs, messageTs, null, triggerDelayCliChain);
                 res.json({ status: 'investigating', channelId, messageTs, skill: skill || 'none' });
             } catch (error) {
                 this.logger.error(`Trigger delay alert error: ${error.message}`);
@@ -3080,14 +3507,15 @@ ${formatted}`
                         : '';
                     const text = message.text || '';
                     const alertSkill = this.config.alertSkill;
-                    let prompt;
-                    if (alertSkill && permalink) {
-                        prompt = `execute ${alertSkill} skill with argument ${permalink}${imageInstruction}`;
-                    } else if (alertSkill) {
-                        prompt = `execute ${alertSkill} skill with argument Alert: ${text.substring(0, 500)}${imageInstruction}`;
-                    } else {
-                        prompt = `Investigate this PagerDuty alert: ${(permalink || text).substring(0, 500)}${imageInstruction}`;
-                    }
+                    const webhookCliChain = this.config.alertCliChain || ['claude'];
+                    const webhookAdapter = getCliAdapter(webhookCliChain[0]);
+                    const prompt = webhookAdapter.buildAlertPrompt({
+                        skill: alertSkill,
+                        permalink,
+                        fallbackText: text,
+                        imageInstruction,
+                        fallbackIntro: 'Investigate this PagerDuty alert',
+                    });
 
                     const position = this._enqueueAlert({ incidentId, channelId, messageTs, prompt, alertType: 'pagerduty' });
                     if (position > 0) {
@@ -3191,6 +3619,7 @@ ${formatted}`
         // Reconcile DB sessions with live tmux sessions
         await this._reconcileSessions();
         this._startSessionSweep();
+        this._startStallMonitor();
         this.logger.info(`[startup] reconcileSessions: ${Date.now() - t0}ms`);
 
         const t1 = Date.now();
@@ -3221,6 +3650,11 @@ ${formatted}`
         if (this._sweepInterval) {
             clearInterval(this._sweepInterval);
             this._sweepInterval = null;
+        }
+
+        if (this._stallMonitorInterval) {
+            clearInterval(this._stallMonitorInterval);
+            this._stallMonitorInterval = null;
         }
 
         if (this._healthCheckInterval) {

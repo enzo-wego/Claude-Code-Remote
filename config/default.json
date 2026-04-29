@@ -11,5 +11,9 @@
       "enabled": true,
       "priority": 1
     }
+  },
+  "cli": {
+    "alertCliChain": ["claude"],
+    "delayAlertCliChain": ["claude"]
   }
 }
