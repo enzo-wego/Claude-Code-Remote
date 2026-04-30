@@ -770,28 +770,17 @@ ${formatted}`
 
         const client = receiver.client;
 
-        client.on('connected', () => {
-            this.connected = true;
-            this.logger.info('Socket Mode connected');
-            // Reset in-memory error state immediately
-            this._wsErrors = [];
-            this._wsEscalationLevel = 0;
-
-            // Clear persisted restart state after 5 min of stable connection.
-            // If WS breaks again before 5 min, the restart count is preserved
-            // so the escalation can reach NOTIFY/EXIT stages.
-            if (this._wsStabilityTimer) clearTimeout(this._wsStabilityTimer);
-            this._wsStabilityTimer = setTimeout(() => {
-                if (this.connected) {
-                    this._clearRestartState();
-                    this.logger.info('WebSocket stable for 5min — cleared restart state');
-                }
-            }, 300000); // 5 min
-        });
+        client.on('connected', () => this._handleSocketConnected());
 
         client.on('disconnected', () => {
             this.connected = false;
             this.logger.warn('Socket Mode disconnected');
+            // Abort any pending recovery DM — if WS is dropping again, the
+            // previous failure has not actually recovered yet.
+            if (this._wsRecoveryNoticeTimer) {
+                clearTimeout(this._wsRecoveryNoticeTimer);
+                this._wsRecoveryNoticeTimer = null;
+            }
             this._recordWsError('disconnected', 'Socket Mode disconnected');
         });
 
@@ -809,6 +798,43 @@ ${formatted}`
         client.on('reconnecting', () => {
             this.logger.info('Socket Mode reconnecting...');
         });
+
+        // app.start() already returned, meaning the socket is connected; the
+        // 'connected' event has already fired and our listener missed it.
+        // Invoke the handler once to catch up. The handler is idempotent.
+        this._handleSocketConnected();
+    }
+
+    _handleSocketConnected() {
+        const wasConnected = this.connected;
+        this.connected = true;
+        if (!wasConnected) this.logger.info('Socket Mode connected');
+        this._wsErrors = [];
+        this._wsEscalationLevel = 0;
+
+        // If the previous process exited and DM'd the owner, send a recovery
+        // DM once the new connection holds for 30s.
+        if (this._pendingRecoveryNotice && !this._wsRecoveryNoticeTimer) {
+            const prev = this._pendingRecoveryNotice;
+            this._wsRecoveryNoticeTimer = setTimeout(() => {
+                this._wsRecoveryNoticeTimer = null;
+                if (!this.connected || !this._pendingRecoveryNotice) return;
+                this._pendingRecoveryNotice = null;
+                this._saveRestartState();
+                this._notifyOwnerWsRecovered(prev).catch(err =>
+                    this.logger.error(`Recovery notice failed: ${err.message}`)
+                );
+            }, 30000);
+        }
+
+        // Clear persisted restart state after 5 min of stable connection.
+        if (this._wsStabilityTimer) clearTimeout(this._wsStabilityTimer);
+        this._wsStabilityTimer = setTimeout(() => {
+            if (this.connected) {
+                this._clearRestartState();
+                this.logger.info('WebSocket stable for 5min — cleared restart state');
+            }
+        }, 300000);
     }
 
     _startHealthCheck() {
@@ -873,6 +899,14 @@ ${formatted}`
                 if (timestamps.length > 0) {
                     this.logger.info(`Loaded ${timestamps.length} recent restart(s) from previous process`);
                 }
+                if (data.pendingRecoveryNotice) {
+                    this._pendingRecoveryNotice = {
+                        notifiedAt: data.notifiedAt || null,
+                        previousErrorCount: data.previousErrorCount || 0,
+                        previousRestartsInWindow: data.previousRestartsInWindow || 0,
+                    };
+                    this.logger.info('Pending recovery notice loaded — will DM owner once WS connection holds');
+                }
                 return timestamps;
             }
         } catch (err) {
@@ -881,21 +915,41 @@ ${formatted}`
         return [];
     }
 
-    _saveRestartState() {
+    _saveRestartState(extraFields = {}) {
         try {
             const cutoff = Date.now() - this._wsRestartWindowMs;
             this._wsRestartTimestamps = this._wsRestartTimestamps.filter(ts => ts > cutoff);
-            fs.writeFileSync(this._wsRestartStateFile, JSON.stringify({
+            const payload = {
                 timestamps: this._wsRestartTimestamps,
-                updatedAt: new Date().toISOString()
-            }));
+                updatedAt: new Date().toISOString(),
+                ...extraFields,
+            };
+            fs.writeFileSync(this._wsRestartStateFile, JSON.stringify(payload));
         } catch (err) {
             this.logger.warn(`Failed to save restart state: ${err.message}`);
         }
     }
 
+    _markPendingRecoveryNotice(errorCount, restartsInWindow) {
+        try {
+            const cutoff = Date.now() - this._wsRestartWindowMs;
+            this._wsRestartTimestamps = this._wsRestartTimestamps.filter(ts => ts > cutoff);
+            fs.writeFileSync(this._wsRestartStateFile, JSON.stringify({
+                timestamps: this._wsRestartTimestamps,
+                updatedAt: new Date().toISOString(),
+                pendingRecoveryNotice: true,
+                notifiedAt: new Date().toISOString(),
+                previousErrorCount: errorCount,
+                previousRestartsInWindow: restartsInWindow,
+            }));
+        } catch (err) {
+            this.logger.warn(`Failed to mark pending recovery notice: ${err.message}`);
+        }
+    }
+
     _clearRestartState() {
         this._wsRestartTimestamps = [];
+        this._pendingRecoveryNotice = null;
         try {
             if (fs.existsSync(this._wsRestartStateFile)) {
                 fs.unlinkSync(this._wsRestartStateFile);
@@ -1028,8 +1082,39 @@ ${formatted}`
                 text,
             });
             this.logger.info('Owner notified of WebSocket failure via DM');
+            if (isExiting) {
+                this._markPendingRecoveryNotice(errorCount, restarts);
+            }
         } catch (err) {
             this.logger.error(`Failed to notify owner: ${err.message}`);
+        }
+    }
+
+    async _notifyOwnerWsRecovered(prev) {
+        const ownerId = this.config.ownerUserId;
+        if (!ownerId) return;
+
+        const downSeconds = prev.notifiedAt
+            ? Math.max(0, Math.round((Date.now() - new Date(prev.notifiedAt).getTime()) / 1000))
+            : null;
+        const downText = downSeconds === null
+            ? 'unknown'
+            : downSeconds < 90
+                ? `${downSeconds}s`
+                : `${Math.round(downSeconds / 60)} min`;
+
+        const text = [
+            `:white_check_mark: *WebSocket Recovered Automatically*`,
+            `*Down for:* ${downText}`,
+            `*Previous failure:* ${prev.previousErrorCount} errors / ${prev.previousRestartsInWindow} restarts in 10min`,
+            `*Action:* No action needed — system is back to normal.`,
+        ].join('\n');
+
+        try {
+            await this.app.client.chat.postMessage({ channel: ownerId, text });
+            this.logger.info('Owner notified of WebSocket recovery via DM');
+        } catch (err) {
+            this.logger.error(`Failed to notify owner of recovery: ${err.message}`);
         }
     }
 
