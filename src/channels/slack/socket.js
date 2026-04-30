@@ -142,10 +142,16 @@ class SlackSocketHandler {
                 prompt      TEXT NOT NULL,
                 status      TEXT NOT NULL DEFAULT 'pending',
                 alert_type  TEXT NOT NULL DEFAULT 'pagerduty',
+                retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at  INTEGER NOT NULL,
                 updated_at  INTEGER NOT NULL
             )
         `);
+        try {
+            this.db.exec('ALTER TABLE alert_queue ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0');
+        } catch {
+            // Column already exists
+        }
         this.db.exec('CREATE INDEX IF NOT EXISTS idx_alert_queue_status ON alert_queue(status)');
 
         this._stmts = {
@@ -179,7 +185,9 @@ class SlackSocketHandler {
             countProcessing: this.db.prepare("SELECT COUNT(*) as count FROM alert_queue WHERE status = 'processing'"),
             getProcessing: this.db.prepare("SELECT * FROM alert_queue WHERE status = 'processing'"),
             getByMessage: this.db.prepare("SELECT * FROM alert_queue WHERE channel_id = ? AND message_ts = ? AND status IN ('pending', 'processing') LIMIT 1"),
+            getLatestForMessage: this.db.prepare("SELECT * FROM alert_queue WHERE channel_id = ? AND message_ts = ? ORDER BY id DESC LIMIT 1"),
             updateStatus: this.db.prepare('UPDATE alert_queue SET status = ?, updated_at = ? WHERE id = ?'),
+            requeueForRetry: this.db.prepare("UPDATE alert_queue SET status = 'pending', retry_count = retry_count + 1, updated_at = ? WHERE id = ? AND status = 'processing'"),
             complete: this.db.prepare("UPDATE alert_queue SET status = 'completed', updated_at = ? WHERE channel_id = ? AND message_ts = ? AND status = 'processing'"),
             cleanOld: this.db.prepare("DELETE FROM alert_queue WHERE status IN ('completed', 'failed') AND updated_at < ?"),
             all: this.db.prepare('SELECT * FROM alert_queue ORDER BY created_at DESC LIMIT 50'),
@@ -321,7 +329,50 @@ class SlackSocketHandler {
             });
     }
 
-    _completeQueueItem(channelId, messageTs) {
+    _completeQueueItem(channelId, messageTs, opts = {}) {
+        const { silent = false } = opts;
+        const maxRetries = this.config.alertSilentMaxRetries ?? 2;
+
+        // Silent failure: investigation produced no output. Requeue if we
+        // still have retry budget, so the same alert gets a fresh tmux run
+        // (covering the Codex-splash-swallowed-prompt class of bug).
+        if (silent) {
+            const item = this._queueStmts.getLatestForMessage.get(channelId, messageTs);
+            // Only requeue items that are still 'processing' — anything else
+            // (already completed/failed/missing) means a different code path
+            // already settled it; don't double-handle.
+            if (item && item.status === 'processing' && item.retry_count < maxRetries) {
+                const result = this._queueStmts.requeueForRetry.run(Date.now(), item.id);
+                if (result.changes > 0) {
+                    const attempt = item.retry_count + 2; // human-friendly: 2nd attempt, 3rd attempt...
+                    const total = maxRetries + 1;
+                    this.logger.warn(`Alert queue: silent failure detected — requeue id=${item.id} attempt=${attempt}/${total}`);
+                    // Restore eyes on the alert message (cleanup paths swap to
+                    // ✅ before calling us; flip it back since we're retrying).
+                    this._removeReaction(channelId, messageTs, 'white_check_mark').catch(() => {});
+                    this._addReaction(channelId, messageTs, 'eyes').catch(() => {});
+                    this.app.client.chat.postMessage({
+                        channel: channelId,
+                        thread_ts: messageTs,
+                        text: `:repeat: Investigation produced no output (likely a CLI startup race) — retrying (attempt ${attempt}/${total}).`
+                    }).catch(err => this.logger.error(`Failed to post requeue notice: ${err.message}`));
+                    setImmediate(() => this._processNextInQueue());
+                    return;
+                }
+            }
+            // Out of retries (or item not found / already settled): post a
+            // give-up notice so the on-call human knows to triage manually,
+            // then fall through to normal completion.
+            if (item && item.status === 'processing' && item.retry_count >= maxRetries) {
+                this.logger.error(`Alert queue: giving up on silent failure id=${item.id} after ${item.retry_count + 1} attempts`);
+                this.app.client.chat.postMessage({
+                    channel: channelId,
+                    thread_ts: messageTs,
+                    text: `:x: Investigation gave up after ${item.retry_count + 1} silent failures — manual triage required.`
+                }).catch(err => this.logger.error(`Failed to post give-up notice: ${err.message}`));
+            }
+        }
+
         const result = this._queueStmts.complete.run(Date.now(), channelId, messageTs);
         if (result.changes > 0) {
             this.logger.info(`Alert queue: completed item channel=${channelId} ts=${messageTs}`);
@@ -2305,7 +2356,8 @@ ${formatted}`
                 if (isAlertSession && session.alertMessageTs) {
                     await this._removeReaction(session.channelId, session.alertMessageTs, 'eyes').catch(() => {});
                     await this._addReaction(session.channelId, session.alertMessageTs, 'white_check_mark').catch(() => {});
-                    this._completeQueueItem(session.channelId, session.alertMessageTs);
+                    // tmux died with no Codex/Claude output buffered → silent failure (e.g. splash-swallowed prompt). Requeue if budget allows.
+                    this._completeQueueItem(session.channelId, session.alertMessageTs, { silent: alertBuffer.length === 0 });
                 }
                 this.logger.info(`Poller stopped: tmux session ${sessionName} is dead`);
                 return;
@@ -2338,7 +2390,8 @@ ${formatted}`
                     if (sess?.alertMessageTs) {
                         await this._removeReaction(sess.channelId, sess.alertMessageTs, 'eyes').catch(() => {});
                         await this._addReaction(sess.channelId, sess.alertMessageTs, 'white_check_mark').catch(() => {});
-                        this._completeQueueItem(sess.channelId, sess.alertMessageTs);
+                        // 30-min poller timeout with empty alertBuffer → CLI hung without producing anything. Requeue.
+                        this._completeQueueItem(sess.channelId, sess.alertMessageTs, { silent: alertBuffer.length === 0 });
                     }
                 }
                 return;
@@ -2535,7 +2588,11 @@ ${formatted}`
                     // Alert session: swap reactions
                     await this._removeReaction(session.channelId, session.alertMessageTs, 'eyes');
                     await this._addReaction(session.channelId, session.alertMessageTs, 'white_check_mark');
-                    this._completeQueueItem(session.channelId, session.alertMessageTs);
+                    // Inactivity timeout for an alert that's still in 'processing' state means
+                    // the completion-marker path never ran. Hand silent=true; _completeQueueItem
+                    // gates the requeue on the queue item still being 'processing', so completed
+                    // items are no-op'd.
+                    this._completeQueueItem(session.channelId, session.alertMessageTs, { silent: true });
                 }
 
                 if (!session.alertMessageTs || isAlertWithUserChat) {
