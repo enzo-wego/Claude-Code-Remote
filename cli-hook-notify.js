@@ -15,6 +15,7 @@ const path = require('path');
 const fs = require('fs');
 const dotenv = require('dotenv');
 const { execSync } = require('child_process');
+const { postOncallDoubleCheck } = require('./src/services/oncall-mention');
 
 // Load environment variables from the project directory
 const projectDir = path.dirname(__filename);
@@ -636,6 +637,38 @@ async function sendHookNotification() {
                     } catch { /* no warning posted */ }
 
                     markAlertQueueComplete(channelId, alertMessageTs);
+
+                    // Post the L1 on-call ping at most once per alert. The bot
+                    // service's poller and this hook race to mark the queue
+                    // 'completed', so we cannot rely on markAlertQueueComplete's
+                    // changes count for "first time" — instead we use an atomic
+                    // stash-file claim (`wx` flag = create-or-fail). Same pattern
+                    // as primaryFile/warningFile above.
+                    const pingMarkerFile = `/tmp/hook-l1ping-${slackSessionKey}`;
+                    let claimedPing = false;
+                    try {
+                        fs.writeFileSync(pingMarkerFile, String(Date.now()), { flag: 'wx' });
+                        claimedPing = true;
+                    } catch (err) {
+                        if (err.code !== 'EEXIST') {
+                            console.error(`L1 ping: failed to claim marker ${pingMarkerFile}: ${err.message} — skipping ping`);
+                        }
+                    }
+                    if (claimedPing) {
+                        try {
+                            await postOncallDoubleCheck({
+                                web,
+                                dbPath: path.join(projectDir, 'src/data/slack-sessions.db'),
+                                channelId,
+                                threadTs,
+                                alertMessageTs,
+                                pagerdutyApiToken: process.env.PAGERDUTY_API_TOKEN,
+                                ownerUserId: process.env.SLACK_OWNER_USER_ID,
+                            });
+                        } catch (err) {
+                            console.error(`postOncallDoubleCheck threw unexpectedly: ${err.message}`);
+                        }
+                    }
                 } else {
                     // No valid report on this Stop.
                     // If we already have a primary posted, the user has a clean answer —
