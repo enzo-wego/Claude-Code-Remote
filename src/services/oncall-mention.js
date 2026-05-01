@@ -5,10 +5,11 @@
  * mentioning the configured owner. Never throws — must not break the
  * report flow.
  *
- * Email → Slack user ID is a hand-maintained static map (below). The
- * Slack bot does not have the `users:read.email` scope, so we don't call
- * users.lookupByEmail. Update PD_EMAIL_TO_SLACK_USER_ID when teammates
- * join or leave the on-call rotation.
+ * Email → Slack user ID comes from PD_EMAIL_SLACK_MAP in .env. The
+ * Slack bot does not have the `users:read.email` scope, so we don't
+ * call users.lookupByEmail. Format:
+ *   PD_EMAIL_SLACK_MAP=lei@wego.com:UUK3WPNNQ,yanyi@wego.com:U050BBA607M
+ * Update the env var when team membership changes; restart the service.
  */
 
 const axios = require('axios');
@@ -17,14 +18,23 @@ const Database = require('better-sqlite3');
 const PD_BASE = 'https://api.pagerduty.com';
 const DOUBLE_CHECK_TEXT = 'final report above, AI can make mistakes, help to double-check';
 
-// Hand-maintained map of PagerDuty user email → Slack user ID. Keys are
-// lower-cased. Update when team membership changes.
-const PD_EMAIL_TO_SLACK_USER_ID = {
-    'lei@wego.com':   'UUK3WPNNQ',     // Lei
-    'yanyi@wego.com': 'U050BBA607M',   // Yan Yi
-    'zen@wego.com':   'UL2TNCQ87',     // Zen Quah
-    'enzo@wego.com':  'U07UAC0J7T3',   // Tung Enzo
-};
+function parsePdEmailMap(envVal) {
+    const map = {};
+    if (!envVal) return map;
+    for (const pair of envVal.split(',')) {
+        const trimmed = pair.trim();
+        if (!trimmed) continue;
+        const idx = trimmed.indexOf(':');
+        if (idx === -1) {
+            console.error(`PD_EMAIL_SLACK_MAP: skipping malformed entry "${trimmed}" (expected "email:slack_user_id")`);
+            continue;
+        }
+        const email = trimmed.substring(0, idx).trim().toLowerCase();
+        const slackId = trimmed.substring(idx + 1).trim();
+        if (email && slackId) map[email] = slackId;
+    }
+    return map;
+}
 
 function pdHeaders(token) {
     return {
@@ -66,7 +76,8 @@ async function getL1Email(escalationPolicyId, token) {
 
 function resolveSlackUserId(email) {
     if (!email) return null;
-    return PD_EMAIL_TO_SLACK_USER_ID[email.toLowerCase()] || null;
+    const map = parsePdEmailMap(process.env.PD_EMAIL_SLACK_MAP);
+    return map[email.toLowerCase()] || null;
 }
 
 async function postOncallDoubleCheck({
@@ -129,6 +140,6 @@ async function postOncallDoubleCheck({
 module.exports = {
     postOncallDoubleCheck,
     resolveSlackUserId,
-    PD_EMAIL_TO_SLACK_USER_ID,
+    parsePdEmailMap,
     DOUBLE_CHECK_TEXT,
 };
