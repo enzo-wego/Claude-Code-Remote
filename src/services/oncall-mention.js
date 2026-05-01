@@ -1,35 +1,36 @@
 /**
  * Posts an "@<L1> please double-check" follow-up message under an alert
  * investigation's final report. Best-effort: any failure (PD API down,
- * no on-call configured, Slack lookup miss) falls back to mentioning the
- * configured owner. Never throws — must not break the report flow.
+ * no on-call for the policy, email not in our static map) falls back to
+ * mentioning the configured owner. Never throws — must not break the
+ * report flow.
  *
- * Slack user IDs are cached in `pd_slack_user_cache` so we only hit
- * `users.lookupByEmail` once per ~30 days per teammate.
+ * Email → Slack user ID is a hand-maintained static map (below). The
+ * Slack bot does not have the `users:read.email` scope, so we don't call
+ * users.lookupByEmail. Update PD_EMAIL_TO_SLACK_USER_ID when teammates
+ * join or leave the on-call rotation.
  */
 
 const axios = require('axios');
 const Database = require('better-sqlite3');
 
 const PD_BASE = 'https://api.pagerduty.com';
-const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const DOUBLE_CHECK_TEXT = 'final report above, AI can make mistakes, help to double-check';
+
+// Hand-maintained map of PagerDuty user email → Slack user ID. Keys are
+// lower-cased. Update when team membership changes.
+const PD_EMAIL_TO_SLACK_USER_ID = {
+    'lei@wego.com':   'UUK3WPNNQ',     // Lei
+    'yanyi@wego.com': 'U050BBA607M',   // Yan Yi
+    'zen@wego.com':   'UL2TNCQ87',     // Zen Quah
+    'enzo@wego.com':  'U07UAC0J7T3',   // Tung Enzo
+};
 
 function pdHeaders(token) {
     return {
         Authorization: `Token token=${token}`,
         Accept: 'application/vnd.pagerduty+json;version=2',
     };
-}
-
-function ensureCacheTable(db) {
-    db.exec(`CREATE TABLE IF NOT EXISTS pd_slack_user_cache (
-        pd_email      TEXT PRIMARY KEY,
-        slack_user_id TEXT,
-        slack_name    TEXT,
-        looked_up_at  INTEGER NOT NULL,
-        not_found     INTEGER NOT NULL DEFAULT 0
-    )`);
 }
 
 function readIncidentIdFromQueue(db, channelId, alertMessageTs) {
@@ -63,32 +64,9 @@ async function getL1Email(escalationPolicyId, token) {
     return l1?.user?.email || null;
 }
 
-async function resolveSlackUserId({ email, web, db, ttlMs = CACHE_TTL_MS }) {
-    ensureCacheTable(db);
-    const row = db.prepare('SELECT * FROM pd_slack_user_cache WHERE pd_email = ?').get(email);
-    const now = Date.now();
-    if (row && (now - row.looked_up_at) < ttlMs) {
-        return row.not_found ? null : row.slack_user_id;
-    }
-    let slackUserId = null;
-    let slackName = null;
-    let notFound = 0;
-    try {
-        const apiRes = await web.users.lookupByEmail({ email });
-        slackUserId = apiRes?.user?.id || null;
-        slackName = apiRes?.user?.real_name || apiRes?.user?.name || null;
-    } catch (err) {
-        if (err?.data?.error === 'users_not_found') {
-            notFound = 1;
-        } else {
-            throw err;
-        }
-    }
-    db.prepare(
-        'INSERT INTO pd_slack_user_cache (pd_email, slack_user_id, slack_name, looked_up_at, not_found) VALUES (?, ?, ?, ?, ?) ' +
-        'ON CONFLICT(pd_email) DO UPDATE SET slack_user_id = excluded.slack_user_id, slack_name = excluded.slack_name, looked_up_at = excluded.looked_up_at, not_found = excluded.not_found'
-    ).run(email, slackUserId, slackName, now, notFound);
-    return notFound ? null : slackUserId;
+function resolveSlackUserId(email) {
+    if (!email) return null;
+    return PD_EMAIL_TO_SLACK_USER_ID[email.toLowerCase()] || null;
 }
 
 async function postOncallDoubleCheck({
@@ -120,11 +98,11 @@ async function postOncallDoubleCheck({
         const email = await getL1Email(epId, pagerdutyApiToken);
         if (!email) throw new Error(`no L1 oncall for escalation_policy ${epId}`);
 
-        const slackUserId = await resolveSlackUserId({ email, web, db });
+        const slackUserId = resolveSlackUserId(email);
         if (slackUserId) {
             mention = `<@${slackUserId}>`;
         } else {
-            (logger.warn || logger.error || console.error)(`Oncall: Slack lookup miss for ${email}; falling back to owner`);
+            (logger.warn || logger.error || console.error)(`Oncall: ${email} not in PD_EMAIL_TO_SLACK_USER_ID map; falling back to owner`);
         }
     } catch (err) {
         (logger.error || console.error)(`Oncall lookup failed: ${err.message}; falling back to owner`);
@@ -151,6 +129,6 @@ async function postOncallDoubleCheck({
 module.exports = {
     postOncallDoubleCheck,
     resolveSlackUserId,
-    ensureCacheTable,
+    PD_EMAIL_TO_SLACK_USER_ID,
     DOUBLE_CHECK_TEXT,
 };
