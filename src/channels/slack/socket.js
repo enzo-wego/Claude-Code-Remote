@@ -2180,6 +2180,30 @@ ${formatted}`
                 throw new Error(`Paste failed after ${pasteMaxAttempts} attempts — ${cliType} may not be ready`);
             }
 
+            // LAYER 1 GUARD — splash-wipe race protection.
+            // Between paste-verify and the first Enter, a still-settling splash
+            // banner can redraw and clear the input box (TCSAFLUSH-style flush
+            // on TUI init). Enter would then submit empty, Claude would never
+            // start a turn, and the Stop hook would never fire. Re-check the
+            // pane right before pressing Enter and re-paste if the content is gone.
+            {
+                const firstLine = command.split('\n')[0].substring(0, 40);
+                const pasteIndicators = adapter.pasteLandedIndicators || [/Pasted text/i];
+                const stillVisible = (out) =>
+                    pasteIndicators.some(p => typeof p === 'string' ? out.includes(p) : p.test(out))
+                    || (firstLine && out.includes(firstLine))
+                    || indicatorHit(out);
+                const preEnterOutput = this._captureOutput(sessionName);
+                if (!stillVisible(preEnterOutput)) {
+                    this.logger.warn(`Input box empty before first Enter — splash redraw wiped paste, re-pasting for ${sessionName}`);
+                    execSync(`tmux send-keys -t ${sessionName} C-u`);
+                    await new Promise(r => setTimeout(r, 200));
+                    execSync(`tmux load-buffer ${tmpFile}`);
+                    execSync(`tmux paste-buffer -t ${sessionName}`);
+                    await new Promise(r => setTimeout(r, 1500));
+                }
+            }
+
             // Send Enter and verify the CLI started processing.
             const maxAttempts = 5;
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -2341,6 +2365,7 @@ ${formatted}`
         let stableCount = 0;
         let attempts = 0;
         let processing = false;
+        let everSawWorking = false; // LAYER 3 — silent-drop detector
         const maxAttempts = Math.ceil((this.config.pollerTimeoutMs || 1800000) / 1000); // default 30 min
         const stableThreshold = 3;
 
@@ -2355,6 +2380,21 @@ ${formatted}`
                 // Don't post here — the Stop hook handles alert posting from the clean transcript.
                 if (alertBuffer) {
                     this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on tmux death for ${sessionName} — hook will post`);
+                }
+                // LAYER 3 — silent-drop notice. If we never saw the CLI enter
+                // working state, the input was almost certainly dropped (splash
+                // wipe, Enter swallowed, etc.) and no Stop hook will fire.
+                // Tell the user instead of failing silent.
+                if (!everSawWorking) {
+                    this.logger.warn(`Silent input drop detected for ${sessionName} (tmux died, working never observed)`);
+                    try {
+                        await say({
+                            text: `:x: \`${session.cliType || 'cli'}\` never started a turn — your message was likely dropped (splash redraw or Enter swallowed). Please reply again to retry.`,
+                            thread_ts: threadTs,
+                        });
+                    } catch (err) {
+                        this.logger.error(`Failed to post silent-drop notice: ${err.message}`);
+                    }
                 }
                 // Swap alert reactions (👀→✅) when tmux dies
                 if (isAlertSession && session.alertMessageTs) {
@@ -2374,7 +2414,16 @@ ${formatted}`
                 this.pollers.delete(pollKey);
                 this.logger.warn(`Poller timeout after ${maxAttempts}s for ${sessionName} (alert=${isAlertSession})`);
                 try {
-                    if (alertBuffer) {
+                    if (!everSawWorking) {
+                        // LAYER 3 — silent-drop notice. 30 min of polling and the
+                        // CLI never entered working state once. Input was almost
+                        // certainly dropped; no Stop hook will fire. Notify the user.
+                        this.logger.warn(`Silent input drop detected for ${sessionName} (timeout, working never observed)`);
+                        await say({
+                            text: `:x: \`${session.cliType || 'cli'}\` never started a turn — your message was likely dropped (splash redraw or Enter swallowed). Please reply again to retry.`,
+                            thread_ts: threadTs,
+                        });
+                    } else if (alertBuffer) {
                         // Don't post here — the Stop hook handles alert posting from the clean transcript.
                         this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on timeout for ${sessionName} — hook will post`);
                     } else if (!isAlertSession) {
@@ -2444,6 +2493,7 @@ ${formatted}`
             const isWorking =
                 adapter.workingIndicators.some(ind => tailText.includes(ind)) ||
                 (adapter.workingRegexes || []).some(re => re.test(tailText));
+            if (isWorking) everSawWorking = true;
 
             if (attempts % 10 === 0) {
                 const lastFiveLines = lines.slice(-5).map(l => l.trim()).join(' | ');
