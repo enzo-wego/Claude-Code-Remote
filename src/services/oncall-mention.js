@@ -16,7 +16,7 @@ const axios = require('axios');
 const Database = require('better-sqlite3');
 
 const PD_BASE = 'https://api.pagerduty.com';
-const DOUBLE_CHECK_TEXT = 'final report above, AI can make mistakes, help to double-check';
+const DOUBLE_CHECK_TEXT = '(L1 PagerDuty on-call for this service) — final report above. AI can make mistakes, please double-check.';
 
 function parsePdEmailMap(envVal) {
     const map = {};
