@@ -67,11 +67,22 @@ function removeOurHooks(list) {
     return filtered.length > 0 ? filtered : undefined;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 module.exports = {
     type: 'claude',
 
     buildLaunchCommand(/* sessionName, repoPath, sessionKey */) {
         return process.env.SLACK_CLAUDE_COMMAND || 'claude --dangerously-skip-permissions';
+    },
+
+    // Returns the launch command with `--resume <uuid>` appended, or null when
+    // the id is malformed. Returning null tells the caller to fall back to
+    // buildLaunchCommand (fresh session). UUID is whitelist-validated to keep
+    // the eventual `tmux send-keys` shell-safe.
+    buildResumeCommand(sessionId) {
+        if (!UUID_RE.test(String(sessionId || ''))) return null;
+        return `${this.buildLaunchCommand()} --resume ${sessionId}`;
     },
 
     // How long to wait for the TUI to be ready before injecting the first command.

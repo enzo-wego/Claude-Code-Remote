@@ -1594,14 +1594,25 @@ ${formatted}`
                 const resumeChain = cliChainHint && cliChainHint.length > 0
                     ? cliChainHint
                     : (resumeSavedCli === 'claude' ? ['claude'] : [resumeSavedCli, 'claude']);
-                this.logger.warn(`Tmux session ${session.sessionName} is dead, recreating in ${session.repoPath} (chain=${resumeChain.join('→')})...`);
-                await say({ text: `Resuming session in \`${session.repoPath}\` (CLI chain: ${resumeChain.join(' → ')})... :rocket:`, thread_ts: threadTs });
+                // If we have a saved CLI session id AND the chain leads with
+                // the same CLI, ask the launcher to use the adapter's resume
+                // command. Different first CLI → resume id wouldn't apply.
+                const resumeIdForFirst = (resumeChain[0] === resumeSavedCli && session.claudeSessionId)
+                    ? session.claudeSessionId : null;
+                this.logger.warn(`Tmux session ${session.sessionName} is dead, recreating in ${session.repoPath} (chain=${resumeChain.join('→')}${resumeIdForFirst ? `, resume=${resumeIdForFirst}` : ''})...`);
+                await say({
+                    text: resumeIdForFirst
+                        ? `Resuming \`${resumeSavedCli}\` session in \`${session.repoPath}\` with prior context... :rocket:`
+                        : `Restarting session in \`${session.repoPath}\` (CLI chain: ${resumeChain.join(' → ')})... :rocket:`,
+                    thread_ts: threadTs,
+                });
 
                 const resumeResult = await this._startCliWithFallback({
                     sessionName: session.sessionName,
                     repoPath: session.repoPath,
                     sessionKey,
                     cliChain: resumeChain,
+                    resumeIdForFirst,
                     onFallback: async ({ failedCli, nextCli, reason }) => {
                         const body = nextCli
                             ? `:warning: \`${failedCli}\` failed to start (${reason}) — falling back to \`${nextCli}\`.`
@@ -1630,21 +1641,31 @@ ${formatted}`
                 // accepted readiness but won't take input → switch to Claude).
                 injectChain = resumeResult.remainingChain || [resumeResult.cliType];
                 this._touchSession(sessionKey);
-                // Reset claude_session_id so the new session's SessionStart hook can register.
-                // Without this, COALESCE preserves the dead session's ID and the Stop hook
-                // rejects the new session as a "subagent".
-                this._stmts.updateClaudeSessionId.run(null, Date.now(), sessionKey);
-                if (userId) this._updateLastUserId(sessionKey, userId);
+                if (resumeResult.resumed) {
+                    // CLI restored its own conversation history — keep the saved
+                    // session id and skip the thread-context replay block (the
+                    // CLI already remembers everything).
+                    this.logger.info(`Resumed ${resumeResult.cliType} session — skipping thread-context replay`);
+                } else {
+                    // Fresh CLI process: the resumed session id (if any)
+                    // belongs to the previous, now-dead process. Clear it so
+                    // the next SessionStart hook can register the new id
+                    // without COALESCE preserving the stale value (which
+                    // would make the Stop hook treat the new session as a
+                    // subagent).
+                    this._stmts.updateClaudeSessionId.run(null, Date.now(), sessionKey);
 
-                // Fetch thread context — summarize with Gemini if long
-                const allMessages = await this._fetchThreadMessages(channelId, threadTs);
-                if (allMessages.length > 10) {
-                    threadContext = await this._summarizeThreadContext(allMessages);
-                    this.logger.info(`Summarized thread context (recreated session): ${allMessages.length} messages`);
-                } else if (allMessages.length > 0) {
-                    threadContext = await this._formatThreadContext(allMessages);
-                    this.logger.info(`Full thread context (recreated session): ${allMessages.length} messages`);
+                    // Fetch thread context — summarize with Gemini if long.
+                    const allMessages = await this._fetchThreadMessages(channelId, threadTs);
+                    if (allMessages.length > 10) {
+                        threadContext = await this._summarizeThreadContext(allMessages);
+                        this.logger.info(`Summarized thread context (recreated session): ${allMessages.length} messages`);
+                    } else if (allMessages.length > 0) {
+                        threadContext = await this._formatThreadContext(allMessages);
+                        this.logger.info(`Full thread context (recreated session): ${allMessages.length} messages`);
+                    }
                 }
+                if (userId) this._updateLastUserId(sessionKey, userId);
             } else {
                 // Brand new conversation
                 const sessionName = this._generateSessionName(channelId, threadTs);
@@ -2066,7 +2087,7 @@ ${formatted}`
     // `remainingChain` starts at the resolved CLI and includes any CLIs that
     // weren't tried yet. The caller can use it to fall back further if the
     // resolved CLI later fails to accept input (e.g. paste rejection).
-    async _startCliWithFallback({ sessionName, repoPath, sessionKey, cliChain, onFallback }) {
+    async _startCliWithFallback({ sessionName, repoPath, sessionKey, cliChain, onFallback, resumeIdForFirst = null }) {
         const chain = (cliChain || []).filter(Boolean);
         if (chain.length === 0) chain.push('claude');
 
@@ -2074,11 +2095,24 @@ ${formatted}`
         for (let i = 0; i < chain.length; i++) {
             const cliType = chain[i];
             const adapter = getCliAdapter(cliType);
-            const cliCmd = adapter.buildLaunchCommand(sessionName, repoPath, sessionKey);
+            // Resume only on the first attempt and only for the saved CLI —
+            // a fallback CLI's session id wouldn't apply.
+            let cliCmd = null;
+            let resumed = false;
+            if (i === 0 && resumeIdForFirst && typeof adapter.buildResumeCommand === 'function') {
+                cliCmd = adapter.buildResumeCommand(resumeIdForFirst);
+                if (cliCmd) {
+                    resumed = true;
+                    this.logger.info(`Resuming ${cliType} session ${resumeIdForFirst} for ${sessionName}`);
+                }
+            }
+            if (!cliCmd) {
+                cliCmd = adapter.buildLaunchCommand(sessionName, repoPath, sessionKey);
+            }
             const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType);
 
             if (result.ok) {
-                return { ok: true, cliType, fellBackFrom, remainingChain: chain.slice(i) };
+                return { ok: true, cliType, fellBackFrom, remainingChain: chain.slice(i), resumed };
             }
 
             // Non-fatal failure (tmux not installed, launch error) — stop the
