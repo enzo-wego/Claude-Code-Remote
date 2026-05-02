@@ -1819,10 +1819,14 @@ ${formatted}`
                 return;
             }
 
-            // Build the full command with thread context if available
+            // Build the full command with thread context if available.
+            // Preamble points Claude at the bot's own source repo so meta-questions
+            // ("why was X tagged?", "how does the queue work?") can be answered
+            // accurately without requiring us to enumerate every behavior in a static doc.
+            const BOT_SELF_KNOWLEDGE_PREAMBLE = `You are responding inside a Slack thread for the EnzoBot Slack bot.\nIf the user asks about the bot's own behavior (notifications, tagging, queue, alerts, etc.),\nthe bot's source lives at /var/go/src/github.com/Claude-Code-Remote — read files there to answer accurately.\n\n`;
             let fullCommand = command;
             if (threadContext) {
-                fullCommand = `Here is the Slack thread discussion for context:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
+                fullCommand = `${BOT_SELF_KNOWLEDGE_PREAMBLE}Here is the Slack thread discussion for context:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
             }
 
             // Inject the command into the tmux session.
