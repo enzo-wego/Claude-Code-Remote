@@ -120,10 +120,18 @@ module.exports = {
     },
 
     // Gemini doesn't render a "[Pasted Content N chars]" placeholder — pasted
-    // text appears verbatim in the input box. Empty array forces the injector
-    // to fall through to its first-line literal-substring check (instead of
-    // the default Claude regex, which wouldn't match here).
-    pasteLandedIndicators: [],
+    // text appears verbatim after the `* ` bullet inside the input box.
+    // The literal-first-line fallback in the injector is too strict here:
+    // characters at the tail of the paste can get swallowed (e.g. `?` is
+    // bound to "open shortcuts" inside the TUI and gets interpreted as a
+    // keypress instead of appearing in the box), making `output.includes()`
+    // fail even when the paste effectively landed.
+    //
+    // Match the input row directly: a `* ` bullet followed by any
+    // non-whitespace that is NOT the empty-state placeholder
+    // (`Type your message or @path/to/file`). The negative lookahead lets us
+    // distinguish "user content rendered" from "empty input box".
+    pasteLandedIndicators: [/^\s*\*\s+(?!Type your message)\S/m],
 
     // Gemini's spinner row reads e.g. "⠦ Refining Find Command (esc to cancel, 6s)".
     // "esc to cancel" is the stable working signal (Codex uses "esc to interrupt",
