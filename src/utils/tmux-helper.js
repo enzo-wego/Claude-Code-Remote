@@ -16,6 +16,15 @@ function buildTmuxCommand(sessionName, repoPath, cliCmd, sessionKey, cliType) {
     const exports = [];
     if (sessionKey) exports.push(`export SLACK_SESSION_KEY='${sessionKey}'`);
     if (cliType) exports.push(`export CLI_SOURCE='${cliType}'`);
+    // Strip OMC's notification credentials before launching the CLI. OMC's
+    // Stop hook (installed in ~/.claude/settings.json by the user's interactive
+    // setup) screen-scrapes the tmux pane via `tmux capture-pane` and posts
+    // the tail to Slack with these tokens. Inside the bot, that double-posts
+    // alongside our cli-hook-notify.js — and includes the input-box ghost
+    // text Claude Code pre-fills as a "next action" suggestion. Our hook
+    // already posts the canonical assistant message; OMC's notification path
+    // adds noise. Unset so the spawned Claude (or its hooks) can't reach it.
+    exports.push('unset OMC_SLACK_BOT_TOKEN OMC_SLACK_APP_TOKEN OMC_SLACK_CHANNEL_ID');
     const envExport = exports.length ? exports.join(' && ') + ' && ' : '';
     // Use -li (login + interactive) so .zshrc is sourced and the full user
     // environment (PATH, custom env vars) is available. Without -i, non-interactive
