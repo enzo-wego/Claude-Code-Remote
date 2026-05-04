@@ -28,6 +28,22 @@ if (fs.existsSync(envPath)) {
     process.exit(1);
 }
 
+// Gemini's AfterAgent hook contract reads stdout as JSON to decide whether
+// to retry or accept the turn (e.g. `{decision:"deny"}` triggers a retry).
+// An empty stdout is treated as a malformed hook and the warning
+// "Hook(s) [...] failed" appears in the TUI — and the hook's effects (our
+// Slack post) get reported as failed even though the script itself exits 0.
+// Emit `{}` once on any exit so Gemini's parser is happy. Harmless for
+// Claude/Codex, which don't read hook stdout.
+let _stdoutFinalized = false;
+function _finalizeHookStdout() {
+    if (_stdoutFinalized) return;
+    _stdoutFinalized = true;
+    try { process.stdout.write('{}\n'); } catch { /* stdout closed */ }
+}
+process.on('exit', _finalizeHookStdout);
+process.on('beforeExit', _finalizeHookStdout);
+
 /**
  * Read JSON from stdin (Claude/Codex both deliver payloads this way, with different shapes).
  */
