@@ -2992,8 +2992,16 @@ ${formatted}`
         const responseLines = newLines.filter(line => {
             const trimmed = line.trim();
             if (!trimmed) return false;
-            if (trimmed === '>' || trimmed === '❯') return false;
-            if (trimmed.match(/^[>❯]\s*$/)) return false;
+            // Drop the input-box / prompt row entirely. Bare prompts (`>`, `❯`,
+            // `›`) are easy, but Claude's TUI also pre-fills the input box with
+            // a "next-action" suggestion (e.g. `❯ switch to main`) after a
+            // response. Without filtering those, the suggestion text leaks into
+            // the Slack post as if it were part of the assistant's reply.
+            // The filter here intentionally does NOT match bare `>` followed
+            // by content because Claude's responses can use `> ` for markdown
+            // blockquotes — only `❯` and `›` are reserved as TUI input prompts.
+            if (trimmed === '>' || trimmed === '❯' || trimmed === '›') return false;
+            if (trimmed.match(/^[❯›](?:\s|$)/)) return false;
             // Filter Claude CLI chrome/status bar lines
             if (trimmed.match(/^[─━═▪▐▛▜▝▘]+/) || trimmed.match(/^[─━═▪]+$/)) return false;
             if (trimmed.startsWith('Model:') || trimmed.includes('bypass permissions')) return false;
