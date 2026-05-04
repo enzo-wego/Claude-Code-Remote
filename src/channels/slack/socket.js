@@ -1560,6 +1560,13 @@ ${formatted}`
         const sessionKey = `${channelId}-${threadTs}`;
         let session = this._getSession(sessionKey);
         let threadContext = null; // Will hold formatted thread messages to prepend
+        // True when the user @mentions the bot with only a `start <cli> from <project>`
+        // keyword and no actual task. Used downstream to (a) skip the
+        // self-knowledge preamble — which an agentic CLI like Gemini reads as a
+        // standing instruction and starts auto-exploring on — and (b) for
+        // Gemini specifically, skip the inject entirely so the session sits
+        // ready until the user supplies a real task.
+        let isTrivialFirstMessage = false;
         // Tracks the still-untried CLIs starting at the currently-running one.
         // Set after _startCliWithFallback succeeds; consulted on inject failure
         // so a paste-rejecting CLI can hand off to the next one in the chain.
@@ -1747,6 +1754,7 @@ ${formatted}`
 
                 // If command was fully consumed by project pattern, default to "hi"
                 if (!command) {
+                    isTrivialFirstMessage = true;
                     command = 'hi';
                 }
 
@@ -1840,13 +1848,34 @@ ${formatted}`
                 return;
             }
 
+            // Gemini under --yolo plus the project-local Serena MCP onboarding flow
+            // treats any non-trivial first prompt as a standing directive to
+            // auto-explore and act. When the user @mentions only the start
+            // keyword (no real task), we'd otherwise inject "hi" + the
+            // self-knowledge preamble, which Gemini reads as "go set up the
+            // workspace" and starts editing files. Skip the inject — the
+            // session is already saved, so the next @mention in this thread
+            // will land on the live session and inject the real task.
+            if (isTrivialFirstMessage && session.cliType === 'gemini') {
+                this.logger.info(`Gemini session ${session.sessionName} ready; skipping inject for trivial first message`);
+                await say({
+                    text: `Gemini session ready in \`${session.repoPath}\`. What would you like me to work on?`,
+                    thread_ts: threadTs,
+                });
+                this._startSessionTimeout(sessionKey);
+                return;
+            }
+
             // Build the full command with thread context if available.
             // Preamble points Claude at the bot's own source repo so meta-questions
             // ("why was X tagged?", "how does the queue work?") can be answered
             // accurately without requiring us to enumerate every behavior in a static doc.
+            // Skipped on a trivial first message ("hi") because the preamble's
+            // "read files at <path>" instruction otherwise reads as a task by
+            // itself when no real user request follows.
             const BOT_SELF_KNOWLEDGE_PREAMBLE = `You are responding inside a Slack thread for the EnzoBot Slack bot.\nIf the user asks about the bot's own behavior (notifications, tagging, queue, alerts, etc.),\nthe bot's source lives at /var/go/src/github.com/Claude-Code-Remote — read files there to answer accurately.\n\n`;
             let fullCommand = command;
-            if (threadContext) {
+            if (threadContext && !isTrivialFirstMessage) {
                 fullCommand = `${BOT_SELF_KNOWLEDGE_PREAMBLE}Here is the Slack thread discussion for context:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
             }
 
