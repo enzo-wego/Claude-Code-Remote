@@ -87,11 +87,29 @@ function codexHooksFeatureEnabled() {
     }
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 module.exports = {
     type: 'codex',
 
     buildLaunchCommand(/* sessionName, repoPath, sessionKey */) {
         return process.env.CODEX_COMMAND || 'codex --dangerously-bypass-approvals-and-sandbox';
+    },
+
+    // Build a `codex resume <uuid> [flags]` invocation by splicing the
+    // `resume` subcommand after the executable token of CODEX_COMMAND.
+    // Codex's `resume` accepts the same global flags as the root command
+    // (--dangerously-bypass-approvals-and-sandbox, -c, etc.). Returns null
+    // when id is malformed or CODEX_COMMAND can't be parsed — caller falls
+    // back to buildLaunchCommand.
+    buildResumeCommand(sessionId) {
+        if (!UUID_RE.test(String(sessionId || ''))) return null;
+        const launch = this.buildLaunchCommand();
+        const m = launch.match(/^(\S+)(?:\s+(.*))?$/);
+        if (!m) return null;
+        const exe = m[1];
+        const rest = (m[2] || '').trim();
+        return rest ? `${exe} resume ${sessionId} ${rest}` : `${exe} resume ${sessionId}`;
     },
 
     // Mirror Claude's natural-language invocation. Codex skills register via

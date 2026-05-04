@@ -450,6 +450,32 @@ async function sendHookNotification() {
                 lastUserId = row.last_user_id || null;
                 rootSessionId = row.claude_session_id || null;
                 sessionName = row.session_name || null;
+
+                // Capture Codex's session_id on the first Stop where we see one.
+                // Codex has no SessionStart-equivalent hook, so the very first Stop
+                // is our only chance to learn the id. Read it from the raw payload
+                // (not the normalized one — normalize falls back to turn_id, which
+                // changes every turn and would overwrite the persistent id).
+                // Skip Claude here; its SessionStart hook owns this column.
+                if (cliSource === 'codex' && !row.claude_session_id && row.cli_type === 'codex') {
+                    const codexSessionId = rawInput && (rawInput.session_id || rawInput['session-id']);
+                    if (codexSessionId) {
+                        try {
+                            const dbWrite = new Database(dbPath);
+                            dbWrite.pragma('journal_mode = WAL');
+                            const result = dbWrite.prepare(
+                                'UPDATE sessions SET claude_session_id = ?, updated_at = ? WHERE session_key = ? AND claude_session_id IS NULL'
+                            ).run(codexSessionId, Date.now(), slackSessionKey);
+                            dbWrite.close();
+                            if (result.changes > 0) {
+                                rootSessionId = codexSessionId;
+                                console.error(`Codex session_id=${codexSessionId} captured on first Stop for key=${slackSessionKey}`);
+                            }
+                        } catch (writeErr) {
+                            console.error('Codex session_id capture failed:', writeErr.message);
+                        }
+                    }
+                }
             }
         }
     } catch (error) {
