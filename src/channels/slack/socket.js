@@ -1892,13 +1892,19 @@ ${formatted}`
             let lastInjectError = null;
             while (!injected) {
                 try {
+                    // Clear any stale "hook posted" marker from a previous turn
+                    // before this inject runs — otherwise _verifyTurnProgress
+                    // would short-circuit on the previous marker and skip
+                    // verification of THIS inject.
+                    try { fs.unlinkSync(`/tmp/cli-hook-post-${sessionKey}`); } catch { /* no prior marker */ }
+                    const injectStartedAt = Date.now();
                     const baseline = await this._injectCommand(session.sessionName, fullCommand, session.cliType);
                     // Guard against silent rejection (Codex at usage limit, Enter
                     // dropped by late banner redraw, etc.). _injectCommand can
                     // succeed because paste landed, but the CLI may never start
                     // a turn — without this check the poller would sit idle for
                     // 30 min and no fallback would fire.
-                    await this._verifyTurnProgress(session.sessionName, session.cliType, baseline);
+                    await this._verifyTurnProgress(session.sessionName, session.cliType, baseline, sessionKey, injectStartedAt);
                     injected = true;
                 } catch (injectError) {
                     lastInjectError = injectError;
@@ -2358,7 +2364,7 @@ ${formatted}`
     // contain the input box, footer (time/context %), and rotating hint
     // line — too noisy to compare against baseline. Strip them and compare
     // only the upper region.
-    async _verifyTurnProgress(sessionName, cliType, baseline, timeoutMs = 90000) {
+    async _verifyTurnProgress(sessionName, cliType, baseline, sessionKey = null, injectStartedAt = null, timeoutMs = 90000) {
         const adapter = getCliAdapter(cliType);
         const fatalPatterns = adapter.fatalErrorPatterns || [];
         const aboveTui = (text) => {
@@ -2369,6 +2375,7 @@ ${formatted}`
                 .trim();
         };
         const baselineUpper = aboveTui(baseline);
+        const markerPath = sessionKey ? `/tmp/cli-hook-post-${sessionKey}` : null;
         const start = Date.now();
         const intervalMs = 2000;
         // Initial settle — paste retries and Enter keystrokes leave the TUI
@@ -2384,6 +2391,18 @@ ${formatted}`
             const fatal = fatalPatterns.find(p => p.regex.test(output));
             if (fatal) {
                 throw new Error(`${cliType} ${fatal.reason}`);
+            }
+            // Authoritative success: cli-hook-notify.js drops a marker file
+            // when the Stop hook successfully posts the assistant message to
+            // Slack. If we see a fresh marker (newer than this inject's
+            // start), the turn definitely completed — skip the brittle
+            // scrollback-growth heuristic that false-positives when the
+            // response is short enough to fit inside the bottom-10 TUI rows.
+            if (markerPath && injectStartedAt) {
+                try {
+                    const ts = parseInt(fs.readFileSync(markerPath, 'utf8'), 10);
+                    if (Number.isFinite(ts) && ts >= injectStartedAt) return;
+                } catch { /* no marker yet — fall through to scrollback check */ }
             }
             const currentUpper = aboveTui(output);
             if (currentUpper.length > baselineUpper.length + 50 && currentUpper !== baselineUpper) {

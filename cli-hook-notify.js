@@ -919,6 +919,13 @@ async function sendHookNotification() {
             } else {
                 await sendResponse(web, channelId, threadTs, assistantMessage, stats, lastUserId);
                 console.error(`Response posted (${assistantMessage.length} chars) to ${channelId} thread=${threadTs}`);
+                // Drop a marker so the bot's _verifyTurnProgress can confirm
+                // the turn really completed even when Claude's reply is short
+                // enough to stay inside the bottom-10 TUI rows (which the
+                // scrollback-growth heuristic can't see).
+                try {
+                    fs.writeFileSync(`/tmp/cli-hook-post-${slackSessionKey}`, String(Date.now()));
+                } catch { /* best-effort marker; bot has fallback heuristic */ }
             }
         } catch (error) {
             console.error('Failed to post response:', error.message);
