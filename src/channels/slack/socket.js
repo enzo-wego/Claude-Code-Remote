@@ -2593,7 +2593,13 @@ ${formatted}`
                         // Regular session or subsequent alert responses
                         processing = true;
                         try {
-                            const sessionStats = this._extractSessionStats(currentOutput);
+                            // Gemini's tmux footer doesn't carry parseable Ctx/In/Out
+                            // figures; product convention is to show the model only
+                            // ("Auto (Gemini 3)"). For Claude/Codex we still parse
+                            // the footer line — same call site, different source.
+                            const sessionStats = adapter.type === 'gemini'
+                                ? { model: 'Auto (Gemini 3)' }
+                                : this._extractSessionStats(currentOutput);
                             this.logger.info(`Response extracted (${response.length} chars): "${response.substring(0, 200)}"`);
 
                             await this._sendResponse(say, threadTs, response, sessionStats);
@@ -2970,6 +2976,22 @@ ${formatted}`
         return responseLines.join('\n').trim();
     }
 
+    /**
+     * Build the italicized stats footer line, omitting any field the extractor
+     * didn't populate. Gemini sessions return only `model` ("Auto (Gemini 3)"),
+     * so the footer collapses to that single label; Claude/Codex still render
+     * the full "<model> · Ctx · In · Out" form.
+     */
+    _formatStatsLine(stats) {
+        if (!stats) return '';
+        const parts = [];
+        if (stats.model) parts.push(stats.model);
+        if (stats.context) parts.push(`Ctx: ${stats.context}`);
+        if (stats.tokensIn) parts.push(`In: ${stats.tokensIn}`);
+        if (stats.tokensOut) parts.push(`Out: ${stats.tokensOut}`);
+        return parts.length > 0 ? `\n_${parts.join(' · ')}_` : '';
+    }
+
     _extractSessionStats(output) {
         const stats = {};
         const lines = output.split('\n');
@@ -3015,9 +3037,7 @@ ${formatted}`
         const codeWrap = '```\n';
         const codeWrapEnd = '\n```';
         const maxLen = 3000 - codeWrap.length - codeWrapEnd.length; // Slack section block text limit is 3000
-        const statsLine = stats
-            ? `\n_${stats.model || ''} · Ctx: ${stats.context || '?'} · In: ${stats.tokensIn || '?'} Out: ${stats.tokensOut || '?'}_`
-            : '';
+        const statsLine = this._formatStatsLine(stats);
 
         if (response.length <= maxLen) {
             const blocks = [
@@ -3097,9 +3117,7 @@ ${formatted}`
         }
 
         const summary = this._extractRecommendedAction(response);
-        const statsLine = stats
-            ? `\n_${stats.model || ''} · Ctx: ${stats.context || '?'} · In: ${stats.tokensIn || '?'} Out: ${stats.tokensOut || '?'}_`
-            : '';
+        const statsLine = this._formatStatsLine(stats);
 
         // Post the summary (Recommended Action only), truncate to stay under 3000-char block limit
         const maxSummaryLen = 2970; // 3000 limit minus "*Recommended Action:* " prefix

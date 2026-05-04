@@ -57,8 +57,12 @@ function readStdin() {
  */
 function detectCliSource(hookInput) {
     const envSource = (process.env.CLI_SOURCE || '').toLowerCase();
-    if (envSource === 'codex' || envSource === 'claude') return envSource;
+    if (envSource === 'codex' || envSource === 'claude' || envSource === 'gemini') return envSource;
     if (hookInput && typeof hookInput === 'object') {
+        // Gemini's AfterAgent payload uses `prompt_response` (not `last_assistant_message`)
+        // and an explicit `hook_event_name: "AfterAgent"` marker. Check before Claude
+        // since both share `session_id`.
+        if (hookInput.hook_event_name === 'AfterAgent' || 'prompt_response' in hookInput) return 'gemini';
         if ('last-assistant-message' in hookInput || 'turn-id' in hookInput) return 'codex';
         if ('last_assistant_message' in hookInput || 'session_id' in hookInput) return 'claude';
     }
@@ -79,6 +83,22 @@ function normalizeCodexInput(raw) {
         session_id: raw.session_id || raw['session-id'] || raw.turn_id || raw['turn-id'] || null,
         transcript_path: raw.transcript_path || raw['transcript-path'] || null,
         _codex_raw: raw,
+    };
+}
+
+/**
+ * Normalize Gemini AfterAgent payload to Claude shape. Field rename per
+ * docs: `prompt_response` → `last_assistant_message`. Underscored keys
+ * already match Claude's; session_id and transcript_path pass through.
+ */
+function normalizeGeminiInput(raw) {
+    if (!raw || typeof raw !== 'object') return {};
+    return {
+        last_assistant_message: raw.prompt_response || raw.last_assistant_message || '',
+        session_id: raw.session_id || null,
+        transcript_path: raw.transcript_path || null,
+        hook_event_name: raw.hook_event_name || null,
+        _gemini_raw: raw,
     };
 }
 
@@ -125,6 +145,35 @@ function extractAlertReport(transcriptPath) {
     }
 
     return bestReport;
+}
+
+/**
+ * Fallback for Gemini AfterAgent: pull the last assistant message from the
+ * transcript JSONL when `prompt_response` is empty or contained streaming
+ * duplication. Gemini's transcript uses `type: "gemini"` (not "assistant")
+ * and a plain string `content` field — different from Claude's shape.
+ */
+function extractFromGeminiTranscript(transcriptPath) {
+    if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
+
+    const content = fs.readFileSync(transcriptPath, 'utf-8').trim();
+    if (!content) return null;
+
+    const lines = content.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+            const entry = JSON.parse(lines[i]);
+            if (entry.type !== 'gemini' || !entry.content) continue;
+            const text = String(entry.content)
+                .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+            if (text) return text;
+        } catch {
+            continue;
+        }
+    }
+    return null;
 }
 
 /**
@@ -276,6 +325,32 @@ function extractCodexSessionStats(transcriptPath) {
 }
 
 /**
+ * Gemini stats footer. Per product convention, Gemini sessions show only
+ * the model identifier "Auto (Gemini 3)" — no Ctx / In / Out figures —
+ * because the gemini-cli surfaces an aggregated "auto" routing label rather
+ * than a single stable model name. Returning only `model` lets formatStatsLine
+ * skip the missing fields cleanly.
+ */
+function extractGeminiSessionStats(/* transcriptPath */) {
+    return { model: 'Auto (Gemini 3)' };
+}
+
+/**
+ * Build the italicized stats footer line, skipping any field the extractor
+ * didn't populate. Claude/Codex return all four (model, context, tokensIn,
+ * tokensOut); Gemini returns only model.
+ */
+function formatStatsLine(stats) {
+    if (!stats) return '';
+    const parts = [];
+    if (stats.model) parts.push(stats.model);
+    if (stats.context) parts.push(`Ctx: ${stats.context}`);
+    if (stats.tokensIn) parts.push(`In: ${stats.tokensIn}`);
+    if (stats.tokensOut) parts.push(`Out: ${stats.tokensOut}`);
+    return parts.length > 0 ? `_${parts.join(' · ')}_` : '';
+}
+
+/**
  * Send a response to Slack, splitting into chunks if needed.
  * Appends session stats (model, context, tokens) to the last chunk when available.
  */
@@ -283,9 +358,7 @@ async function sendResponse(web, channelId, threadTs, response, stats, mentionUs
     const maxLen = 2990;
     const mention = mentionUserId ? `<@${mentionUserId}> ` : '';
     const prefix = `:black_circle_for_record: ${mention}`;
-    const statsLine = stats
-        ? `_${stats.model} · Ctx: ${stats.context} · In: ${stats.tokensIn} Out: ${stats.tokensOut}_`
-        : '';
+    const statsLine = formatStatsLine(stats);
 
     const firstChunkMax = maxLen - prefix.length;
 
@@ -370,7 +443,10 @@ async function sendHookNotification() {
 
     const rawInput = await readStdin();
     const cliSource = detectCliSource(rawInput);
-    const hookInput = cliSource === 'codex' ? normalizeCodexInput(rawInput) : rawInput;
+    let hookInput;
+    if (cliSource === 'codex') hookInput = normalizeCodexInput(rawInput);
+    else if (cliSource === 'gemini') hookInput = normalizeGeminiInput(rawInput);
+    else hookInput = rawInput;
 
     const slackSessionKey = process.env.SLACK_SESSION_KEY;
     if (!slackSessionKey) {
@@ -496,11 +572,13 @@ async function sendHookNotification() {
     const web = new WebClient(process.env.SLACK_BOT_TOKEN);
 
     let assistantMessage = hookInput.last_assistant_message
-        || (cliSource === 'claude' ? extractFromTranscript(hookInput.transcript_path) : null);
+        || (cliSource === 'claude' ? extractFromTranscript(hookInput.transcript_path) : null)
+        || (cliSource === 'gemini' ? extractFromGeminiTranscript(hookInput.transcript_path) : null);
 
-    const stats = cliSource === 'codex'
-        ? extractCodexSessionStats(hookInput.transcript_path)
-        : extractSessionStats(hookInput.transcript_path);
+    let stats;
+    if (cliSource === 'codex') stats = extractCodexSessionStats(hookInput.transcript_path);
+    else if (cliSource === 'gemini') stats = extractGeminiSessionStats(hookInput.transcript_path);
+    else stats = extractSessionStats(hookInput.transcript_path);
 
     if (assistantMessage && threadTs) {
         try {
@@ -575,8 +653,10 @@ async function sendHookNotification() {
                         { type: 'section', text: { type: 'mrkdwn', text: `*Recommended Action:* ${trimmedSummary}` } }
                     ];
                     if (stats) {
-                        const statsLine = `_${stats.model} · Ctx: ${stats.context} · In: ${stats.tokensIn} Out: ${stats.tokensOut}_`;
-                        alertBlocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: statsLine }] });
+                        const statsLine = formatStatsLine(stats);
+                        if (statsLine) {
+                            alertBlocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: statsLine }] });
+                        }
                     }
 
                     // Attachment is the "attachment zone" — everything after the first

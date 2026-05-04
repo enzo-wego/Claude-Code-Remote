@@ -12,10 +12,12 @@
 
 const claudeAdapter = require('./claude-adapter');
 const codexAdapter = require('./codex-adapter');
+const geminiAdapter = require('./gemini-adapter');
 
 const ADAPTERS = {
     claude: claudeAdapter,
     codex: codexAdapter,
+    gemini: geminiAdapter,
 };
 
 const DEFAULT_ADAPTER = claudeAdapter;
@@ -33,4 +35,4 @@ function adapterNames() {
     return Object.keys(ADAPTERS);
 }
 
-module.exports = { getCliAdapter, listAdapters, adapterNames, claudeAdapter, codexAdapter };
+module.exports = { getCliAdapter, listAdapters, adapterNames, claudeAdapter, codexAdapter, geminiAdapter };
