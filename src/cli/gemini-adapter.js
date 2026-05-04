@@ -25,7 +25,14 @@ const REPO_ROOT = path.resolve(__dirname, '../..');
 const GEMINI_HOME = path.join(os.homedir(), '.gemini');
 const SETTINGS_PATH = path.join(GEMINI_HOME, 'settings.json');
 const HOOK_MARKERS = ['cli-hook-notify', 'claude-hook-notify'];
-const HOOK_TIMEOUT = 15;
+// Gemini's settings.json `timeout` is in MILLISECONDS — the existing
+// agent-mem entries in the same file use values like 2000 / 5000ms, and
+// the original `15` here was being interpreted as 15ms, killing the hook
+// before the Slack API call could complete (TUI showed
+// "Hook(s) [...] failed for event AfterAgent" while Slack got nothing).
+// Claude's settings.json uses seconds for the same field, so the Claude
+// adapter's `15` is correct there. 30 seconds = 30000 here.
+const HOOK_TIMEOUT_MS = 30000;
 
 function hookScriptPath() {
     const preferred = path.join(REPO_ROOT, 'cli-hook-notify.js');
@@ -64,7 +71,7 @@ function upsertHook(list, command) {
     }
     list.push({
         matcher: '*',
-        hooks: [{ type: 'command', command, timeout: HOOK_TIMEOUT }]
+        hooks: [{ type: 'command', command, timeout: HOOK_TIMEOUT_MS }]
     });
     return list;
 }
