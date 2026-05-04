@@ -306,11 +306,14 @@ class SlackSocketHandler {
         this._queueStmts.updateStatus.run('processing', Date.now(), item.id);
         this.logger.info(`Alert queue: processing id=${item.id} incident=${item.incident_id} channel=${item.channel_id} ts=${item.message_ts}`);
 
-        // Swap hourglass → eyes for items that waited in the queue
+        // Swap hourglass → eyes whenever a queued item starts. The reaction
+        // is the only signal that the alert moved past "waiting" — gating it
+        // on wait time hides short-queue starts (under a minute) entirely.
+        // The chat notice stays gated so near-instant dequeues don't spam.
         const waitedMs = Date.now() - item.created_at;
+        this._removeReaction(item.channel_id, item.message_ts, 'hourglass_flowing_sand').catch(() => {});
+        this._addReaction(item.channel_id, item.message_ts, 'eyes').catch(() => {});
         if (waitedMs > 60000) {
-            this._removeReaction(item.channel_id, item.message_ts, 'hourglass_flowing_sand').catch(() => {});
-            this._addReaction(item.channel_id, item.message_ts, 'eyes').catch(() => {});
             this.app.client.chat.postMessage({
                 channel: item.channel_id,
                 text: `:mag: Starting investigation (waited ${Math.round(waitedMs / 60000)}m in queue)...`,
