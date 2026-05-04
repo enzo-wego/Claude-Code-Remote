@@ -46,6 +46,7 @@ class SlackSocketHandler {
             logLevel: 'error'
         });
 
+
         this.httpPort = config.httpPort || 9999;
         this.httpServer = null;
 

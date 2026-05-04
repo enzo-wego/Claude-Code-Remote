@@ -469,6 +469,18 @@ async function sendHookNotification() {
         process.exit(0);
     }
 
+    // ─── SubagentStop: never post to Slack ──────────────────────────
+    // SubagentStop fires when Claude finishes an internal sub-agent (e.g. the
+    // Task tool, or the next-action / ghost-text suggester). The sub-agent's
+    // last_assistant_message is internal scratch (we observed it leaking the
+    // input-box ghost-text "switch to main" to Slack). The Stop hook posts
+    // the canonical user-facing assistant message; SubagentStop output is not
+    // meant to reach Slack at all.
+    if (notificationType === 'waiting') {
+        console.error('SubagentStop (waiting) — skipping post, sub-agent output is internal');
+        process.exit(0);
+    }
+
     // ─── SessionStart: register session_id in DB ─────────────────────
     // (Claude-only — Codex's notify hook doesn't have a session_start equivalent.)
     if (notificationType === 'session_start') {
