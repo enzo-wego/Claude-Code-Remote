@@ -46,6 +46,7 @@ class SlackSocketHandler {
             logLevel: 'error'
         });
 
+
         this.httpPort = config.httpPort || 9999;
         this.httpServer = null;
 
@@ -305,11 +306,14 @@ class SlackSocketHandler {
         this._queueStmts.updateStatus.run('processing', Date.now(), item.id);
         this.logger.info(`Alert queue: processing id=${item.id} incident=${item.incident_id} channel=${item.channel_id} ts=${item.message_ts}`);
 
-        // Swap hourglass → eyes for items that waited in the queue
+        // Swap hourglass → eyes whenever a queued item starts. The reaction
+        // is the only signal that the alert moved past "waiting" — gating it
+        // on wait time hides short-queue starts (under a minute) entirely.
+        // The chat notice stays gated so near-instant dequeues don't spam.
         const waitedMs = Date.now() - item.created_at;
+        this._removeReaction(item.channel_id, item.message_ts, 'hourglass_flowing_sand').catch(() => {});
+        this._addReaction(item.channel_id, item.message_ts, 'eyes').catch(() => {});
         if (waitedMs > 60000) {
-            this._removeReaction(item.channel_id, item.message_ts, 'hourglass_flowing_sand').catch(() => {});
-            this._addReaction(item.channel_id, item.message_ts, 'eyes').catch(() => {});
             this.app.client.chat.postMessage({
                 channel: item.channel_id,
                 text: `:mag: Starting investigation (waited ${Math.round(waitedMs / 60000)}m in queue)...`,
@@ -1560,6 +1564,13 @@ ${formatted}`
         const sessionKey = `${channelId}-${threadTs}`;
         let session = this._getSession(sessionKey);
         let threadContext = null; // Will hold formatted thread messages to prepend
+        // True when the user @mentions the bot with only a `start <cli> from <project>`
+        // keyword and no actual task. Used downstream to (a) skip the
+        // self-knowledge preamble — which an agentic CLI like Gemini reads as a
+        // standing instruction and starts auto-exploring on — and (b) for
+        // Gemini specifically, skip the inject entirely so the session sits
+        // ready until the user supplies a real task.
+        let isTrivialFirstMessage = false;
         // Tracks the still-untried CLIs starting at the currently-running one.
         // Set after _startCliWithFallback succeeds; consulted on inject failure
         // so a paste-rejecting CLI can hand off to the next one in the chain.
@@ -1747,6 +1758,7 @@ ${formatted}`
 
                 // If command was fully consumed by project pattern, default to "hi"
                 if (!command) {
+                    isTrivialFirstMessage = true;
                     command = 'hi';
                 }
 
@@ -1840,13 +1852,34 @@ ${formatted}`
                 return;
             }
 
+            // Gemini under --yolo plus the project-local Serena MCP onboarding flow
+            // treats any non-trivial first prompt as a standing directive to
+            // auto-explore and act. When the user @mentions only the start
+            // keyword (no real task), we'd otherwise inject "hi" + the
+            // self-knowledge preamble, which Gemini reads as "go set up the
+            // workspace" and starts editing files. Skip the inject — the
+            // session is already saved, so the next @mention in this thread
+            // will land on the live session and inject the real task.
+            if (isTrivialFirstMessage && session.cliType === 'gemini') {
+                this.logger.info(`Gemini session ${session.sessionName} ready; skipping inject for trivial first message`);
+                await say({
+                    text: `Gemini session ready in \`${session.repoPath}\`. What would you like me to work on?`,
+                    thread_ts: threadTs,
+                });
+                this._startSessionTimeout(sessionKey);
+                return;
+            }
+
             // Build the full command with thread context if available.
             // Preamble points Claude at the bot's own source repo so meta-questions
             // ("why was X tagged?", "how does the queue work?") can be answered
             // accurately without requiring us to enumerate every behavior in a static doc.
+            // Skipped on a trivial first message ("hi") because the preamble's
+            // "read files at <path>" instruction otherwise reads as a task by
+            // itself when no real user request follows.
             const BOT_SELF_KNOWLEDGE_PREAMBLE = `You are responding inside a Slack thread for the EnzoBot Slack bot.\nIf the user asks about the bot's own behavior (notifications, tagging, queue, alerts, etc.),\nthe bot's source lives at /var/go/src/github.com/Claude-Code-Remote — read files there to answer accurately.\n\n`;
             let fullCommand = command;
-            if (threadContext) {
+            if (threadContext && !isTrivialFirstMessage) {
                 fullCommand = `${BOT_SELF_KNOWLEDGE_PREAMBLE}Here is the Slack thread discussion for context:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
             }
 
@@ -1862,13 +1895,19 @@ ${formatted}`
             let lastInjectError = null;
             while (!injected) {
                 try {
+                    // Clear any stale "hook posted" marker from a previous turn
+                    // before this inject runs — otherwise _verifyTurnProgress
+                    // would short-circuit on the previous marker and skip
+                    // verification of THIS inject.
+                    try { fs.unlinkSync(`/tmp/cli-hook-post-${sessionKey}`); } catch { /* no prior marker */ }
+                    const injectStartedAt = Date.now();
                     const baseline = await this._injectCommand(session.sessionName, fullCommand, session.cliType);
                     // Guard against silent rejection (Codex at usage limit, Enter
                     // dropped by late banner redraw, etc.). _injectCommand can
                     // succeed because paste landed, but the CLI may never start
                     // a turn — without this check the poller would sit idle for
                     // 30 min and no fallback would fire.
-                    await this._verifyTurnProgress(session.sessionName, session.cliType, baseline);
+                    await this._verifyTurnProgress(session.sessionName, session.cliType, baseline, sessionKey, injectStartedAt);
                     injected = true;
                 } catch (injectError) {
                     lastInjectError = injectError;
@@ -2328,7 +2367,7 @@ ${formatted}`
     // contain the input box, footer (time/context %), and rotating hint
     // line — too noisy to compare against baseline. Strip them and compare
     // only the upper region.
-    async _verifyTurnProgress(sessionName, cliType, baseline, timeoutMs = 90000) {
+    async _verifyTurnProgress(sessionName, cliType, baseline, sessionKey = null, injectStartedAt = null, timeoutMs = 90000) {
         const adapter = getCliAdapter(cliType);
         const fatalPatterns = adapter.fatalErrorPatterns || [];
         const aboveTui = (text) => {
@@ -2339,6 +2378,7 @@ ${formatted}`
                 .trim();
         };
         const baselineUpper = aboveTui(baseline);
+        const markerPath = sessionKey ? `/tmp/cli-hook-post-${sessionKey}` : null;
         const start = Date.now();
         const intervalMs = 2000;
         // Initial settle — paste retries and Enter keystrokes leave the TUI
@@ -2354,6 +2394,18 @@ ${formatted}`
             const fatal = fatalPatterns.find(p => p.regex.test(output));
             if (fatal) {
                 throw new Error(`${cliType} ${fatal.reason}`);
+            }
+            // Authoritative success: cli-hook-notify.js drops a marker file
+            // when the Stop hook successfully posts the assistant message to
+            // Slack. If we see a fresh marker (newer than this inject's
+            // start), the turn definitely completed — skip the brittle
+            // scrollback-growth heuristic that false-positives when the
+            // response is short enough to fit inside the bottom-10 TUI rows.
+            if (markerPath && injectStartedAt) {
+                try {
+                    const ts = parseInt(fs.readFileSync(markerPath, 'utf8'), 10);
+                    if (Number.isFinite(ts) && ts >= injectStartedAt) return;
+                } catch { /* no marker yet — fall through to scrollback check */ }
             }
             const currentUpper = aboveTui(output);
             if (currentUpper.length > baselineUpper.length + 50 && currentUpper !== baselineUpper) {
@@ -2593,7 +2645,13 @@ ${formatted}`
                         // Regular session or subsequent alert responses
                         processing = true;
                         try {
-                            const sessionStats = this._extractSessionStats(currentOutput);
+                            // Gemini's tmux footer doesn't carry parseable Ctx/In/Out
+                            // figures; product convention is to show the model only
+                            // ("Auto (Gemini 3)"). For Claude/Codex we still parse
+                            // the footer line — same call site, different source.
+                            const sessionStats = adapter.type === 'gemini'
+                                ? { model: 'Auto (Gemini 3)' }
+                                : this._extractSessionStats(currentOutput);
                             this.logger.info(`Response extracted (${response.length} chars): "${response.substring(0, 200)}"`);
 
                             await this._sendResponse(say, threadTs, response, sessionStats);
@@ -2957,8 +3015,16 @@ ${formatted}`
         const responseLines = newLines.filter(line => {
             const trimmed = line.trim();
             if (!trimmed) return false;
-            if (trimmed === '>' || trimmed === '❯') return false;
-            if (trimmed.match(/^[>❯]\s*$/)) return false;
+            // Drop the input-box / prompt row entirely. Bare prompts (`>`, `❯`,
+            // `›`) are easy, but Claude's TUI also pre-fills the input box with
+            // a "next-action" suggestion (e.g. `❯ switch to main`) after a
+            // response. Without filtering those, the suggestion text leaks into
+            // the Slack post as if it were part of the assistant's reply.
+            // The filter here intentionally does NOT match bare `>` followed
+            // by content because Claude's responses can use `> ` for markdown
+            // blockquotes — only `❯` and `›` are reserved as TUI input prompts.
+            if (trimmed === '>' || trimmed === '❯' || trimmed === '›') return false;
+            if (trimmed.match(/^[❯›](?:\s|$)/)) return false;
             // Filter Claude CLI chrome/status bar lines
             if (trimmed.match(/^[─━═▪▐▛▜▝▘]+/) || trimmed.match(/^[─━═▪]+$/)) return false;
             if (trimmed.startsWith('Model:') || trimmed.includes('bypass permissions')) return false;
@@ -2968,6 +3034,22 @@ ${formatted}`
         });
 
         return responseLines.join('\n').trim();
+    }
+
+    /**
+     * Build the italicized stats footer line, omitting any field the extractor
+     * didn't populate. Gemini sessions return only `model` ("Auto (Gemini 3)"),
+     * so the footer collapses to that single label; Claude/Codex still render
+     * the full "<model> · Ctx · In · Out" form.
+     */
+    _formatStatsLine(stats) {
+        if (!stats) return '';
+        const parts = [];
+        if (stats.model) parts.push(stats.model);
+        if (stats.context) parts.push(`Ctx: ${stats.context}`);
+        if (stats.tokensIn) parts.push(`In: ${stats.tokensIn}`);
+        if (stats.tokensOut) parts.push(`Out: ${stats.tokensOut}`);
+        return parts.length > 0 ? `\n_${parts.join(' · ')}_` : '';
     }
 
     _extractSessionStats(output) {
@@ -3015,9 +3097,7 @@ ${formatted}`
         const codeWrap = '```\n';
         const codeWrapEnd = '\n```';
         const maxLen = 3000 - codeWrap.length - codeWrapEnd.length; // Slack section block text limit is 3000
-        const statsLine = stats
-            ? `\n_${stats.model || ''} · Ctx: ${stats.context || '?'} · In: ${stats.tokensIn || '?'} Out: ${stats.tokensOut || '?'}_`
-            : '';
+        const statsLine = this._formatStatsLine(stats);
 
         if (response.length <= maxLen) {
             const blocks = [
@@ -3097,9 +3177,7 @@ ${formatted}`
         }
 
         const summary = this._extractRecommendedAction(response);
-        const statsLine = stats
-            ? `\n_${stats.model || ''} · Ctx: ${stats.context || '?'} · In: ${stats.tokensIn || '?'} Out: ${stats.tokensOut || '?'}_`
-            : '';
+        const statsLine = this._formatStatsLine(stats);
 
         // Post the summary (Recommended Action only), truncate to stay under 3000-char block limit
         const maxSummaryLen = 2970; // 3000 limit minus "*Recommended Action:* " prefix
