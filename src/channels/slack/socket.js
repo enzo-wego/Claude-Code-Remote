@@ -2463,9 +2463,8 @@ ${formatted}`
             if (!this._isTmuxSessionAlive(sessionName)) {
                 clearInterval(interval);
                 this.pollers.delete(pollKey);
-                // Don't post here — the Stop hook handles alert posting from the clean transcript.
                 if (alertBuffer) {
-                    this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on tmux death for ${sessionName} — hook will post`);
+                    this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on tmux death for ${sessionName}`);
                 }
                 // LAYER 3 — silent-drop notice. If we never saw the CLI enter
                 // working state, the input was almost certainly dropped (splash
@@ -2486,8 +2485,13 @@ ${formatted}`
                 if (isAlertSession && session.alertMessageTs) {
                     await this._removeReaction(session.channelId, session.alertMessageTs, 'eyes').catch(() => {});
                     await this._addReaction(session.channelId, session.alertMessageTs, 'white_check_mark').catch(() => {});
-                    // tmux died with no Codex/Claude output buffered → silent failure (e.g. splash-swallowed prompt). Requeue if budget allows.
-                    this._completeQueueItem(session.channelId, session.alertMessageTs, { silent: alertBuffer.length === 0 });
+                    // Re-read session so lastBotTs reflects any post that happened during this turn.
+                    // "silent" means the bot never posted anything to the thread — covers both
+                    // the splash-swallowed-prompt case (empty buffer) and the produced-bytes-but-
+                    // never-finished case (non-empty buffer, no Stop hook fired).
+                    const fresh = sessionKey ? this._getSession(sessionKey) : null;
+                    const lastBotTs = fresh?.lastBotTs ?? session.lastBotTs;
+                    this._completeQueueItem(session.channelId, session.alertMessageTs, { silent: !lastBotTs });
                 }
                 this.logger.info(`Poller stopped: tmux session ${sessionName} is dead`);
                 return;
@@ -2510,8 +2514,10 @@ ${formatted}`
                             thread_ts: threadTs,
                         });
                     } else if (alertBuffer) {
-                        // Don't post here — the Stop hook handles alert posting from the clean transcript.
-                        this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on timeout for ${sessionName} — hook will post`);
+                        // Tmux is about to be killed (line below) — no Stop hook will fire,
+                        // so the buffered output is unreachable. Requeue path picks this up
+                        // via lastBotTs check.
+                        this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on timeout for ${sessionName}`);
                     } else if (!isAlertSession) {
                         await say({ text: 'Claude session timed out. Send another message to continue.', thread_ts: threadTs });
                     }
@@ -2529,8 +2535,11 @@ ${formatted}`
                     if (sess?.alertMessageTs) {
                         await this._removeReaction(sess.channelId, sess.alertMessageTs, 'eyes').catch(() => {});
                         await this._addReaction(sess.channelId, sess.alertMessageTs, 'white_check_mark').catch(() => {});
-                        // 30-min poller timeout with empty alertBuffer → CLI hung without producing anything. Requeue.
-                        this._completeQueueItem(sess.channelId, sess.alertMessageTs, { silent: alertBuffer.length === 0 });
+                        // 30-min poller timeout. "silent" means the bot never posted anything to
+                        // the thread — covers both the empty-buffer case (CLI hung from the start)
+                        // and the produced-bytes-but-never-finished case (Stop hook never fired
+                        // before tmux was killed above).
+                        this._completeQueueItem(sess.channelId, sess.alertMessageTs, { silent: !sess.lastBotTs });
                     }
                 }
                 return;
