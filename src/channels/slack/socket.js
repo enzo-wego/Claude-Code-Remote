@@ -2551,11 +2551,16 @@ ${formatted}`
             // run independently.
             const lines = currentOutput.trimEnd().split('\n');
             const tailLines = lines.slice(-10);
+            // Codex uses `›` (U+203A) instead of `❯` (U+276F) and always renders
+            // the input row as `› <placeholder hint>` (e.g. `› Summarize recent
+            // commits`), so we must match a leading `› ` line in addition to the
+            // bare-prompt forms used by Claude.
             const hasPrompt = tailLines.some(l => {
                 const trimmed = l.trim();
-                return trimmed === '❯' || trimmed === '>' ||
-                       trimmed.match(/^[>❯]\s*$/) ||
-                       trimmed.includes('│ >') || trimmed.includes('│ ❯');
+                return trimmed === '❯' || trimmed === '>' || trimmed === '›' ||
+                       trimmed.match(/^[>❯›]\s*$/) ||
+                       trimmed.includes('│ >') || trimmed.includes('│ ❯') ||
+                       trimmed.startsWith('› ');
             });
 
             // Use a wider window (30 lines) for working detection — Claude Code's
