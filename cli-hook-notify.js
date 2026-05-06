@@ -21,6 +21,28 @@ const { postOncallDoubleCheck } = require('./src/services/oncall-mention');
 const projectDir = path.dirname(__filename);
 const envPath = path.join(projectDir, '.env');
 
+// Diagnostic trace log — append every invocation so we can tell whether
+// completion hooks (Codex Stop / Gemini AfterAgent) actually fire. Stderr
+// from this script goes to the TUI inside tmux and is unrecoverable, which
+// makes silent hook failures impossible to debug otherwise.
+const TRACE_LOG_PATH = path.join(projectDir, 'cli-hook-notify.log');
+function traceLog(stage, extra = {}) {
+    try {
+        const entry = {
+            ts: new Date().toISOString(),
+            stage,
+            argv: process.argv.slice(2),
+            cli_source: process.env.CLI_SOURCE || null,
+            session_key: process.env.SLACK_SESSION_KEY || null,
+            pid: process.pid,
+            ...extra,
+        };
+        fs.appendFileSync(TRACE_LOG_PATH, JSON.stringify(entry) + '\n');
+    } catch (_) { /* silent fail — diagnostics must never break the hook */ }
+}
+traceLog('entry');
+process.on('exit', (code) => traceLog('exit', { code }));
+
 if (fs.existsSync(envPath)) {
     dotenv.config({ path: envPath, override: true, quiet: true });
 } else {
