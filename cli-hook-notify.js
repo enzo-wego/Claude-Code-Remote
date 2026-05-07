@@ -625,6 +625,18 @@ async function sendHookNotification() {
         || (cliSource === 'claude' ? extractFromTranscript(hookInput.transcript_path) : null)
         || (cliSource === 'gemini' ? extractFromGeminiTranscript(hookInput.transcript_path) : null);
 
+    // Gemini's `prompt_response` payload often arrives with runs of whitespace-only
+    // lines (e.g. "\n \n \n \n") between mention and content — those don't go
+    // through the transcript extractor's `\n{3,}` collapse because each blank
+    // line carries a space. Normalize at the central point so every downstream
+    // path (alert post, conversation reply, regular chat) sees clean text.
+    if (assistantMessage) {
+        assistantMessage = String(assistantMessage)
+            .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+            .replace(/(?:[ \t]*\n){3,}/g, '\n\n')
+            .trim();
+    }
+
     let stats;
     if (cliSource === 'codex') stats = extractCodexSessionStats(hookInput.transcript_path);
     else if (cliSource === 'gemini') stats = extractGeminiSessionStats(hookInput.transcript_path);
