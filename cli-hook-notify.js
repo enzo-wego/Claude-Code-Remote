@@ -673,6 +673,47 @@ async function sendHookNotification() {
                     } catch { /* proceed without recovery */ }
                 }
 
+                // Conversation mode: once a human has replied in-thread after the
+                // primary investigation post, the alert has transitioned from
+                // "single investigation that may be refined" into a Q&A discussion.
+                // Stop overwriting the primary post on every agent turn — post the
+                // agent's answer as a plain threaded reply instead.
+                if (primary && primary.ts && assistantMessage) {
+                    let userRepliedAfter = false;
+                    try {
+                        const replies = await web.conversations.replies({
+                            channel: channelId, ts: threadTs, limit: 100,
+                        });
+                        const primaryTsNum = parseFloat(primary.ts);
+                        userRepliedAfter = (replies.messages || []).some(m =>
+                            !m.bot_id && m.ts !== threadTs && parseFloat(m.ts) > primaryTsNum
+                        );
+                    } catch { /* on lookup failure, fall back to alert-format path */ }
+
+                    if (userRepliedAfter) {
+                        // Slack chat.postMessage caps at 40k chars. Trim defensively;
+                        // the conversational answer is usually well under that.
+                        const MAX_TEXT = 39000;
+                        const text = assistantMessage.length > MAX_TEXT
+                            ? assistantMessage.slice(0, MAX_TEXT) + '\n\n…(truncated)'
+                            : assistantMessage;
+                        try {
+                            const post = await web.chat.postMessage({
+                                channel: channelId,
+                                thread_ts: threadTs,
+                                text,
+                            });
+                            console.error(`Alert in conversation mode — posted plain reply ts=${post.ts}`);
+                            try {
+                                fs.writeFileSync(`/tmp/cli-hook-post-${slackSessionKey}`, String(Date.now()));
+                            } catch { /* ignore */ }
+                        } catch (err) {
+                            console.error(`Conversation-mode post failed: ${err.message}`);
+                        }
+                        return;
+                    }
+                }
+
                 let hasValidReport = false;
                 if (cliSource === 'claude' && hookInput.transcript_path) {
                     const report = extractAlertReport(hookInput.transcript_path);
