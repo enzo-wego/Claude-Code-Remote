@@ -688,6 +688,14 @@ async function sendHookNotification() {
                     hasValidReport = true;
                 }
 
+                // Gemini doesn't follow the alert-skill `Recommended Action:` contract,
+                // so a strict regex gate would silently drop every Gemini alert reply.
+                // Accept any non-trivial agent response; the summary extractor below
+                // falls back to the first 500 chars when the heading is absent.
+                if (!hasValidReport && cliSource === 'gemini' && assistantMessage && assistantMessage.length >= 200) {
+                    hasValidReport = true;
+                }
+
                 if (hasValidReport) {
                     try { fs.unlinkSync(retryFile); } catch { /* ignore */ }
                     const match = assistantMessage.match(/Recommended Action:\s*([\s\S]*?)(?:\n\s*---|\n\n##|\n\n\*\*)/i);
