@@ -694,9 +694,11 @@ async function sendHookNotification() {
                         // Slack chat.postMessage caps at 40k chars. Trim defensively;
                         // the conversational answer is usually well under that.
                         const MAX_TEXT = 39000;
-                        const text = assistantMessage.length > MAX_TEXT
+                        const mention = lastUserId ? `<@${lastUserId}> ` : '';
+                        const body = assistantMessage.length > MAX_TEXT
                             ? assistantMessage.slice(0, MAX_TEXT) + '\n\n…(truncated)'
                             : assistantMessage;
+                        const text = mention + body;
                         try {
                             const post = await web.chat.postMessage({
                                 channel: channelId,
