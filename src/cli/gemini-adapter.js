@@ -149,6 +149,16 @@ module.exports = {
     ],
     workingRegexes: [],
 
+    // Poller idle-prompt detection. socket.js's shared `hasPrompt` regex only
+    // matches `❯`/`>`/`›` style prompts — Gemini renders an empty input row as
+    // ` *   Type your message or @path/to/file `, so without an adapter-specific
+    // indicator the poller never declares idle and spins until POLLER_TIMEOUT_MS.
+    // The placeholder text only appears when the input box is empty (= idle),
+    // making it a reliable signal. This is the only fallback when AfterAgent
+    // doesn't fire — notably on `Request cancelled.` (safety-guard turn aborts),
+    // where the hook is skipped because no turn-final assistant message exists.
+    idlePromptIndicators: ['Type your message or @'],
+
     confirmationPrompts: [],
     handlesConfirmationPrompts: false,
 

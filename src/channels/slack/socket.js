@@ -1364,6 +1364,16 @@ ${formatted}`
             }
         }
 
+        // Ack-only kill switch: when ALERT_ACK_ONLY=true the bot acknowledges
+        // the PD incident (above) but skips the investigation pipeline. Used
+        // during incident storms to stop spawning tmux sessions.
+        if (process.env.ALERT_ACK_ONLY === 'true') {
+            this.logger.info(`ALERT_ACK_ONLY=true — acked incident ${incidentId || 'unknown'}, skipping investigation`);
+            await this._addReaction(channelId, messageTs, 'no_entry').catch(() => {});
+            if (incidentId) this.trackedIncidents.delete(incidentId);
+            return;
+        }
+
         // Download attached images
         const imagePaths = await this._downloadSlackImages(event.files, `alert-${messageTs.replace('.', '')}`);
         const imageInstruction = imagePaths.length > 0
@@ -1512,11 +1522,6 @@ ${formatted}`
         const rawText = event.text || '';
 
         this.logger.info(`Mention received | user=${userId} channel=${channelId} thread=${threadTs} text="${rawText.substring(0, 100)}"`);
-
-        if (!this._isOwner(userId) && !this.alertMonitor.isMonitoredChannel(channelId)) {
-            await say({ text: `Sorry, I can only respond to my owner to save Claude's API tokens. 🙏`, thread_ts: threadTs });
-            return;
-        }
 
         let text = rawText.replace(/<@[A-Z0-9]+>/g, '').trim();
 
@@ -1760,11 +1765,6 @@ ${formatted}`
                 if (!command) {
                     isTrivialFirstMessage = true;
                     command = 'hi';
-                }
-
-                if (!alertMessageTs) {
-                    const chainLabel = cliChain.length > 1 ? `${cliType} (fallback: ${cliChain.slice(1).join(', ')})` : cliType;
-                    await say({ text: `Starting ${chainLabel} session in \`${repoPath}\`... :rocket:`, thread_ts: threadTs });
                 }
 
                 const startResult = await this._startCliWithFallback({
@@ -2564,12 +2564,20 @@ ${formatted}`
             // the input row as `› <placeholder hint>` (e.g. `› Summarize recent
             // commits`), so we must match a leading `› ` line in addition to the
             // bare-prompt forms used by Claude.
+            // Adapter-specific idle-prompt patterns let each CLI declare what its
+            // empty input row looks like. Gemini renders ` *   Type your message …`
+            // (asterisk bullet + placeholder) and none of the shared `❯`/`>`/`›`
+            // forms match — see gemini-adapter.js `idlePromptIndicators`.
+            const adapterIdleIndicators = adapter.idlePromptIndicators || [];
             const hasPrompt = tailLines.some(l => {
                 const trimmed = l.trim();
-                return trimmed === '❯' || trimmed === '>' || trimmed === '›' ||
-                       trimmed.match(/^[>❯›]\s*$/) ||
-                       trimmed.includes('│ >') || trimmed.includes('│ ❯') ||
-                       trimmed.startsWith('› ');
+                if (trimmed === '❯' || trimmed === '>' || trimmed === '›' ||
+                    trimmed.match(/^[>❯›]\s*$/) ||
+                    trimmed.includes('│ >') || trimmed.includes('│ ❯') ||
+                    trimmed.startsWith('› ')) return true;
+                return adapterIdleIndicators.some(ind =>
+                    typeof ind === 'string' ? l.includes(ind) : ind.test(l)
+                );
             });
 
             // Use a wider window (30 lines) for working detection — Claude Code's
@@ -3231,12 +3239,6 @@ ${formatted}`
             const row = this.db.prepare('SELECT channel_id FROM sessions WHERE thread_ts = ?').get(threadTs);
             return row ? row.channel_id : null;
         } catch { return null; }
-    }
-
-    _isOwner(userId) {
-        const ownerId = this.config.ownerUserId;
-        if (!ownerId) return true; // No owner set = allow all (backwards compat)
-        return userId === ownerId;
     }
 
     // ─── HTTP Server ─────────────────────────────────────────────────
