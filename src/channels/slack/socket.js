@@ -1601,15 +1601,25 @@ ${formatted}`
                 // No thread context needed — Claude is already in the conversation
                 this.logger.info(`Existing live session ${session.sessionName}, injecting command directly`);
             } else if (session && !this._isTmuxSessionAlive(session.sessionName)) {
-                // Session in DB but tmux died — recreate. Respect the caller's
-                // chain hint if one was supplied (alerts pass the configured
-                // ALERT_CLI chain); otherwise rebuild a chain from the saved
-                // CLI with Claude appended as the unconditional fallback so
-                // the resume isn't stuck on a broken Codex quota.
+                // Session in DB but tmux died — recreate. Chain resolution:
+                //   1. Caller-supplied chain hint (alerts pass ALERT_CLI).
+                //   2. Per-message `start <cli>` keyword — lets the user
+                //      force a CLI swap when the saved adapter is broken
+                //      (e.g. dead Gemini that never produces output).
+                //   3. Saved CLI with Claude appended as last-resort fallback.
                 const resumeSavedCli = session.cliType || 'claude';
-                const resumeChain = cliChainHint && cliChainHint.length > 0
-                    ? cliChainHint
-                    : (resumeSavedCli === 'claude' ? ['claude'] : [resumeSavedCli, 'claude']);
+                let resumeChain;
+                if (cliChainHint && cliChainHint.length > 0) {
+                    resumeChain = cliChainHint;
+                } else {
+                    const kwMatch = command.match(CLI_KEYWORD_RE);
+                    if (kwMatch) {
+                        const typed = kwMatch[1].toLowerCase();
+                        resumeChain = typed === 'claude' ? ['claude'] : [typed, 'claude'];
+                    } else {
+                        resumeChain = resumeSavedCli === 'claude' ? ['claude'] : [resumeSavedCli, 'claude'];
+                    }
+                }
                 // If we have a saved CLI session id AND the chain leads with
                 // the same CLI, ask the launcher to use the adapter's resume
                 // command. Different first CLI → resume id wouldn't apply.
