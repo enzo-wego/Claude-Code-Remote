@@ -11,6 +11,7 @@ const dotenv = require('dotenv');
 const Logger = require('./src/core/logger');
 const SlackSocketHandler = require('./src/channels/slack/socket');
 const { runDailySummary, parseChannelsConfig } = require('./src/services/daily-summary');
+const { SsoPrewarm } = require('./src/services/sso-prewarm');
 
 // Load environment variables
 const envPath = path.join(__dirname, '.env');
@@ -82,6 +83,17 @@ const config = {
     xoxdToken: process.env.SLACK_XOXD_TOKEN || '',
     // App mode: 'local' (mentions only), 'cloud' (monitors + summary only), 'all' (everything)
     appMode: (process.env.APP_MODE || 'all').toLowerCase(),
+    // SSO pre-warm (keeps the local SSO credential server's token hot so
+    // PagerDuty investigations never pay the puppeteer-login cost mid-incident).
+    // SSO_PREWARM_PROFILES is a CSV — single profile today, multiple later.
+    ssoPrewarmEnabled: (process.env.SSO_PREWARM_ENABLED || '').toLowerCase() === 'true',
+    ssoPrewarmUrl: process.env.SSO_PREWARM_URL || 'http://localhost:6789',
+    ssoPrewarmProfiles: (process.env.SSO_PREWARM_PROFILES || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean),
+    ssoPrewarmIntervalMs: parseInt(process.env.SSO_PREWARM_INTERVAL_MS) || 1800000, // 30 min
+    ssoPrewarmTimeoutMs: parseInt(process.env.SSO_PREWARM_TIMEOUT_MS) || 120000, // 2 min
 };
 
 // Validate configuration
@@ -204,6 +216,7 @@ async function start() {
     logger.info(`- Delay Alert Threshold: ${config.delayAlertThreshold} alerts in ${config.delayAlertWindowMs}ms`);
     logger.info(`- Daily Summary: ${config.dailySummaryChannels ? `${config.dailySummaryTime} → ${config.dailySummaryChannels}` : 'Not configured'}`);
     logger.info(`- App Mode: ${config.appMode}`);
+    logger.info(`- SSO Pre-warm: ${config.ssoPrewarmEnabled ? `${config.ssoPrewarmProfiles.join(', ')} every ${config.ssoPrewarmIntervalMs}ms via ${config.ssoPrewarmUrl}` : 'Disabled'}`);
 
     await handler.start();
     logger.info('Slack Socket Mode is running. Listening for messages...');
@@ -218,6 +231,27 @@ async function start() {
     if (config.dailySummaryChannels && config.appMode !== 'local') {
         scheduleDailySummary(config.dailySummaryTime);
     }
+
+    // SSO pre-warm — only on instances that handle PD alerts (cloud/all).
+    // Skip on local instances since alerts there don't run AWS investigations.
+    if (
+        config.ssoPrewarmEnabled
+        && config.ssoPrewarmProfiles.length > 0
+        && config.appMode !== 'local'
+    ) {
+        const prewarm = new SsoPrewarm({
+            url: config.ssoPrewarmUrl,
+            profiles: config.ssoPrewarmProfiles,
+            intervalMs: config.ssoPrewarmIntervalMs,
+            timeoutMs: config.ssoPrewarmTimeoutMs,
+            slackClient: handler.app.client,
+            ownerUserId: config.ownerUserId,
+        });
+        handler.ssoPrewarm = prewarm;
+        prewarm.start();
+    } else if (config.ssoPrewarmEnabled && config.appMode === 'local') {
+        logger.info('SSO pre-warm skipped: APP_MODE=local does not handle alerts');
+    }
 }
 
 start().catch((error) => {
@@ -228,6 +262,7 @@ start().catch((error) => {
 // Handle graceful shutdown
 function shutdown() {
     logger.info('Shutting down Slack Socket Mode server...');
+    if (handler.ssoPrewarm) handler.ssoPrewarm.stop();
     handler.stop().then(() => {
         process.exit(0);
     }).catch(() => {

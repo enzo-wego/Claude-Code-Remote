@@ -3383,6 +3383,23 @@ ${formatted}`
                             '500': { description: 'Failed to run summary' }
                         }
                     }
+                },
+                '/sso-status': {
+                    get: {
+                        summary: 'SSO pre-warm watcher status',
+                        description: 'Reports per-profile last-warm timestamp, duration, error, and consecutive failure count for the SSO credential server.',
+                        responses: {
+                            '200': { description: 'Watcher status', content: { 'application/json': { schema: { type: 'object' } } } }
+                        }
+                    },
+                    post: {
+                        summary: 'Force an SSO pre-warm tick now',
+                        description: 'Runs one pre-warm cycle against all configured profiles immediately (useful for verifying recovery without waiting for the next interval).',
+                        responses: {
+                            '200': { description: 'Warm completed', content: { 'application/json': { schema: { type: 'object' } } } },
+                            '503': { description: 'SSO pre-warm not enabled' }
+                        }
+                    }
                 }
             }
         };
@@ -3754,6 +3771,25 @@ ${formatted}`
                 slackClient: this.app.client,
                 deliveryChannelId: this.config.channelId,
             }).catch(err => this.logger.error(`Daily summary error: ${err.message}`));
+        });
+
+        httpApp.get('/sso-status', (req, res) => {
+            if (!this.ssoPrewarm) {
+                return res.json({ enabled: false });
+            }
+            res.json(this.ssoPrewarm.getStatus());
+        });
+
+        httpApp.post('/sso-status', async (req, res) => {
+            if (!this.ssoPrewarm) {
+                return res.status(503).json({ error: 'SSO pre-warm not enabled' });
+            }
+            try {
+                const status = await this.ssoPrewarm.warmOnce();
+                res.json(status);
+            } catch (err) {
+                res.status(500).json({ error: err.message });
+            }
         });
 
         // ─── PagerDuty Webhook (fallback for Socket Mode) ──────────
