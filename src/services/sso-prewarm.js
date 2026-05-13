@@ -15,10 +15,15 @@
  * returns instantly (token still valid) and the alert path never pays the
  * puppeteer-login cost during an incident.
  *
- * On failure (timeout, HTTP error, server down) the watcher DMs
- * SLACK_OWNER_USER_ID once until recovery so we find out during quiet
- * hours rather than mid-incident.
+ * On failure (timeout, HTTP error, server down) the watcher schedules a
+ * single quick retry. Only if that retry also fails does it DM
+ * SLACK_OWNER_USER_ID — single transient timeouts that the next tick
+ * would have absorbed stay silent. The retry exists because a real
+ * outage during quiet hours otherwise hides for the full poll interval
+ * (typically 30 min) before we hear about it.
  */
+
+const RETRY_AFTER_FAILURE_MS = 30000;
 
 const http = require('http');
 const https = require('https');
@@ -38,9 +43,10 @@ class SsoPrewarm {
         this._timer = null;
         this._inFlight = false;
         this._startedAt = null;
-        // Per-profile rolling state. lastNotifiedFailureAt is only used to
-        // suppress duplicate "still failing" DMs — a single DM per failure
-        // streak, plus one recovery DM, is the right cadence.
+        // Per-profile rolling state. notifiedFailure tracks whether we've
+        // already DM'd about the current outage so we send exactly one ⚠️
+        // per streak and one ✅ on recovery — and stay silent when a
+        // single failure is self-covered by the scheduled retry.
         this._state = new Map();
         for (const p of this.profiles) {
             this._state.set(p, {
@@ -49,6 +55,8 @@ class SsoPrewarm {
                 lastError: null,
                 consecutiveFailures: 0,
                 credentialExpiresAt: null,
+                notifiedFailure: false,
+                retryTimer: null,
             });
         }
     }
@@ -74,6 +82,12 @@ class SsoPrewarm {
         if (this._timer) {
             clearInterval(this._timer);
             this._timer = null;
+        }
+        for (const state of this._state.values()) {
+            if (state.retryTimer) {
+                clearTimeout(state.retryTimer);
+                state.retryTimer = null;
+            }
         }
     }
 
@@ -126,13 +140,19 @@ class SsoPrewarm {
             state.lastDurationMs = duration;
             state.lastError = null;
             const prevFailures = state.consecutiveFailures;
+            const wasNotified = state.notifiedFailure;
             state.consecutiveFailures = 0;
+            state.notifiedFailure = false;
+            if (state.retryTimer) {
+                clearTimeout(state.retryTimer);
+                state.retryTimer = null;
+            }
             try {
                 const parsed = JSON.parse(body);
                 if (parsed.Expiration) state.credentialExpiresAt = parsed.Expiration;
             } catch { /* non-JSON shape (e.g. shell export) — ignore */ }
             this.logger.debug(`SSO pre-warm OK: ${profile} (${duration}ms)`);
-            if (prevFailures > 0) {
+            if (wasNotified) {
                 await this._notifyOwnerRecovered(profile, prevFailures);
             }
         } catch (err) {
@@ -142,6 +162,18 @@ class SsoPrewarm {
             state.consecutiveFailures += 1;
             this.logger.warn(`SSO pre-warm FAIL: ${profile} (${duration}ms): ${err.message}`);
             if (state.consecutiveFailures === 1) {
+                // Likely the SSO server is mid-login. Schedule one quick
+                // retry instead of waking the owner — if it succeeds the
+                // outage was self-covered and stays silent.
+                if (!state.retryTimer) {
+                    state.retryTimer = setTimeout(() => {
+                        state.retryTimer = null;
+                        this._warmProfile(profile).catch(() => {});
+                    }, RETRY_AFTER_FAILURE_MS);
+                    if (state.retryTimer.unref) state.retryTimer.unref();
+                }
+            } else if (!state.notifiedFailure) {
+                state.notifiedFailure = true;
                 await this._notifyOwnerFailure(profile, err.message, duration);
             }
         }
