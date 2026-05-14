@@ -1623,8 +1623,19 @@ ${formatted}`
                 // If we have a saved CLI session id AND the chain leads with
                 // the same CLI, ask the launcher to use the adapter's resume
                 // command. Different first CLI → resume id wouldn't apply.
-                const resumeIdForFirst = (resumeChain[0] === resumeSavedCli && session.claudeSessionId)
+                let resumeIdForFirst = (resumeChain[0] === resumeSavedCli && session.claudeSessionId)
                     ? session.claudeSessionId : null;
+                // Only promise "with prior context" if the adapter actually
+                // supports resume. Gemini's buildResumeCommand returns null →
+                // the launcher silently falls back to a fresh launch; without
+                // this gate the user sees "Resuming with prior context :rocket:"
+                // while the new process boots with empty history.
+                if (resumeIdForFirst) {
+                    const firstAdapter = getCliAdapter(resumeChain[0]);
+                    const wouldResume = typeof firstAdapter.buildResumeCommand === 'function'
+                        && firstAdapter.buildResumeCommand(resumeIdForFirst);
+                    if (!wouldResume) resumeIdForFirst = null;
+                }
                 this.logger.warn(`Tmux session ${session.sessionName} is dead, recreating in ${session.repoPath} (chain=${resumeChain.join('→')}${resumeIdForFirst ? `, resume=${resumeIdForFirst}` : ''})...`);
                 await say({
                     text: resumeIdForFirst
@@ -2462,7 +2473,17 @@ ${formatted}`
         let attempts = 0;
         let processing = false;
         let everSawWorking = false; // LAYER 3 — silent-drop detector
-        const maxAttempts = Math.ceil((this.config.pollerTimeoutMs || 1800000) / 1000); // default 30 min
+        // Idle-based timeout: only fire after the CLI has been silent for too
+        // long (no working spinner AND no output change). Wall-clock-only
+        // timeouts kill actively-progressing sessions — e.g. Gemini 3's
+        // multi-minute "Thinking..." steps would lose all progress and
+        // requeue from scratch. Keep a wall ceiling as a safety net for
+        // genuinely runaway sessions.
+        const idleTimeoutMs = this.config.pollerTimeoutMs || 1800000; // default 30 min of silence
+        const wallCeilingMs = this.config.pollerMaxWallMs || (idleTimeoutMs * 4); // hard cap, default 2h
+        const pollerStartedAt = Date.now();
+        let lastActivityAt = pollerStartedAt;
+        let lastSessionTimerArm = pollerStartedAt;
         const stableThreshold = 3;
 
         const interval = setInterval(async () => {
@@ -2496,12 +2517,24 @@ ${formatted}`
                     await this._removeReaction(session.channelId, session.alertMessageTs, 'eyes').catch(() => {});
                     await this._addReaction(session.channelId, session.alertMessageTs, 'white_check_mark').catch(() => {});
                     // Re-read session so lastBotTs reflects any post that happened during this turn.
-                    // "silent" means the bot never posted anything to the thread — covers both
-                    // the splash-swallowed-prompt case (empty buffer) and the produced-bytes-but-
-                    // never-finished case (non-empty buffer, no Stop hook fired).
+                    // Silent-failure requeue is for the startup-race case only: CLI never started a
+                    // turn, no output, no Stop hook. If the pane DID show working at any point,
+                    // requeueing won't help (same CLI on the same skill hits the same wall) — let
+                    // the item complete and surface a manual-triage notice instead.
                     const fresh = sessionKey ? this._getSession(sessionKey) : null;
                     const lastBotTs = fresh?.lastBotTs ?? session.lastBotTs;
-                    this._completeQueueItem(session.channelId, session.alertMessageTs, { silent: !lastBotTs });
+                    const silentStartup = !lastBotTs && !everSawWorking;
+                    if (!silentStartup && !lastBotTs && everSawWorking) {
+                        try {
+                            await say({
+                                text: `:hourglass: \`${session.cliType || 'cli'}\` started work but did not finish before the session ended — manual triage required.`,
+                                thread_ts: threadTs,
+                            });
+                        } catch (err) {
+                            this.logger.error(`Failed to post in-progress-timeout notice: ${err.message}`);
+                        }
+                    }
+                    this._completeQueueItem(session.channelId, session.alertMessageTs, { silent: silentStartup });
                 }
                 this.logger.info(`Poller stopped: tmux session ${sessionName} is dead`);
                 return;
@@ -2509,26 +2542,44 @@ ${formatted}`
 
             attempts++;
 
-            if (attempts > maxAttempts) {
+            const now = Date.now();
+            const idleMs = now - lastActivityAt;
+            const wallMs = now - pollerStartedAt;
+            const hitIdleTimeout = idleMs > idleTimeoutMs;
+            const hitWallCeiling = wallMs > wallCeilingMs;
+
+            if (hitIdleTimeout || hitWallCeiling) {
                 clearInterval(interval);
                 this.pollers.delete(pollKey);
-                this.logger.warn(`Poller timeout after ${maxAttempts}s for ${sessionName} (alert=${isAlertSession})`);
+                const reason = hitWallCeiling
+                    ? `wall ceiling ${Math.round(wallMs / 60000)}min`
+                    : `idle ${Math.round(idleMs / 60000)}min`;
+                this.logger.warn(`Poller timeout (${reason}) for ${sessionName} (alert=${isAlertSession}, everSawWorking=${everSawWorking})`);
                 try {
                     if (!everSawWorking) {
-                        // LAYER 3 — silent-drop notice. 30 min of polling and the
-                        // CLI never entered working state once. Input was almost
-                        // certainly dropped; no Stop hook will fire. Notify the user.
+                        // LAYER 3 — silent-drop. Polled the full idle window and the
+                        // CLI never entered working state. Input was almost certainly
+                        // dropped; no Stop hook will fire. Notify the user.
                         this.logger.warn(`Silent input drop detected for ${sessionName} (timeout, working never observed)`);
                         await say({
                             text: `:x: \`${session.cliType || 'cli'}\` never started a turn — your message was likely dropped (splash redraw or Enter swallowed). Please reply again to retry.`,
                             thread_ts: threadTs,
                         });
+                    } else if (isAlertSession) {
+                        // Worked but never finished — long-running step exceeded the
+                        // idle window (Gemini-style). Don't retry on the same CLI;
+                        // surface a manual-triage notice. _completeQueueItem below
+                        // gets silent=false so the requeue path skips this item.
+                        await say({
+                            text: `:hourglass: Investigation did not complete (${reason}) — manual triage required.`,
+                            thread_ts: threadTs,
+                        });
+                        if (alertBuffer) {
+                            this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on idle timeout for ${sessionName}`);
+                        }
                     } else if (alertBuffer) {
-                        // Tmux is about to be killed (line below) — no Stop hook will fire,
-                        // so the buffered output is unreachable. Requeue path picks this up
-                        // via lastBotTs check.
-                        this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on timeout for ${sessionName}`);
-                    } else if (!isAlertSession) {
+                        this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on idle timeout for ${sessionName}`);
+                    } else {
                         await say({ text: 'Claude session timed out. Send another message to continue.', thread_ts: threadTs });
                     }
                 } catch (err) {
@@ -2545,11 +2596,11 @@ ${formatted}`
                     if (sess?.alertMessageTs) {
                         await this._removeReaction(sess.channelId, sess.alertMessageTs, 'eyes').catch(() => {});
                         await this._addReaction(sess.channelId, sess.alertMessageTs, 'white_check_mark').catch(() => {});
-                        // 30-min poller timeout. "silent" means the bot never posted anything to
-                        // the thread — covers both the empty-buffer case (CLI hung from the start)
-                        // and the produced-bytes-but-never-finished case (Stop hook never fired
-                        // before tmux was killed above).
-                        this._completeQueueItem(sess.channelId, sess.alertMessageTs, { silent: !sess.lastBotTs });
+                        // Requeue only on genuine startup race (no bot post AND
+                        // the CLI never entered working state). In-progress timeouts
+                        // get silent=false so the queue completes without retry.
+                        const silentStartup = !sess.lastBotTs && !everSawWorking;
+                        this._completeQueueItem(sess.channelId, sess.alertMessageTs, { silent: silentStartup });
                     }
                 }
                 return;
@@ -2612,6 +2663,22 @@ ${formatted}`
                 adapter.workingIndicators.some(ind => tailText.includes(ind)) ||
                 (adapter.workingRegexes || []).some(re => re.test(tailText));
             if (isWorking) everSawWorking = true;
+
+            // Activity tracking for the idle-based timeout. Output change OR
+            // an active spinner both count — a CLI mid-inference may keep the
+            // pane visually identical for many seconds (Gemini's "Thinking..."
+            // timer increments but the screen capture can occasionally match
+            // depending on tmux refresh), so we need both signals.
+            if (isWorking || stableCount === 0) {
+                lastActivityAt = Date.now();
+                // Re-arm the parallel session-inactivity timer so it doesn't
+                // fire and kill a busy session. Throttle to once per minute —
+                // re-arming setTimeout every poll tick is unnecessary churn.
+                if (sessionKey && Date.now() - lastSessionTimerArm > 60000) {
+                    this._startSessionTimeout(sessionKey);
+                    lastSessionTimerArm = Date.now();
+                }
+            }
 
             if (attempts % 10 === 0) {
                 const lastFiveLines = lines.slice(-5).map(l => l.trim()).join(' | ');
