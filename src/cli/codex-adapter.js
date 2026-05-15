@@ -87,6 +87,33 @@ function codexHooksFeatureEnabled() {
     }
 }
 
+// Idempotently set `codex_hooks = true` under `[features]` in config.toml.
+// Returns true if the file was changed. We use a regex-based merge instead of
+// a TOML parser to preserve comments and ordering of unrelated keys — the bot
+// is the only thing touching this flag, and the format is stable enough.
+function enableCodexHooksFeature() {
+    let body = '';
+    if (fs.existsSync(CONFIG_PATH)) {
+        try { body = fs.readFileSync(CONFIG_PATH, 'utf8'); } catch { body = ''; }
+    }
+    if (/codex_hooks\s*=\s*true/.test(body)) return false;
+
+    let next;
+    if (/codex_hooks\s*=\s*false/.test(body)) {
+        next = body.replace(/codex_hooks\s*=\s*false/, 'codex_hooks = true');
+    } else if (/^\s*\[features\]\s*$/m.test(body)) {
+        // Insert immediately after the [features] header
+        next = body.replace(/^(\s*\[features\]\s*)$/m, `$1\ncodex_hooks = true`);
+    } else {
+        const sep = body.length === 0 || body.endsWith('\n') ? '' : '\n';
+        next = body + `${sep}\n[features]\ncodex_hooks = true\n`;
+    }
+
+    if (!fs.existsSync(CODEX_HOME)) fs.mkdirSync(CODEX_HOME, { recursive: true });
+    fs.writeFileSync(CONFIG_PATH, next);
+    return true;
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 module.exports = {
@@ -214,15 +241,21 @@ module.exports = {
 
         const before = JSON.stringify(doc.hooks.Stop || []);
         doc.hooks.Stop = upsertHook(doc.hooks.Stop, command);
-        const changed = JSON.stringify(doc.hooks.Stop) !== before;
+        const hooksChanged = JSON.stringify(doc.hooks.Stop) !== before;
 
-        if (changed) saveHooks(doc);
+        if (hooksChanged) saveHooks(doc);
 
-        const warning = codexHooksFeatureEnabled()
-            ? null
-            : 'config.toml missing `[features] codex_hooks = true` — Codex will ignore hooks.json until this is set.';
+        // hooks.json is silently ignored without this flag — enable it as part
+        // of the install instead of just warning, so a one-shot install works.
+        const featureChanged = enableCodexHooksFeature();
 
-        return { path: HOOKS_PATH, changed, command, warning };
+        return {
+            path: HOOKS_PATH,
+            changed: hooksChanged || featureChanged,
+            command,
+            warning: null,
+            featureEnabled: true,
+        };
     },
 
     uninstallHooks() {

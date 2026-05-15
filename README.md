@@ -40,7 +40,7 @@ npm run setup
 The interactive wizard will:
 1. Prompt for Slack tokens, channel ID, repo path, per-feature CLI (Claude/Codex), etc.
 2. Generate `.env`
-3. Merge hooks into `~/.claude/settings.json` (Claude) and `~/.codex/config.toml` (Codex)
+3. Install hooks into each CLI's native location (`~/.claude/settings.json`, `~/.codex/hooks.json` with `codex_hooks` feature flag auto-enabled, `~/.gemini/settings.json`)
 
 You can re-run it anytime to update settings.
 
@@ -94,11 +94,16 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-For Codex, add a top-level line to `~/.codex/config.toml`:
+For Codex / Gemini, run the bundled installer instead of editing files manually:
 
-```toml
-notify = ["node", "/path/to/Claude-Code-Remote/cli-hook-notify.js", "completed"]
+```bash
+npm run hooks:install codex   # writes ~/.codex/hooks.json and enables [features] codex_hooks = true
+npm run hooks:install gemini  # writes ~/.gemini/settings.json
+npm run hooks:install all     # all CLIs at once
+npm run hooks:status          # verify
 ```
+
+Each CLI is isolated — installing one never touches another's config.
 
 ### Start
 

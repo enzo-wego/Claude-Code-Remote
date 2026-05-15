@@ -215,6 +215,39 @@ function extractFromGeminiTranscript(transcriptPath) {
 }
 
 /**
+ * Fallback for Codex Stop hook: the payload's `last_assistant_message` is
+ * sometimes empty (intermediate sub-turn, or recent Codex versions delivering
+ * it only on the very last turn). Recover the final assistant text from the
+ * rollout JSONL — outer entry `{ timestamp, type, payload }`, where the
+ * assistant text lives at `payload.message` whenever `payload.type ===
+ * "agent_message"`. We take the LAST such entry.
+ */
+function extractFromCodexTranscript(transcriptPath) {
+    if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
+
+    const content = fs.readFileSync(transcriptPath, 'utf-8').trim();
+    if (!content) return null;
+
+    let last = null;
+    for (const line of content.split('\n')) {
+        try {
+            const entry = JSON.parse(line);
+            const p = entry.payload;
+            if (p && p.type === 'agent_message' && typeof p.message === 'string') {
+                last = p.message;
+            }
+        } catch {
+            continue;
+        }
+    }
+    if (!last) return null;
+    return last
+        .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+/**
  * Fallback (Claude-only transcript format): extract the last assistant text message.
  */
 function extractFromTranscript(transcriptPath) {
@@ -623,6 +656,7 @@ async function sendHookNotification() {
 
     let assistantMessage = hookInput.last_assistant_message
         || (cliSource === 'claude' ? extractFromTranscript(hookInput.transcript_path) : null)
+        || (cliSource === 'codex'  ? extractFromCodexTranscript(hookInput.transcript_path) : null)
         || (cliSource === 'gemini' ? extractFromGeminiTranscript(hookInput.transcript_path) : null);
 
     // Gemini's `prompt_response` payload often arrives with runs of whitespace-only

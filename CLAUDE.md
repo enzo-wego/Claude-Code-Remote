@@ -27,10 +27,10 @@ There is no test runner configured.
 
 ### Entry Points
 
-- **`cli-hook-notify.js`** — Unified hook entry point. Called by Claude `Stop/SubagentStop` hooks and by Codex's `notify` hook. Looks up tmux session in SQLite DB to find the correct channel/thread. Sniffs `CLI_SOURCE` env (set in the tmux prelude) or payload shape to distinguish Claude vs Codex payloads.
+- **`cli-hook-notify.js`** — Unified hook entry point. Called by Claude `Stop/SubagentStop` hooks and by Codex's native `Stop` hook (`~/.codex/hooks.json`, gated by `[features] codex_hooks = true`). Looks up tmux session in SQLite DB to find the correct channel/thread. Sniffs `CLI_SOURCE` env (set in the tmux prelude) or payload shape to distinguish Claude vs Codex payloads. For Codex, falls back to the rollout JSONL transcript (`payload.type === "agent_message"`) when the hook's `last_assistant_message` field is empty.
 - **`claude-hook-notify.js`** — One-line shim that requires `cli-hook-notify.js`. Kept so already-installed Claude hook commands on existing hosts keep working without re-running `npm run hooks:install`.
 - **`claude-remote.js`** — Main CLI (`notify`, `test`, `status`, `config` commands)
-- **`setup.js`** — Interactive setup wizard that generates `.env` and merges hooks into `~/.claude/settings.json` **and** `~/.codex/config.toml` (via the CLI adapters).
+- **`setup.js`** — Interactive setup wizard that generates `.env` and installs hooks into each CLI's native location (Claude → `~/.claude/settings.json`, Codex → `~/.codex/hooks.json` plus enabling `[features] codex_hooks = true` in `~/.codex/config.toml`, Gemini → `~/.gemini/settings.json`) via the CLI adapters.
 - **`start-slack-socket.js`** — Slack Socket Mode launcher
 
 ### Core Modules (`src/core/`)
@@ -52,7 +52,7 @@ The bot can run tmux sessions with Claude Code or Codex CLI, chosen per feature.
 
 - `src/cli/index.js` — selector. `getCliAdapter(type)` returns an adapter by name (`'claude'`, `'codex'`, …), falling back to Claude on unknown names. `listAdapters()` / `adapterNames()` enumerate everything registered.
 - `src/cli/claude-adapter.js` — Claude Code. Uses `SLACK_CLAUDE_COMMAND`. Installs `SessionStart`/`Stop`/`SubagentStop` hooks in `~/.claude/settings.json`. Watches for numbered-choice / "Do you want to proceed?" dialogs.
-- `src/cli/codex-adapter.js` — Codex CLI. Uses `CODEX_COMMAND` (default `codex --dangerously-bypass-approvals-and-sandbox`). Installs a top-level `notify = ["node", "<repo>/cli-hook-notify.js", "completed"]` line in `~/.codex/config.toml`. Skips the Claude-specific confirmation watcher.
+- `src/cli/codex-adapter.js` — Codex CLI. Uses `CODEX_COMMAND` (default `codex --dangerously-bypass-approvals-and-sandbox`). Installs a `Stop` hook in `~/.codex/hooks.json` (Codex's native hook system) calling `cli-hook-notify.js completed`, and enables `[features] codex_hooks = true` in `~/.codex/config.toml` since hooks.json is ignored without it. Skips the Claude-specific confirmation watcher.
 
 **Adding a new CLI** (e.g. Gemini): create `src/cli/gemini-adapter.js` exporting the same interface, register it in the `ADAPTERS` dict in `src/cli/index.js`. The hooks installer, @mention `start <cli> from project …` keyword detector, and config name validation all pick it up automatically — no other edits needed.
 
@@ -71,7 +71,7 @@ All state is file-based:
 
 ### Execution Flow (Regular)
 
-1. Claude / Codex runs with hooks configured in `~/.claude/settings.json` (Claude) or `~/.codex/config.toml` (Codex — `notify` line)
+1. Claude / Codex / Gemini runs with hooks configured in their native locations (`~/.claude/settings.json`, `~/.codex/hooks.json` + `codex_hooks` feature flag, `~/.gemini/settings.json`)
 2. On task completion, hooks call `cli-hook-notify.js completed|waiting`
 3. Hook script detects which CLI sent the payload (via `CLI_SOURCE` env from the tmux prelude or payload shape) and looks up tmux session in SQLite -> posts to correct Slack channel/thread
 4. User replies via Slack @mention
@@ -100,13 +100,15 @@ All state is file-based:
 
 The bot relies on CLI lifecycle hooks to know when a task finished:
 - **Claude**: `Stop` / `SubagentStop` / `SessionStart` in `~/.claude/settings.json`
-- **Codex**: top-level `notify = [...]` in `~/.codex/config.toml`
+- **Codex**: `Stop` in `~/.codex/hooks.json` — requires `[features] codex_hooks = true` in `~/.codex/config.toml` (the installer enables it automatically). Codex's payload `last_assistant_message` is sometimes empty, so `cli-hook-notify.js` falls back to reading the rollout JSONL (`payload.type === "agent_message"`).
+- **Gemini**: `SessionStart` / `AfterAgent` in `~/.gemini/settings.json`
 
-Both CLIs call the same entry point (`cli-hook-notify.js`), which routes to the right handler based on payload shape / `CLI_SOURCE` env.
+All CLIs call the same entry point (`cli-hook-notify.js`), which routes to the right handler based on payload shape / `CLI_SOURCE` env.
 
 **If a user reports the bot is not sending messages to Slack after the CLI completes a task**, the most likely cause is hooks not being installed. Debug with:
-- `npm run hooks:status` — check both CLIs' hook state
-- `cat ~/.claude/settings.json` / `cat ~/.codex/config.toml` — verify hook commands point to the correct absolute path of `cli-hook-notify.js`
+- `npm run hooks:status` — check every CLI's hook state
+- `tail cli-hook-notify.log` — confirms whether the hook actually fired (entry/exit rows per invocation)
+- `cat ~/.claude/settings.json` / `cat ~/.codex/hooks.json` / `cat ~/.gemini/settings.json` — verify hook commands point to the correct absolute path of `cli-hook-notify.js`
 - `node cli-hook-notify.js completed` — test the hook directly
 - `npm run hooks:install` — re-install hooks for every registered CLI adapter
 
