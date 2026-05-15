@@ -3154,13 +3154,47 @@ ${formatted}`
     _extractSessionStats(output) {
         const stats = {};
         const lines = output.split('\n');
+        // Track whether we've seen the live OMC HUD `ctx:NN%` field. Once we
+        // have, ignore any later `Ctx(u): N.N%` matches: the latter comes from
+        // a one-time /context snapshot in scrollback and goes stale while the
+        // HUD updates every poll cycle.
+        let liveCtxSeen = false;
         for (const line of lines) {
             // Match: Model: Opus 4.6⎇ mainCtx(u): 12.2% | In: 73Out: 1.9k | Cost: $0.24
             const modelMatch = line.match(/Model:\s*(.+?)(?:⎇|$)/);
             if (modelMatch) stats.model = modelMatch[1].trim();
 
-            const ctxMatch = line.match(/Ctx\(u\):\s*([\d.]+%)/);
-            if (ctxMatch) stats.context = ctxMatch[1];
+            // Live OMC HUD footer: `... | ctx:39% | ...` (lowercase, no parens).
+            // Preferred over the legacy `Ctx(u):` form because it reflects the
+            // current turn — the HUD is repainted on every poll, whereas the
+            // old `Ctx(u):` figure is captured from a /context dump that
+            // rapidly scrolls past the 200-line tmux capture window.
+            const ctxLiveMatch = line.match(/\bctx:\s*([\d.]+%)/);
+            if (ctxLiveMatch) {
+                stats.context = ctxLiveMatch[1];
+                liveCtxSeen = true;
+            }
+            if (!liveCtxSeen) {
+                const ctxMatch = line.match(/Ctx\(u\):\s*([\d.]+%)/);
+                if (ctxMatch) stats.context = ctxMatch[1];
+            }
+
+            // Codex live footer:
+            //   gpt-5.5 high · /var/go/src/github.com/payments · Context 36% used · 5h 99% · weekly 87%
+            // The whole footer sits on a single line, so `Context NN% used` is
+            // the authoritative live value. Always overrides earlier matches.
+            const codexFooter = line.match(/^([a-z][\w.-]*\s+(?:high|medium|low|max|min))\s+·.*?Context\s+([\d.]+%)\s+used/i);
+            if (codexFooter) {
+                stats.model = codexFooter[1].trim();
+                stats.context = codexFooter[2];
+                liveCtxSeen = true;
+            } else {
+                const codexCtx = line.match(/Context\s+([\d.]+%)\s+used/);
+                if (codexCtx) {
+                    stats.context = codexCtx[1];
+                    liveCtxSeen = true;
+                }
+            }
 
             const inMatch = line.match(/In:\s*([\d,.]+[kmb]?)/i);
             if (inMatch) stats.tokensIn = inMatch[1];

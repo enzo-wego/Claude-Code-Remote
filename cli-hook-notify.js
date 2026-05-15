@@ -330,7 +330,12 @@ function extractSessionStats(transcriptPath) {
     if (modelMatch) modelShort = modelMatch[1];
 
     const contextTokens = lastInputTokens + lastCacheRead + lastCacheCreation;
-    const contextLimit = (model || '').includes('opus') ? 1000000 : 200000;
+    // Claude Code annotates 1M-context model variants with `[1m]` in the id
+    // (e.g. `claude-opus-4-7[1m]`). Plain `claude-opus-4-7` runs at the
+    // standard 200K window — same divisor OMC HUD uses, so they agree.
+    // The old `includes('opus') ? 1M : 200K` heuristic over-counted by 5×
+    // for Opus on 200K, producing 4% in Slack vs 21% in the live HUD.
+    const contextLimit = /\[1m\]/i.test(model || '') ? 1000000 : 200000;
     const contextPct = Math.min(100, Math.round((contextTokens / contextLimit) * 100));
 
     const fmtTokens = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
