@@ -475,6 +475,30 @@ async function sendResponse(web, channelId, threadTs, response, stats, mentionUs
     }
 }
 
+/**
+ * Mirror socket.js `_updateLastBotTs` from the hook side. Without this, the
+ * poller's tmux-died branch sees `last_bot_ts IS NULL` even after the hook
+ * posted a real report and misclassifies a clean session exit as
+ * "started work but did not finish".
+ */
+function updateLastBotTs(slackSessionKey) {
+    if (!slackSessionKey) return;
+    try {
+        const Database = require('better-sqlite3');
+        const dbPath = path.join(projectDir, 'src/data/slack-sessions.db');
+        if (!fs.existsSync(dbPath)) return;
+        const db = new Database(dbPath);
+        db.pragma('journal_mode = WAL');
+        const nowTs = String(Date.now() / 1000);
+        db.prepare(
+            'UPDATE sessions SET last_bot_ts = ?, updated_at = ? WHERE session_key = ?'
+        ).run(nowTs, Date.now(), slackSessionKey);
+        db.close();
+    } catch (err) {
+        console.error(`Failed to update last_bot_ts: ${err.message}`);
+    }
+}
+
 function markAlertQueueComplete(channelId, alertMessageTs) {
     if (!channelId || !alertMessageTs) return;
     try {
@@ -760,6 +784,7 @@ async function sendHookNotification() {
                             try {
                                 fs.writeFileSync(`/tmp/cli-hook-post-${slackSessionKey}`, String(Date.now()));
                             } catch { /* ignore */ }
+                            updateLastBotTs(slackSessionKey);
                         } catch (err) {
                             console.error(`Conversation-mode post failed: ${err.message}`);
                         }
@@ -880,6 +905,7 @@ async function sendHookNotification() {
                         } catch (err) {
                             console.error(`Failed to persist primary stash: ${err.message}`);
                         }
+                        updateLastBotTs(slackSessionKey);
                     }
 
                     // Clean up any stale "AI agent unresponsive" warning posted earlier
@@ -1050,6 +1076,7 @@ async function sendHookNotification() {
                 try {
                     fs.writeFileSync(`/tmp/cli-hook-post-${slackSessionKey}`, String(Date.now()));
                 } catch { /* best-effort marker; bot has fallback heuristic */ }
+                updateLastBotTs(slackSessionKey);
             }
         } catch (error) {
             console.error('Failed to post response:', error.message);

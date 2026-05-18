@@ -1844,6 +1844,16 @@ ${formatted}`
 
             // Handle /exit — clean up session
             if (command === '/exit') {
+                // Stop the poller BEFORE injecting /exit. Otherwise the inject's
+                // await window lets the 1s poll tick see tmux die and misclassify
+                // a user-initiated exit as a "started work but did not finish"
+                // failure (alert sessions whose completion marker never matched
+                // sit in accumulation forever, so the poller is still live here).
+                const pollKey = session.sessionName;
+                if (this.pollers.has(pollKey)) {
+                    clearInterval(this.pollers.get(pollKey).interval);
+                    this.pollers.delete(pollKey);
+                }
                 if (this._isTmuxSessionAlive(session.sessionName)) {
                     try {
                         await this._injectCommand(session.sessionName, command, session.cliType);
@@ -1853,11 +1863,6 @@ ${formatted}`
                 }
                 this._deleteSession(sessionKey);
                 this._clearSessionTimeout(sessionKey);
-                const pollKey = session.sessionName;
-                if (this.pollers.has(pollKey)) {
-                    clearInterval(this.pollers.get(pollKey).interval);
-                    this.pollers.delete(pollKey);
-                }
                 // Swap alert reactions if this was an alert session
                 if (session.alertMessageTs) {
                     await this._removeReaction(channelId, session.alertMessageTs, 'eyes');
