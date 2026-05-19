@@ -2873,7 +2873,7 @@ ${formatted}`
     }
 
     _startSessionSweep() {
-        const SWEEP_INTERVAL = 15 * 60 * 1000; // 15 minutes
+        const SWEEP_INTERVAL = 60 * 60 * 1000; // 1 hour
         this._sweepInterval = setInterval(() => {
             const sessions = this._getAllSessions();
             let orphaned = 0;
