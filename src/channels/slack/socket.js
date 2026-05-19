@@ -1909,6 +1909,24 @@ ${formatted}`
                 fullCommand = `${BOT_SELF_KNOWLEDGE_PREAMBLE}Here is the Slack thread discussion for context:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
             }
 
+            // Slack mrkdwn reminder on every non-skill chat turn. Skill prompts
+            // (`/<skill>` or the natural-language `execute <skill> skill with
+            // argument …` form) carry their own formatting rules via SKILL.md,
+            // so skip the guidance for those — otherwise we'd double up.
+            // Reason this exists: Gemini drifts back to GitHub-style `**bold**`
+            // and `[label](url)` between turns even after a skill teaches the
+            // rules; Claude/Codex get a one-liner reminder for symmetry.
+            const isSkillInvocation = command.startsWith('/')
+                || /^execute\s+\S+\s+skill\s+with\s+argument\b/i.test(command);
+            if (!isSkillInvocation && !isTrivialFirstMessage) {
+                const chatAdapter = getCliAdapter(session.cliType);
+                const guidance = typeof chatAdapter.chatFormattingGuidance === 'function'
+                    ? chatAdapter.chatFormattingGuidance() : '';
+                if (guidance) {
+                    fullCommand = `${guidance}${fullCommand}`;
+                }
+            }
+
             // Inject the command into the tmux session.
             //
             // If injection fails (e.g. the CLI accepted readiness but rejects

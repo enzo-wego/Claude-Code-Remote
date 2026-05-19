@@ -93,6 +93,18 @@ module.exports = {
         return /^[)❯>]\s*$/m.test(output);
     },
 
+    // Brief Slack mrkdwn reminder prepended to every non-skill chat turn so
+    // Claude doesn't default to GitHub-style `**bold**` mid-thread. Skill
+    // invocations skip this — SKILL.md is authoritative there. See
+    // _processCommand in src/channels/slack/socket.js.
+    chatFormattingGuidance() {
+        return [
+            '[Slack mrkdwn for Slack replies: *bold*, _italic_, ~strike~, `code`, <https://url|label>, "-" or "•" bullets. No `#` / `##` headings — they print as literal hashes. Standard GitHub markdown only inside attachment files.]',
+            '',
+            '',
+        ].join('\n');
+    },
+
     buildAlertPrompt({ skill, permalink, fallbackText = '', imageInstruction = '', fallbackIntro = 'Investigate this alert' } = {}) {
         const snippet = (fallbackText || '').substring(0, 500);
         if (skill && permalink) {

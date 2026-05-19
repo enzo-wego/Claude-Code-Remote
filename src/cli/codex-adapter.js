@@ -139,6 +139,18 @@ module.exports = {
         return rest ? `${exe} resume ${sessionId} ${rest}` : `${exe} resume ${sessionId}`;
     },
 
+    // Brief Slack mrkdwn reminder prepended to every non-skill chat turn so
+    // Codex doesn't default to GitHub-style `**bold**` mid-thread. Skill
+    // invocations skip this — SKILL.md is authoritative there. See
+    // _processCommand in src/channels/slack/socket.js.
+    chatFormattingGuidance() {
+        return [
+            '[Slack mrkdwn for Slack replies: *bold*, _italic_, ~strike~, `code`, <https://url|label>, "-" or "•" bullets. No `#` / `##` headings — they print as literal hashes. Standard GitHub markdown only inside attachment files.]',
+            '',
+            '',
+        ].join('\n');
+    },
+
     // Mirror Claude's natural-language invocation. Codex skills register via
     // slash commands, but those require an active session (error: "Session
     // expired. /<skill> requires an active session — send a message first").
