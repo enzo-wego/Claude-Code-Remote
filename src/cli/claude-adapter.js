@@ -125,11 +125,13 @@ module.exports = {
     ],
 
     // Extra regexes evaluated against lowercased tail text. Claude Code renders a
-    // per-turn timer like "(54s · ↑ 12 tokens)" or "(54s · ↓ 331 tokens)" that
-    // always shows while the agent is active — a reliable signal even when the
-    // verb words rotate. Match either arrow so we cover the input phase too.
+    // per-turn timer like "(54s · ↑ 12 tokens)" or "(3m 59s · ↓ 10.5k tokens)"
+    // that always shows while the agent is active — a reliable signal even when
+    // the verb words rotate. Past 60s the timer switches to space-separated
+    // units ("1m 23s", "1h 5m 12s"), so the regex must accept one-or-more
+    // `<digits><h|m|s>` groups separated by whitespace.
     workingRegexes: [
-        /\(\d+[sm]\d*s?\s+·\s+[↑↓]/
+        /\((?:\d+[hms]\s*)+·\s+[↑↓]/
     ],
 
     // Substrings that indicate the CLI is waiting for numbered-choice / yes-no confirmation.
