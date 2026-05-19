@@ -74,13 +74,14 @@ function readStdin() {
         let input = '';
         process.stdin.on('data', (chunk) => input += chunk);
         process.stdin.on('end', () => {
-            try {
-                resolve(input.trim() ? JSON.parse(input) : {});
-            } catch {
-                resolve({});
+            let parsed = {};
+            let parseError = null;
+            if (input.trim()) {
+                try { parsed = JSON.parse(input); } catch (e) { parseError = e.message; }
             }
+            resolve({ parsed, rawLen: input.length, parseError, tty: false });
         });
-        if (process.stdin.isTTY) resolve({});
+        if (process.stdin.isTTY) resolve({ parsed: {}, rawLen: 0, parseError: null, tty: true });
     });
 }
 
@@ -541,12 +542,27 @@ async function sendHookNotification() {
     const currentDir = process.cwd();
     const projectName = path.basename(currentDir);
 
-    const rawInput = await readStdin();
+    const stdinResult = await readStdin();
+    const rawInput = stdinResult.parsed;
     const cliSource = detectCliSource(rawInput);
     let hookInput;
     if (cliSource === 'codex') hookInput = normalizeCodexInput(rawInput);
     else if (cliSource === 'gemini') hookInput = normalizeGeminiInput(rawInput);
     else hookInput = rawInput;
+
+    // Diagnostic: capture the inbound payload shape so we can tell whether
+    // an empty-stdin invocation is causing the hook to silently exit before
+    // it can post (e.g. Codex's multi-hook Stop chain starving stdin for the
+    // last hook in the list). One line per invocation alongside entry/exit.
+    traceLog('payload', {
+        stdin_bytes: stdinResult.rawLen,
+        stdin_tty: stdinResult.tty,
+        stdin_parse_error: stdinResult.parseError,
+        raw_keys: Object.keys(rawInput || {}),
+        transcript_path: hookInput.transcript_path || null,
+        last_msg_len: (hookInput.last_assistant_message || '').length,
+        session_id: hookInput.session_id || null,
+    });
 
     const slackSessionKey = process.env.SLACK_SESSION_KEY;
     if (!slackSessionKey) {
