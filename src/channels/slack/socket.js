@@ -22,6 +22,7 @@ const { getCliAdapter, adapterNames } = require('../../cli');
 // new adapter entry auto-enables its keyword in @mention chat regexes below.
 const CLI_NAMES_ALT = adapterNames().join('|');
 const CLI_KEYWORD_RE = new RegExp(`\\bstart\\s+(${CLI_NAMES_ALT})\\b`, 'i');
+const INVESTIGATE_NOW_RE = /\binvestigate\s+(?:it\s+|this\s+)?now\b/i;
 const CLI_PREFIX_GROUP = `(?:(?:${CLI_NAMES_ALT})\\s+)?`;
 const ROOT_COMMAND_RE = new RegExp(`start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+root\\s*$`, 'i');
 const PROJECT_COMMAND_RE = new RegExp(`(?:start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+)?project\\s+(\\S+)(?:\\s+from\\s+root)?`, 'i');
@@ -190,6 +191,10 @@ class SlackSocketHandler {
             updateStatus: this.db.prepare('UPDATE alert_queue SET status = ?, updated_at = ? WHERE id = ?'),
             requeueForRetry: this.db.prepare("UPDATE alert_queue SET status = 'pending', retry_count = retry_count + 1, updated_at = ? WHERE id = ? AND status = 'processing'"),
             complete: this.db.prepare("UPDATE alert_queue SET status = 'completed', updated_at = ? WHERE channel_id = ? AND message_ts = ? AND status = 'processing'"),
+            // Atomic promotion: claim a pending row for a manual "investigate now"
+            // override. Filter on status='pending' so we lose cleanly to a racing
+            // _processNextInQueue dequeue (result.changes === 0 then).
+            promote: this.db.prepare("UPDATE alert_queue SET status = 'processing', updated_at = ? WHERE id = ? AND status = 'pending'"),
             cleanOld: this.db.prepare("DELETE FROM alert_queue WHERE status IN ('completed', 'failed') AND updated_at < ?"),
             all: this.db.prepare('SELECT * FROM alert_queue ORDER BY created_at DESC LIMIT 50'),
         };
@@ -1537,7 +1542,81 @@ ${formatted}`
             return;
         }
 
+        // Manual override: "investigate now" inside an alert thread claims the
+        // queued row and starts the investigation immediately, bypassing the
+        // alertMaxConcurrent cap. Falls through to normal chat if no pending
+        // row matches (e.g. already running, or not an alert thread at all).
+        if (INVESTIGATE_NOW_RE.test(text)) {
+            const promoted = await this._tryPromoteQueuedAlert({ channelId, threadTs, text, userId, say });
+            if (promoted) return;
+        }
+
         await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId);
+    }
+
+    /**
+     * Manually promote a pending alert_queue row → 'processing' and fire the
+     * investigation immediately. Used when a human types "investigate now" in
+     * the alert thread instead of waiting for the queue to drain.
+     *
+     * Returns true if we handled the message (promoted, posted a notice, or
+     * detected an already-running investigation); false means the caller
+     * should fall through to normal @mention chat handling.
+     */
+    async _tryPromoteQueuedAlert({ channelId, threadTs, text, userId, say }) {
+        const item = this._queueStmts.getLatestForMessage.get(channelId, threadTs);
+        if (!item) return false; // Not an alert thread we tracked.
+
+        if (item.status === 'processing') {
+            await say({
+                text: ':information_source: Investigation already running for this alert — your follow-up will go to the live session.',
+                thread_ts: threadTs,
+            });
+            return false; // Let _processCommand inject this message into the live session.
+        }
+        if (item.status !== 'pending') {
+            // 'completed' or 'failed' — nothing to promote.
+            return false;
+        }
+
+        // Atomic claim. result.changes === 0 means _processNextInQueue won the race.
+        const result = this._queueStmts.promote.run(Date.now(), item.id);
+        if (result.changes === 0) {
+            this.logger.info(`Manual promote race: id=${item.id} already dequeued by queue worker`);
+            return false;
+        }
+
+        // Resolve CLI chain — honor an inline `start <cli>` keyword, else use
+        // the configured alert chain.
+        let cliChain = this.config.alertCliChain || ['claude'];
+        const kwMatch = text.match(CLI_KEYWORD_RE);
+        if (kwMatch) {
+            const typed = kwMatch[1].toLowerCase();
+            cliChain = typed === 'claude' ? ['claude'] : [typed, 'claude'];
+        }
+
+        this.logger.info(`Manual promote: id=${item.id} incident=${item.incident_id} channel=${channelId} ts=${threadTs} chain=${cliChain.join('→')} by user=${userId}`);
+
+        // Reactions: hourglass → eyes (matches _processNextInQueue's swap).
+        this._removeReaction(channelId, threadTs, 'hourglass_flowing_sand').catch(() => {});
+        this._addReaction(channelId, threadTs, 'eyes').catch(() => {});
+
+        await say({
+            text: `:zap: Manual override — starting investigation now with \`${cliChain.join(' → ')}\` (bypassing queue).`,
+            thread_ts: threadTs,
+        });
+
+        // Fire via the normal command flow with the saved alert prompt (NOT
+        // the user's "investigate now" text). _processCommand will create the
+        // tmux session, set alert_message_ts, and the poller will call
+        // _completeQueueItem when the investigation finishes.
+        this._processCommand(channelId, threadTs, item.prompt, say, threadTs, item.message_ts, userId, cliChain)
+            .catch(err => {
+                this.logger.error(`Manual promote: failed to start investigation for id=${item.id}: ${err.message}`);
+                this._queueStmts.updateStatus.run('failed', Date.now(), item.id);
+            });
+
+        return true;
     }
 
     // ─── Command Processing ──────────────────────────────────────────
