@@ -1671,6 +1671,48 @@ ${formatted}`
             return;
         }
 
+        // /exit — clean up the session regardless of tmux state. Lifted above
+        // the live/dead branching so a /exit on a dead-tmux row doesn't trigger
+        // a fresh tmux spin-up just to immediately kill it (which also leaves
+        // the alert queue slot stuck if the recreate path posts a "Restarting…"
+        // message and the user can't tell whether the incident actually closed).
+        if (command === '/exit' && session) {
+            const pollKey = session.sessionName;
+            if (this.pollers.has(pollKey)) {
+                clearInterval(this.pollers.get(pollKey).interval);
+                this.pollers.delete(pollKey);
+            }
+            if (this._isTmuxSessionAlive(session.sessionName)) {
+                try {
+                    await this._injectCommand(session.sessionName, command, session.cliType);
+                } catch {
+                    // Expected — /exit kills the session before Enter-retry finishes.
+                }
+            }
+            this._deleteSession(sessionKey);
+            this._clearSessionTimeout(sessionKey);
+            if (session.alertMessageTs) {
+                try {
+                    await this._removeReaction(channelId, session.alertMessageTs, 'eyes');
+                    await this._addReaction(channelId, session.alertMessageTs, 'white_check_mark');
+                } catch (err) {
+                    this.logger.warn(`Failed to swap alert reactions on /exit (channel=${channelId} ts=${session.alertMessageTs}): ${err.message}`);
+                }
+                // Free the queue slot so the next pending alert can start.
+                this._completeQueueItem(channelId, session.alertMessageTs);
+            }
+            try {
+                await this.app.client.reactions.add({
+                    channel: channelId,
+                    timestamp: messageTs,
+                    name: 'white_check_mark',
+                });
+            } catch (err) {
+                this.logger.warn(`Failed to ack /exit message (ts=${messageTs}): ${err.message}`);
+            }
+            return;
+        }
+
         try {
             if (session && this._isTmuxSessionAlive(session.sessionName)) {
                 // Tmux alive — Claude already has full context, just inject the raw command
@@ -1921,41 +1963,6 @@ ${formatted}`
                 // Don't start timeout yet — bot is processing the first command. Timeout starts when bot responds.
             }
 
-            // Handle /exit — clean up session
-            if (command === '/exit') {
-                // Stop the poller BEFORE injecting /exit. Otherwise the inject's
-                // await window lets the 1s poll tick see tmux die and misclassify
-                // a user-initiated exit as a "started work but did not finish"
-                // failure (alert sessions whose completion marker never matched
-                // sit in accumulation forever, so the poller is still live here).
-                const pollKey = session.sessionName;
-                if (this.pollers.has(pollKey)) {
-                    clearInterval(this.pollers.get(pollKey).interval);
-                    this.pollers.delete(pollKey);
-                }
-                if (this._isTmuxSessionAlive(session.sessionName)) {
-                    try {
-                        await this._injectCommand(session.sessionName, command, session.cliType);
-                    } catch {
-                        // Expected — /exit kills the session before Enter-retry finishes
-                    }
-                }
-                this._deleteSession(sessionKey);
-                this._clearSessionTimeout(sessionKey);
-                // Swap alert reactions if this was an alert session
-                if (session.alertMessageTs) {
-                    await this._removeReaction(channelId, session.alertMessageTs, 'eyes');
-                    await this._addReaction(channelId, session.alertMessageTs, 'white_check_mark');
-                    // Free the queue slot so the next pending alert can start
-                    this._completeQueueItem(channelId, session.alertMessageTs);
-                }
-                await this.app.client.reactions.add({
-                    channel: channelId,
-                    timestamp: messageTs,
-                    name: 'white_check_mark',
-                });
-                return;
-            }
 
             // Gemini under --yolo plus the project-local Serena MCP onboarding flow
             // treats any non-trivial first prompt as a standing directive to
