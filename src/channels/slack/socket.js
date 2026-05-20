@@ -3365,6 +3365,66 @@ ${formatted}`
                 await say({ text: chunks[i], thread_ts: threadTs, blocks });
             }
         }
+
+        await this._uploadResponseAttachments(threadTs, response);
+    }
+
+    /**
+     * Scan a CLI response for `Attachment written: <path>` markers and upload each
+     * referenced file to the thread. Mirrors the alert-summary upload flow so that
+     * normal @mention chat can deliver large supporting files (logs, dumps, reports)
+     * the same way PagerDuty investigations do.
+     */
+    _extractAttachmentPaths(response) {
+        if (!response || typeof response !== 'string') return [];
+        const paths = [];
+        const seen = new Set();
+        const re = /Attachment written:\s*`?([^\s`\n]+)`?/gi;
+        let m;
+        while ((m = re.exec(response)) !== null) {
+            const cleaned = m[1].replace(/[.,;:!?)\]]+$/, '').trim();
+            if (cleaned && !seen.has(cleaned)) {
+                seen.add(cleaned);
+                paths.push(cleaned);
+            }
+        }
+        return paths;
+    }
+
+    _getRepoPathForThread(threadTs) {
+        try {
+            const row = this.db.prepare('SELECT repo_path FROM sessions WHERE thread_ts = ?').get(threadTs);
+            return row ? row.repo_path : null;
+        } catch { return null; }
+    }
+
+    async _uploadResponseAttachments(threadTs, response) {
+        const candidates = this._extractAttachmentPaths(response);
+        if (!candidates.length) return;
+
+        const channelId = this._getChannelForThread(threadTs) || this.config.channelId;
+        const repoPath = this._getRepoPathForThread(threadTs) || this.config.repoPath || process.cwd();
+
+        for (const rel of candidates) {
+            const abs = path.isAbsolute(rel) ? rel : path.resolve(repoPath, rel);
+            try {
+                const stat = fs.statSync(abs);
+                if (!stat.isFile()) {
+                    this.logger.warn(`Attachment path is not a regular file, skipping: ${abs}`);
+                    continue;
+                }
+                await this.app.client.filesUploadV2({
+                    channel_id: channelId,
+                    thread_ts: threadTs,
+                    file: fs.createReadStream(abs),
+                    filename: path.basename(abs),
+                    title: path.basename(abs),
+                });
+                this.logger.info(`Uploaded chat attachment ${abs} (${stat.size} bytes) to thread ${threadTs}`);
+            } catch (err) {
+                this.logger.warn(`Failed to upload attachment "${rel}" (resolved=${abs}): ${err.message}`);
+            }
+        }
     }
 
     /**
