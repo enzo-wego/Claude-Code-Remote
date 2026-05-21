@@ -259,28 +259,43 @@ function extractFromTranscript(transcriptPath) {
 
     const lines = content.split('\n');
 
+    // Walk backwards but stop at the current turn's boundary. A turn starts
+    // at the most recent `user` entry whose content is a string (the real
+    // human prompt). `user` entries with array content are tool_results and
+    // are part of the current turn. Without this scoping, a turn that
+    // finishes via tool_use only (no assistant text) would cause us to walk
+    // back and return the PREVIOUS turn's assistant text — re-posting it as
+    // if it were the new reply.
     for (let i = lines.length - 1; i >= 0; i--) {
+        let entry;
         try {
-            const entry = JSON.parse(lines[i]);
-            if (entry.type !== 'assistant' || !entry.message?.content) continue;
-
-            let text = '';
-            if (typeof entry.message.content === 'string') {
-                text = entry.message.content;
-            } else if (Array.isArray(entry.message.content)) {
-                text = entry.message.content
-                    .filter(item => item.type === 'text')
-                    .map(item => item.text)
-                    .join('\n');
-            }
-
-            text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
-            text = text.replace(/\n{3,}/g, '\n\n').trim();
-
-            if (text) return text;
+            entry = JSON.parse(lines[i]);
         } catch {
             continue;
         }
+
+        if (entry.type === 'user' && typeof entry.message?.content === 'string') {
+            // Crossed into the previous turn without finding assistant text
+            // in this one — the current turn produced no text reply.
+            return null;
+        }
+
+        if (entry.type !== 'assistant' || !entry.message?.content) continue;
+
+        let text = '';
+        if (typeof entry.message.content === 'string') {
+            text = entry.message.content;
+        } else if (Array.isArray(entry.message.content)) {
+            text = entry.message.content
+                .filter(item => item.type === 'text')
+                .map(item => item.text)
+                .join('\n');
+        }
+
+        text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
+        text = text.replace(/\n{3,}/g, '\n\n').trim();
+
+        if (text) return text;
     }
 
     return null;
