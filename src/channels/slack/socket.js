@@ -1655,6 +1655,13 @@ ${formatted}`
         // Gemini specifically, skip the inject entirely so the session sits
         // ready until the user supplies a real task.
         let isTrivialFirstMessage = false;
+        // True when the CLI process is brand new for this turn — either a
+        // first-ever session or a recreated session that did NOT resume prior
+        // CLI state. Used to gate the Slack-mrkdwn formatting guidance so we
+        // only teach the rule once per CLI process instead of on every turn.
+        // Live sessions and resumed sessions stay false (the CLI already saw
+        // the guidance on its first turn).
+        let isFreshCliBoot = false;
         // Tracks the still-untried CLIs starting at the currently-running one.
         // Set after _startCliWithFallback succeeds; consulted on inject failure
         // so a paste-rejecting CLI can hand off to the next one in the chain.
@@ -1812,6 +1819,7 @@ ${formatted}`
                     // would make the Stop hook treat the new session as a
                     // subagent).
                     this._stmts.updateClaudeSessionId.run(null, Date.now(), sessionKey);
+                    isFreshCliBoot = true;
 
                     // Fetch thread context — summarize with Gemini if long.
                     const allMessages = await this._fetchThreadMessages(channelId, threadTs);
@@ -1947,6 +1955,7 @@ ${formatted}`
                     cliType: resolvedCliType
                 };
                 this._saveSession(session);
+                isFreshCliBoot = true;
                 if (userId) this._updateLastUserId(`${channelId}-${threadTs}`, userId);
 
                 // Fetch thread context — summarize with Gemini if this is a continuation
@@ -1995,16 +2004,19 @@ ${formatted}`
                 fullCommand = `${BOT_SELF_KNOWLEDGE_PREAMBLE}Here is the Slack thread discussion for context:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
             }
 
-            // Slack mrkdwn reminder on every non-skill chat turn. Skill prompts
-            // (`/<skill>` or the natural-language `execute <skill> skill with
-            // argument …` form) carry their own formatting rules via SKILL.md,
-            // so skip the guidance for those — otherwise we'd double up.
-            // Reason this exists: Gemini drifts back to GitHub-style `**bold**`
-            // and `[label](url)` between turns even after a skill teaches the
-            // rules; Claude/Codex get a one-liner reminder for symmetry.
+            // Slack mrkdwn reminder — sent ONCE on the first turn of a fresh
+            // CLI process. Live-session injects and resumed processes already
+            // saw the rule in their first turn, so repeating it just pollutes
+            // context. Skill prompts (`/<skill>` or the natural-language
+            // `execute <skill> skill with argument …` form) carry their own
+            // formatting rules via SKILL.md, so skip the guidance for those —
+            // otherwise we'd double up. Trade-off vs the previous every-turn
+            // approach: Gemini may drift back to GitHub `**bold**` later in a
+            // long session since it doesn't get re-reminded — acceptable to
+            // avoid the noise on Claude/Codex.
             const isSkillInvocation = command.startsWith('/')
                 || /^execute\s+\S+\s+skill\s+with\s+argument\b/i.test(command);
-            if (!isSkillInvocation && !isTrivialFirstMessage) {
+            if (!isSkillInvocation && !isTrivialFirstMessage && isFreshCliBoot) {
                 const chatAdapter = getCliAdapter(session.cliType);
                 const guidance = typeof chatAdapter.chatFormattingGuidance === 'function'
                     ? chatAdapter.chatFormattingGuidance() : '';
