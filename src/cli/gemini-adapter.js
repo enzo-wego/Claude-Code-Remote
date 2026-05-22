@@ -112,6 +112,28 @@ module.exports = {
         return /Type your message or @/.test(output);
     },
 
+    // Gemini drifts back to GitHub-style `**bold**` / `[label](url)` between
+    // turns even after a skill's SKILL.md teaches Slack mrkdwn, so reinforce
+    // the rules verbatim on every chat inject. Skill invocations skip this
+    // (the SKILL.md is authoritative there) — see _processCommand in
+    // src/channels/slack/socket.js.
+    chatFormattingGuidance() {
+        return [
+            '[Slack formatting rules — apply to every Slack message you post in this thread]',
+            '- Bold: *bold*  (single asterisk; NOT **bold**)',
+            '- Italic: _italic_  (NOT *italic*)',
+            '- Strikethrough: ~strike~',
+            '- Inline code: `code`',
+            '- Code block: ```code```',
+            '- Bullet list: prefix each line with "•" or "-"',
+            '- Links: <https://example.com|label>  (NOT [label](url))',
+            '- No `#` / `##` headings — they print as literal hashes in Slack.',
+            'Standard GitHub-flavored markdown is OK ONLY inside attachment files saved to disk; never in the chat message body.',
+            '',
+            '',
+        ].join('\n');
+    },
+
     buildAlertPrompt({ skill, permalink, fallbackText = '', imageInstruction = '', fallbackIntro = 'Investigate this alert' } = {}) {
         const snippet = (fallbackText || '').substring(0, 500);
         if (skill && permalink) {

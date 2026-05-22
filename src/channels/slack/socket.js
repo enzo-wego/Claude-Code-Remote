@@ -22,6 +22,7 @@ const { getCliAdapter, adapterNames } = require('../../cli');
 // new adapter entry auto-enables its keyword in @mention chat regexes below.
 const CLI_NAMES_ALT = adapterNames().join('|');
 const CLI_KEYWORD_RE = new RegExp(`\\bstart\\s+(${CLI_NAMES_ALT})\\b`, 'i');
+const INVESTIGATE_NOW_RE = /\binvestigate\s+(?:it\s+|this\s+)?now\b/i;
 const CLI_PREFIX_GROUP = `(?:(?:${CLI_NAMES_ALT})\\s+)?`;
 const ROOT_COMMAND_RE = new RegExp(`start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+root\\s*$`, 'i');
 const PROJECT_COMMAND_RE = new RegExp(`(?:start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+)?project\\s+(\\S+)(?:\\s+from\\s+root)?`, 'i');
@@ -190,6 +191,10 @@ class SlackSocketHandler {
             updateStatus: this.db.prepare('UPDATE alert_queue SET status = ?, updated_at = ? WHERE id = ?'),
             requeueForRetry: this.db.prepare("UPDATE alert_queue SET status = 'pending', retry_count = retry_count + 1, updated_at = ? WHERE id = ? AND status = 'processing'"),
             complete: this.db.prepare("UPDATE alert_queue SET status = 'completed', updated_at = ? WHERE channel_id = ? AND message_ts = ? AND status = 'processing'"),
+            // Atomic promotion: claim a pending row for a manual "investigate now"
+            // override. Filter on status='pending' so we lose cleanly to a racing
+            // _processNextInQueue dequeue (result.changes === 0 then).
+            promote: this.db.prepare("UPDATE alert_queue SET status = 'processing', updated_at = ? WHERE id = ? AND status = 'pending'"),
             cleanOld: this.db.prepare("DELETE FROM alert_queue WHERE status IN ('completed', 'failed') AND updated_at < ?"),
             all: this.db.prepare('SELECT * FROM alert_queue ORDER BY created_at DESC LIMIT 50'),
         };
@@ -1537,7 +1542,81 @@ ${formatted}`
             return;
         }
 
+        // Manual override: "investigate now" inside an alert thread claims the
+        // queued row and starts the investigation immediately, bypassing the
+        // alertMaxConcurrent cap. Falls through to normal chat if no pending
+        // row matches (e.g. already running, or not an alert thread at all).
+        if (INVESTIGATE_NOW_RE.test(text)) {
+            const promoted = await this._tryPromoteQueuedAlert({ channelId, threadTs, text, userId, say });
+            if (promoted) return;
+        }
+
         await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId);
+    }
+
+    /**
+     * Manually promote a pending alert_queue row → 'processing' and fire the
+     * investigation immediately. Used when a human types "investigate now" in
+     * the alert thread instead of waiting for the queue to drain.
+     *
+     * Returns true if we handled the message (promoted, posted a notice, or
+     * detected an already-running investigation); false means the caller
+     * should fall through to normal @mention chat handling.
+     */
+    async _tryPromoteQueuedAlert({ channelId, threadTs, text, userId, say }) {
+        const item = this._queueStmts.getLatestForMessage.get(channelId, threadTs);
+        if (!item) return false; // Not an alert thread we tracked.
+
+        if (item.status === 'processing') {
+            await say({
+                text: ':information_source: Investigation already running for this alert — your follow-up will go to the live session.',
+                thread_ts: threadTs,
+            });
+            return false; // Let _processCommand inject this message into the live session.
+        }
+        if (item.status !== 'pending') {
+            // 'completed' or 'failed' — nothing to promote.
+            return false;
+        }
+
+        // Atomic claim. result.changes === 0 means _processNextInQueue won the race.
+        const result = this._queueStmts.promote.run(Date.now(), item.id);
+        if (result.changes === 0) {
+            this.logger.info(`Manual promote race: id=${item.id} already dequeued by queue worker`);
+            return false;
+        }
+
+        // Resolve CLI chain — honor an inline `start <cli>` keyword, else use
+        // the configured alert chain.
+        let cliChain = this.config.alertCliChain || ['claude'];
+        const kwMatch = text.match(CLI_KEYWORD_RE);
+        if (kwMatch) {
+            const typed = kwMatch[1].toLowerCase();
+            cliChain = typed === 'claude' ? ['claude'] : [typed, 'claude'];
+        }
+
+        this.logger.info(`Manual promote: id=${item.id} incident=${item.incident_id} channel=${channelId} ts=${threadTs} chain=${cliChain.join('→')} by user=${userId}`);
+
+        // Reactions: hourglass → eyes (matches _processNextInQueue's swap).
+        this._removeReaction(channelId, threadTs, 'hourglass_flowing_sand').catch(() => {});
+        this._addReaction(channelId, threadTs, 'eyes').catch(() => {});
+
+        await say({
+            text: `:zap: Manual override — starting investigation now with \`${cliChain.join(' → ')}\` (bypassing queue).`,
+            thread_ts: threadTs,
+        });
+
+        // Fire via the normal command flow with the saved alert prompt (NOT
+        // the user's "investigate now" text). _processCommand will create the
+        // tmux session, set alert_message_ts, and the poller will call
+        // _completeQueueItem when the investigation finishes.
+        this._processCommand(channelId, threadTs, item.prompt, say, threadTs, item.message_ts, userId, cliChain)
+            .catch(err => {
+                this.logger.error(`Manual promote: failed to start investigation for id=${item.id}: ${err.message}`);
+                this._queueStmts.updateStatus.run('failed', Date.now(), item.id);
+            });
+
+        return true;
     }
 
     // ─── Command Processing ──────────────────────────────────────────
@@ -1576,6 +1655,13 @@ ${formatted}`
         // Gemini specifically, skip the inject entirely so the session sits
         // ready until the user supplies a real task.
         let isTrivialFirstMessage = false;
+        // True when the CLI process is brand new for this turn — either a
+        // first-ever session or a recreated session that did NOT resume prior
+        // CLI state. Used to gate the Slack-mrkdwn formatting guidance so we
+        // only teach the rule once per CLI process instead of on every turn.
+        // Live sessions and resumed sessions stay false (the CLI already saw
+        // the guidance on its first turn).
+        let isFreshCliBoot = false;
         // Tracks the still-untried CLIs starting at the currently-running one.
         // Set after _startCliWithFallback succeeds; consulted on inject failure
         // so a paste-rejecting CLI can hand off to the next one in the chain.
@@ -1589,6 +1675,48 @@ ${formatted}`
         if (command.startsWith('/') && !isLiveSession && !(command === '/exit' && session) && !cliChainHint) {
             const cmd = command.split(/\s/)[0];
             await say({ text: `Session expired. \`${cmd}\` requires an active session — send a message first to start a new one, then use \`${cmd}\`.`, thread_ts: threadTs });
+            return;
+        }
+
+        // /exit — clean up the session regardless of tmux state. Lifted above
+        // the live/dead branching so a /exit on a dead-tmux row doesn't trigger
+        // a fresh tmux spin-up just to immediately kill it (which also leaves
+        // the alert queue slot stuck if the recreate path posts a "Restarting…"
+        // message and the user can't tell whether the incident actually closed).
+        if (command === '/exit' && session) {
+            const pollKey = session.sessionName;
+            if (this.pollers.has(pollKey)) {
+                clearInterval(this.pollers.get(pollKey).interval);
+                this.pollers.delete(pollKey);
+            }
+            if (this._isTmuxSessionAlive(session.sessionName)) {
+                try {
+                    await this._injectCommand(session.sessionName, command, session.cliType);
+                } catch {
+                    // Expected — /exit kills the session before Enter-retry finishes.
+                }
+            }
+            this._deleteSession(sessionKey);
+            this._clearSessionTimeout(sessionKey);
+            if (session.alertMessageTs) {
+                try {
+                    await this._removeReaction(channelId, session.alertMessageTs, 'eyes');
+                    await this._addReaction(channelId, session.alertMessageTs, 'white_check_mark');
+                } catch (err) {
+                    this.logger.warn(`Failed to swap alert reactions on /exit (channel=${channelId} ts=${session.alertMessageTs}): ${err.message}`);
+                }
+                // Free the queue slot so the next pending alert can start.
+                this._completeQueueItem(channelId, session.alertMessageTs);
+            }
+            try {
+                await this.app.client.reactions.add({
+                    channel: channelId,
+                    timestamp: messageTs,
+                    name: 'white_check_mark',
+                });
+            } catch (err) {
+                this.logger.warn(`Failed to ack /exit message (ts=${messageTs}): ${err.message}`);
+            }
             return;
         }
 
@@ -1691,6 +1819,7 @@ ${formatted}`
                     // would make the Stop hook treat the new session as a
                     // subagent).
                     this._stmts.updateClaudeSessionId.run(null, Date.now(), sessionKey);
+                    isFreshCliBoot = true;
 
                     // Fetch thread context — summarize with Gemini if long.
                     const allMessages = await this._fetchThreadMessages(channelId, threadTs);
@@ -1826,6 +1955,7 @@ ${formatted}`
                     cliType: resolvedCliType
                 };
                 this._saveSession(session);
+                isFreshCliBoot = true;
                 if (userId) this._updateLastUserId(`${channelId}-${threadTs}`, userId);
 
                 // Fetch thread context — summarize with Gemini if this is a continuation
@@ -1842,41 +1972,6 @@ ${formatted}`
                 // Don't start timeout yet — bot is processing the first command. Timeout starts when bot responds.
             }
 
-            // Handle /exit — clean up session
-            if (command === '/exit') {
-                // Stop the poller BEFORE injecting /exit. Otherwise the inject's
-                // await window lets the 1s poll tick see tmux die and misclassify
-                // a user-initiated exit as a "started work but did not finish"
-                // failure (alert sessions whose completion marker never matched
-                // sit in accumulation forever, so the poller is still live here).
-                const pollKey = session.sessionName;
-                if (this.pollers.has(pollKey)) {
-                    clearInterval(this.pollers.get(pollKey).interval);
-                    this.pollers.delete(pollKey);
-                }
-                if (this._isTmuxSessionAlive(session.sessionName)) {
-                    try {
-                        await this._injectCommand(session.sessionName, command, session.cliType);
-                    } catch {
-                        // Expected — /exit kills the session before Enter-retry finishes
-                    }
-                }
-                this._deleteSession(sessionKey);
-                this._clearSessionTimeout(sessionKey);
-                // Swap alert reactions if this was an alert session
-                if (session.alertMessageTs) {
-                    await this._removeReaction(channelId, session.alertMessageTs, 'eyes');
-                    await this._addReaction(channelId, session.alertMessageTs, 'white_check_mark');
-                    // Free the queue slot so the next pending alert can start
-                    this._completeQueueItem(channelId, session.alertMessageTs);
-                }
-                await this.app.client.reactions.add({
-                    channel: channelId,
-                    timestamp: messageTs,
-                    name: 'white_check_mark',
-                });
-                return;
-            }
 
             // Gemini under --yolo plus the project-local Serena MCP onboarding flow
             // treats any non-trivial first prompt as a standing directive to
@@ -1907,6 +2002,27 @@ ${formatted}`
             let fullCommand = command;
             if (threadContext && !isTrivialFirstMessage) {
                 fullCommand = `${BOT_SELF_KNOWLEDGE_PREAMBLE}Here is the Slack thread discussion for context:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
+            }
+
+            // Slack mrkdwn reminder — sent ONCE on the first turn of a fresh
+            // CLI process. Live-session injects and resumed processes already
+            // saw the rule in their first turn, so repeating it just pollutes
+            // context. Skill prompts (`/<skill>` or the natural-language
+            // `execute <skill> skill with argument …` form) carry their own
+            // formatting rules via SKILL.md, so skip the guidance for those —
+            // otherwise we'd double up. Trade-off vs the previous every-turn
+            // approach: Gemini may drift back to GitHub `**bold**` later in a
+            // long session since it doesn't get re-reminded — acceptable to
+            // avoid the noise on Claude/Codex.
+            const isSkillInvocation = command.startsWith('/')
+                || /^execute\s+\S+\s+skill\s+with\s+argument\b/i.test(command);
+            if (!isSkillInvocation && !isTrivialFirstMessage && isFreshCliBoot) {
+                const chatAdapter = getCliAdapter(session.cliType);
+                const guidance = typeof chatAdapter.chatFormattingGuidance === 'function'
+                    ? chatAdapter.chatFormattingGuidance() : '';
+                if (guidance) {
+                    fullCommand = `${guidance}${fullCommand}`;
+                }
             }
 
             // Inject the command into the tmux session.
@@ -3259,6 +3375,66 @@ ${formatted}`
                     blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: statsLine.trim() }] });
                 }
                 await say({ text: chunks[i], thread_ts: threadTs, blocks });
+            }
+        }
+
+        await this._uploadResponseAttachments(threadTs, response);
+    }
+
+    /**
+     * Scan a CLI response for `Attachment written: <path>` markers and upload each
+     * referenced file to the thread. Mirrors the alert-summary upload flow so that
+     * normal @mention chat can deliver large supporting files (logs, dumps, reports)
+     * the same way PagerDuty investigations do.
+     */
+    _extractAttachmentPaths(response) {
+        if (!response || typeof response !== 'string') return [];
+        const paths = [];
+        const seen = new Set();
+        const re = /Attachment written:\s*`?([^\s`\n]+)`?/gi;
+        let m;
+        while ((m = re.exec(response)) !== null) {
+            const cleaned = m[1].replace(/[.,;:!?)\]]+$/, '').trim();
+            if (cleaned && !seen.has(cleaned)) {
+                seen.add(cleaned);
+                paths.push(cleaned);
+            }
+        }
+        return paths;
+    }
+
+    _getRepoPathForThread(threadTs) {
+        try {
+            const row = this.db.prepare('SELECT repo_path FROM sessions WHERE thread_ts = ?').get(threadTs);
+            return row ? row.repo_path : null;
+        } catch { return null; }
+    }
+
+    async _uploadResponseAttachments(threadTs, response) {
+        const candidates = this._extractAttachmentPaths(response);
+        if (!candidates.length) return;
+
+        const channelId = this._getChannelForThread(threadTs) || this.config.channelId;
+        const repoPath = this._getRepoPathForThread(threadTs) || this.config.repoPath || process.cwd();
+
+        for (const rel of candidates) {
+            const abs = path.isAbsolute(rel) ? rel : path.resolve(repoPath, rel);
+            try {
+                const stat = fs.statSync(abs);
+                if (!stat.isFile()) {
+                    this.logger.warn(`Attachment path is not a regular file, skipping: ${abs}`);
+                    continue;
+                }
+                await this.app.client.filesUploadV2({
+                    channel_id: channelId,
+                    thread_ts: threadTs,
+                    file: fs.createReadStream(abs),
+                    filename: path.basename(abs),
+                    title: path.basename(abs),
+                });
+                this.logger.info(`Uploaded chat attachment ${abs} (${stat.size} bytes) to thread ${threadTs}`);
+            } catch (err) {
+                this.logger.warn(`Failed to upload attachment "${rel}" (resolved=${abs}): ${err.message}`);
             }
         }
     }

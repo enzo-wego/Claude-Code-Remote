@@ -259,28 +259,43 @@ function extractFromTranscript(transcriptPath) {
 
     const lines = content.split('\n');
 
+    // Walk backwards but stop at the current turn's boundary. A turn starts
+    // at the most recent `user` entry whose content is a string (the real
+    // human prompt). `user` entries with array content are tool_results and
+    // are part of the current turn. Without this scoping, a turn that
+    // finishes via tool_use only (no assistant text) would cause us to walk
+    // back and return the PREVIOUS turn's assistant text — re-posting it as
+    // if it were the new reply.
     for (let i = lines.length - 1; i >= 0; i--) {
+        let entry;
         try {
-            const entry = JSON.parse(lines[i]);
-            if (entry.type !== 'assistant' || !entry.message?.content) continue;
-
-            let text = '';
-            if (typeof entry.message.content === 'string') {
-                text = entry.message.content;
-            } else if (Array.isArray(entry.message.content)) {
-                text = entry.message.content
-                    .filter(item => item.type === 'text')
-                    .map(item => item.text)
-                    .join('\n');
-            }
-
-            text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
-            text = text.replace(/\n{3,}/g, '\n\n').trim();
-
-            if (text) return text;
+            entry = JSON.parse(lines[i]);
         } catch {
             continue;
         }
+
+        if (entry.type === 'user' && typeof entry.message?.content === 'string') {
+            // Crossed into the previous turn without finding assistant text
+            // in this one — the current turn produced no text reply.
+            return null;
+        }
+
+        if (entry.type !== 'assistant' || !entry.message?.content) continue;
+
+        let text = '';
+        if (typeof entry.message.content === 'string') {
+            text = entry.message.content;
+        } else if (Array.isArray(entry.message.content)) {
+            text = entry.message.content
+                .filter(item => item.type === 'text')
+                .map(item => item.text)
+                .join('\n');
+        }
+
+        text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
+        text = text.replace(/\n{3,}/g, '\n\n').trim();
+
+        if (text) return text;
     }
 
     return null;
@@ -661,19 +676,25 @@ async function sendHookNotification() {
                 // (not the normalized one — normalize falls back to turn_id, which
                 // changes every turn and would overwrite the persistent id).
                 // Skip Claude here; its SessionStart hook owns this column.
-                if (cliSource === 'codex' && !row.claude_session_id && row.cli_type === 'codex') {
+                //
+                // Overwrite a stale id from a different CLI in the fallback chain:
+                // if gemini was tried first and its session_start populated this
+                // column, the value is stale once the bot fell back to codex.
+                // Codex's session_id is stable per session, so the worst case of
+                // overwriting on every codex Stop is a no-op same-value write.
+                if (cliSource === 'codex' && row.cli_type === 'codex') {
                     const codexSessionId = rawInput && (rawInput.session_id || rawInput['session-id']);
-                    if (codexSessionId) {
+                    if (codexSessionId && codexSessionId !== row.claude_session_id) {
                         try {
                             const dbWrite = new Database(dbPath);
                             dbWrite.pragma('journal_mode = WAL');
                             const result = dbWrite.prepare(
-                                'UPDATE sessions SET claude_session_id = ?, updated_at = ? WHERE session_key = ? AND claude_session_id IS NULL'
+                                'UPDATE sessions SET claude_session_id = ?, updated_at = ? WHERE session_key = ?'
                             ).run(codexSessionId, Date.now(), slackSessionKey);
                             dbWrite.close();
                             if (result.changes > 0) {
                                 rootSessionId = codexSessionId;
-                                console.error(`Codex session_id=${codexSessionId} captured on first Stop for key=${slackSessionKey}`);
+                                console.error(`Codex session_id=${codexSessionId} captured on Stop for key=${slackSessionKey} (replaced=${row.claude_session_id || 'null'})`);
                             }
                         } catch (writeErr) {
                             console.error('Codex session_id capture failed:', writeErr.message);
@@ -729,7 +750,14 @@ async function sendHookNotification() {
                     return;
                 }
 
-                if (rootSessionId && hookInput.session_id && hookInput.session_id !== rootSessionId) {
+                // Subagent skip is Claude-only: SubagentStop hooks fire with a
+                // child session_id that differs from the root, and we don't want
+                // those internal turns posting to the alert thread. Codex and
+                // Gemini have no nested-session concept — their Stop's session_id
+                // is always the root, so applying this check there causes a
+                // false-positive skip whenever a previous CLI's session_id is
+                // still sitting in claude_session_id from a failed fallback.
+                if (cliSource === 'claude' && rootSessionId && hookInput.session_id && hookInput.session_id !== rootSessionId) {
                     console.error(`Alert session: skipping Stop from subagent (hook=${hookInput.session_id}, root=${rootSessionId})`);
                     return;
                 }
