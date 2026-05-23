@@ -30,6 +30,12 @@ const START_FROM_RE = new RegExp(`start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+(\\
 // Strips used to remove the CLI/project suffix before sending the prompt to the CLI
 const PROJECT_STRIP_RE = new RegExp(`(?:start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+)?project\\s+\\S+(?:\\s+from\\s+root)?[,.]?\\s*`, 'i');
 const START_FROM_STRIP_RE = new RegExp(`start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+\\S+?(?:\\s+project)?\\s*$`, 'i');
+// Matches a leading "resume" / "resume <cli>" / "resume from <X>" / "resume <cli> from <X>"
+// so the resumed CLI doesn't see the resume preamble as part of its prompt.
+const RESUME_PREFIX_STRIP_RE = new RegExp(
+    `^\\s*resume(?:\\s+(?:${CLI_NAMES_ALT}))?(?:\\s+(?:from|in)\\s+\\S+)?\\s*[,.:]?\\s*`,
+    'i'
+);
 
 class SlackSocketHandler {
     constructor(config = {}) {
@@ -1729,25 +1735,32 @@ ${formatted}`
                 // No thread context needed — Claude is already in the conversation
                 this.logger.info(`Existing live session ${session.sessionName}, injecting command directly`);
             } else if (session && !this._isTmuxSessionAlive(session.sessionName)) {
-                // Session in DB but tmux died — recreate. Chain resolution:
-                //   1. Caller-supplied chain hint (alerts pass ALERT_CLI).
-                //   2. Per-message `start <cli>` keyword — lets the user
-                //      force a CLI swap when the saved adapter is broken
-                //      (e.g. dead Gemini that never produces output).
-                //   3. Saved CLI with Claude appended as last-resort fallback.
+                // Session in DB but tmux died — recreate using the ORIGINAL
+                // CLI and ORIGINAL folder. Chain resolution:
+                //   1. Caller-supplied chain hint (alerts pass ALERT_CLI —
+                //      that's system policy, not a user override).
+                //   2. Saved CLI with Claude appended as last-resort fallback.
+                // User-typed "start <cli>" / "from <project>" hints are
+                // deliberately ignored on resume so the session always comes
+                // back with the same provider and folder it was launched with.
+                // To switch CLI or folder, the user must /exit first to clear
+                // the session row.
                 const resumeSavedCli = session.cliType || 'claude';
                 let resumeChain;
                 if (cliChainHint && cliChainHint.length > 0) {
                     resumeChain = cliChainHint;
                 } else {
-                    const kwMatch = command.match(CLI_KEYWORD_RE);
-                    if (kwMatch) {
-                        const typed = kwMatch[1].toLowerCase();
-                        resumeChain = typed === 'claude' ? ['claude'] : [typed, 'claude'];
-                    } else {
-                        resumeChain = resumeSavedCli === 'claude' ? ['claude'] : [resumeSavedCli, 'claude'];
-                    }
+                    resumeChain = resumeSavedCli === 'claude' ? ['claude'] : [resumeSavedCli, 'claude'];
                 }
+                // Strip the resume preamble + any stale CLI/project hints from
+                // the user's text so the CLI sees a clean prompt (e.g.
+                // "resume claude from agent-mem do X" → "do X").
+                command = command
+                    .replace(RESUME_PREFIX_STRIP_RE, '')
+                    .replace(CLI_KEYWORD_RE, '')
+                    .replace(START_FROM_STRIP_RE, '')
+                    .replace(PROJECT_STRIP_RE, '')
+                    .trim();
                 // If we have a saved CLI session id AND the chain leads with
                 // the same CLI, ask the launcher to use the adapter's resume
                 // command. Different first CLI → resume id wouldn't apply.
