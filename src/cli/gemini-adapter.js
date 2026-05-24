@@ -181,8 +181,15 @@ module.exports = {
     // where the hook is skipped because no turn-final assistant message exists.
     idlePromptIndicators: ['Type your message or @'],
 
-    confirmationPrompts: [],
-    handlesConfirmationPrompts: false,
+    // Gemini's TUI parks the outer agent on `! Shell awaiting input (Tab to focus)`
+    // when a shell tool prompts for stdin OR when --yolo doesn't cover the MAX_TURNS
+    // recovery turn. Without auto-handling, the agent stays parked, AfterAgent never
+    // fires, and the alert investigation never reaches Slack (root cause of the
+    // lost-report incident on Q0OWCEYQW7VRLU). socket.js `_autoApprove` sends Escape
+    // on this pattern, which cancels the stuck shell so the agent can finish its
+    // turn and fire AfterAgent normally.
+    confirmationPrompts: ['Shell awaiting input'],
+    handlesConfirmationPrompts: true,
 
     // No fatal startup banners observed yet. Add as we encounter them.
     fatalErrorPatterns: [],

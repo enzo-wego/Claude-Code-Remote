@@ -345,8 +345,21 @@ class SlackSocketHandler {
     }
 
     _completeQueueItem(channelId, messageTs, opts = {}) {
-        const { silent = false } = opts;
+        let { silent = false } = opts;
         const maxRetries = this.config.alertSilentMaxRetries ?? 2;
+
+        // Cross-check the caller's `silent` claim against DB state: if any bot
+        // message has been posted for this alert's session (last_bot_ts non-null),
+        // requeueing would duplicate the investigation. Catches races where the
+        // hook fires between the caller deciding 'silent' and reaching us, and
+        // also where the poller watchdog has already rescued the report.
+        if (silent) {
+            const sessionRow = this._stmts.get.get(`${channelId}-${messageTs}`);
+            if (sessionRow && sessionRow.last_bot_ts) {
+                this.logger.info(`Alert queue: skip silent-requeue for channel=${channelId} ts=${messageTs} — last_bot_ts=${sessionRow.last_bot_ts} (bot already posted)`);
+                silent = false;
+            }
+        }
 
         // Silent failure: investigation produced no output. Requeue if we
         // still have retry budget, so the same alert gets a fresh tmux run
@@ -2849,18 +2862,34 @@ ${formatted}`
                                 && /(?:^|\n)(?:#{1,3}\s+)?(?:\*\*)?Recommended Action(?:\*\*)?:/im.test(alertBuffer);
 
                             if (hasCompletionMarker || alertAccumulationCount >= 5) {
-                                // Completion detected — stop poller. Posting is handled by
-                                // cli-hook-notify.js (Stop / Codex notify) which reads the clean transcript.
+                                // Stop the accumulation loop. Posting is normally handled by
+                                // cli-hook-notify.js (Stop / AfterAgent / Codex notify) which
+                                // reads the clean transcript. The watchdog below verifies the
+                                // hook actually fires — if it doesn't (CLI stuck on a tool prompt,
+                                // crash, OOM), we fall back to posting the accumulated buffer so
+                                // the investigation isn't silently dropped.
                                 const reason = hasCompletionMarker ? 'completion marker found' : `fallback after ${alertAccumulationCount} cycles`;
-                                this.logger.info(`Alert poller done (${reason}): ${alertBuffer.length} chars for ${sessionName} — hook will post`);
+                                this.logger.info(`Alert poller done (${reason}): ${alertBuffer.length} chars for ${sessionName} — arming hook watchdog`);
                                 isFirstResponse = false;
                                 clearInterval(interval);
                                 this.pollers.delete(pollKey);
-                                // Free the queue slot immediately so the next alert can start
                                 if (session.alertMessageTs) {
-                                    this._removeReaction(session.channelId, session.alertMessageTs, 'eyes').catch(() => {});
-                                    this._addReaction(session.channelId, session.alertMessageTs, 'white_check_mark').catch(() => {});
+                                    // Free the queue slot immediately so the next alert can start.
+                                    // Reaction swap is deferred to the watchdog so 👀 → ✅ only flips
+                                    // once content actually lands in the thread.
                                     this._completeQueueItem(session.channelId, session.alertMessageTs);
+                                    this._armHookWatchdog({
+                                        sessionKey,
+                                        sessionName,
+                                        channelId: session.channelId,
+                                        threadTs,
+                                        alertMessageTs: session.alertMessageTs,
+                                        buffer: alertBuffer,
+                                        cliType: session.cliType,
+                                        // Completion-marker path trusts the hook more; fallback path
+                                        // is more likely to need partial-post rescue.
+                                        timeoutMs: hasCompletionMarker ? 90000 : 60000,
+                                    });
                                 }
                                 return;
                             } else {
@@ -3357,6 +3386,88 @@ ${formatted}`
             exec(`tmux send-keys -t ${sessionName} 'y'`, () => {
                 setTimeout(() => exec(`tmux send-keys -t ${sessionName} Enter`), 300);
             });
+        } else if (output.includes('Shell awaiting input')) {
+            // Gemini's TUI parks the outer agent on `! Shell awaiting input (Tab to focus)`
+            // when a shell tool either prompts for stdin or, more commonly, when --yolo
+            // doesn't cover the MAX_TURNS recovery turn. Pressing Escape cancels the
+            // stuck shell so the agent can finish its turn and fire AfterAgent.
+            // Without this the alert investigation report never lands in Slack and the
+            // poller falls back to its watchdog (Bug #1 from incident Q0OWCEYQW7VRLU).
+            exec(`tmux send-keys -t ${sessionName} Escape`);
+        }
+    }
+
+    // ─── Hook Watchdog (rescue path for silently-lost alert reports) ─────────
+    //
+    // When the alert poller bails out ("hook will post") but the CLI never
+    // actually fires its turn-final hook (stuck on a tool prompt, crash, OOM,
+    // Gemini MAX_TURNS recovery without YOLO), the investigation is silently
+    // dropped. This watchdog gives the hook a short window to fire; if it
+    // doesn't, we post the accumulated tmux buffer as a partial report so the
+    // user always gets *something* back.
+    _armHookWatchdog({ sessionKey, sessionName, channelId, threadTs, alertMessageTs, buffer, cliType, timeoutMs }) {
+        if (!alertMessageTs) return;
+        const startedAt = Date.now();
+        const checkIntervalMs = 5000;
+
+        const finalize = async () => {
+            try {
+                await this._removeReaction(channelId, alertMessageTs, 'eyes');
+                await this._addReaction(channelId, alertMessageTs, 'white_check_mark');
+            } catch (err) {
+                this.logger.warn(`Hook watchdog: reaction swap failed: ${err.message}`);
+            }
+        };
+
+        const tick = async () => {
+            try {
+                const session = sessionKey ? this._getSession(sessionKey) : null;
+                if (session?.lastBotTs) {
+                    this.logger.info(`Hook watchdog: hook posted for ${sessionName} after ${Math.round((Date.now() - startedAt) / 1000)}s — clean handoff`);
+                    await finalize();
+                    return;
+                }
+                if (Date.now() - startedAt >= timeoutMs) {
+                    this.logger.warn(`Hook watchdog timed out (${Math.round(timeoutMs / 1000)}s) for ${sessionName} — posting accumulated buffer (${buffer ? buffer.length : 0} chars) as partial report`);
+                    try {
+                        await this._postPartialAlertReport({ channelId, threadTs, buffer, cliType, sessionKey });
+                    } catch (err) {
+                        this.logger.error(`Hook watchdog: failed to post partial buffer: ${err.message}`);
+                    }
+                    await finalize();
+                    return;
+                }
+                setTimeout(tick, checkIntervalMs);
+            } catch (err) {
+                this.logger.error(`Hook watchdog tick error for ${sessionName}: ${err.message}`);
+                await finalize();
+            }
+        };
+
+        setTimeout(tick, checkIntervalMs);
+    }
+
+    async _postPartialAlertReport({ channelId, threadTs, buffer, cliType, sessionKey }) {
+        const trimmed = (buffer || '').trim();
+        if (!trimmed) {
+            this.logger.warn(`Hook watchdog: empty buffer — nothing to post (channel=${channelId} thread=${threadTs})`);
+            return;
+        }
+        const banner = `:warning: \`${cliType || 'cli'}\` did not deliver a turn-final message (stuck on a tool prompt or exceeded its turn budget). Posting captured terminal output as a partial report — clean version will follow if the hook eventually fires.`;
+        try {
+            await this.app.client.chat.postMessage({
+                channel: channelId,
+                thread_ts: threadTs,
+                text: banner,
+            });
+        } catch (err) {
+            this.logger.error(`Failed to post partial banner: ${err.message}`);
+        }
+        const say = ({ text, thread_ts, blocks }) =>
+            this.app.client.chat.postMessage({ channel: channelId, text, thread_ts, blocks });
+        await this._sendResponse(say, threadTs, trimmed, null);
+        if (sessionKey) {
+            this._updateLastBotTs(sessionKey, String(Date.now() / 1000));
         }
     }
 
