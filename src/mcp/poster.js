@@ -216,6 +216,26 @@ async function handleAction({ body, action, client }) {
         return;
     }
 
+    // Sentinel buttons open a modal instead of resolving the tool — they
+    // appear on the non-compact select render ("Open picker") and the text
+    // render ("Open editor"). Without this branch the generic `btn` handler
+    // below would resolve the MCP call with the literal sentinel string
+    // ("__open_modal__"), which Claude correctly treats as garbage and
+    // retries — see Phase 3 E2E bug report.
+    if (kind === 'btn' && (value === '__open_modal__' || value === '__open_text_modal__')) {
+        const entry = askUserTool.getPending(requestId);
+        if (!entry) {
+            logger.warn(`open-modal: pending entry for ${requestId} missing`);
+            return;
+        }
+        const view = buildModalView(requestId, entry.questions, {
+            title: entry.title || 'Question',
+            submitLabel: entry.submitLabel || 'Submit',
+        });
+        await client.views.open({ trigger_id: body.trigger_id, view });
+        return;
+    }
+
     if (kind === 'btn') {
         // In-thread button tap → resolve immediately for single-question.
         askUserTool.resolvePending(requestId, {
@@ -395,4 +415,5 @@ module.exports = {
     _findNextVisibleStep: findNextVisibleStep,
     _shouldShowQuestion: shouldShowQuestion,
     _handleViewSubmission: handleViewSubmission,
+    _handleAction: handleAction,
 };
