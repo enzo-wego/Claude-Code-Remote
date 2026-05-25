@@ -166,7 +166,13 @@ async function handleAction({ body, action, client }) {
     if (!parsed) return;
     const { requestId, questionId, kind, value } = parsed;
 
-    if (kind === '__bootstrap__') {
+    // For sentinel rows (`ask_user:<reqId>:__bootstrap__:open`,
+    // `ask_user:<reqId>:__wizard__:start`) the sentinel lands in the
+    // `questionId` slot of parseActionId, NOT in `kind` — `kind` ends up
+    // as the button's own label ('open' / 'start'). Earlier code checked
+    // `kind === '__bootstrap__'`, which never matched, so clicks fell
+    // through silently. Match on `questionId` instead.
+    if (questionId === '__bootstrap__') {
         // Open the single_modal for this question.
         const entry = askUserTool.getPending(requestId);
         if (!entry) {
@@ -181,7 +187,7 @@ async function handleAction({ body, action, client }) {
         return;
     }
 
-    if (kind === '__wizard__') {
+    if (questionId === '__wizard__') {
         // Open the first visible step (skip leading questions whose show_if
         // can never fire — they'd block the wizard before the user can
         // answer anything).
