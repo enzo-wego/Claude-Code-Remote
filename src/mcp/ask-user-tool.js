@@ -44,59 +44,82 @@ const pending = new Map();
 const askUserToolDefinition = {
     name: 'ask_user',
     description:
-        'Ask the remote Slack user a question. Use instead of the built-in ' +
-        'AskUserQuestion / ask_user_question — those render in the TUI that ' +
-        'the user is NOT looking at. This tool posts to Slack and blocks ' +
-        'until the user responds.',
+        'Ask the remote Slack user one or more questions. Use instead of the ' +
+        'built-in AskUserQuestion / ask_user_question — those render in the ' +
+        'TUI that the user is NOT looking at. This tool posts to Slack and ' +
+        'blocks until the user responds. Always pass `questions[]`; a single ' +
+        'question is just a one-element array.',
     inputSchema: {
         type: 'object',
+        required: ['questions'],
         properties: {
-            // Single-question shorthand
-            type: { enum: ['select', 'confirm', 'text', 'preview'] },
-            question: { type: 'string' },
-            options: {
-                type: 'array',
-                items: {
-                    type: 'object',
-                    properties: {
-                        label: { type: 'string' },
-                        description: { type: 'string' },
-                        value: { type: 'string' },
-                    },
-                    required: ['label'],
-                },
-            },
-            multi: { type: 'boolean' },
-            allow_custom: { type: 'boolean' },
-            buttons: {
-                type: 'array',
-                items: {
-                    type: 'object',
-                    properties: {
-                        label: { type: 'string' },
-                        value: { type: 'string' },
-                        style: { enum: ['primary', 'danger', 'default'] },
-                    },
-                    required: ['label'],
-                },
-            },
-            placeholder: { type: 'string' },
-            multiline: { type: 'boolean' },
-            default: { type: 'string' },
-            body: { type: 'string' },
-            language: { type: 'string' },
-            truncate_after_lines: { type: 'integer' },
-
-            // Multi-question / wizard
             questions: {
                 type: 'array',
-                items: { type: 'object' /* same fields as above + id + show_if */ },
+                minItems: 1,
+                items: {
+                    type: 'object',
+                    required: ['type', 'question'],
+                    properties: {
+                        id: { type: 'string', description: 'Result key. Auto-generated if omitted.' },
+                        type: { enum: ['select', 'confirm', 'text', 'preview'] },
+                        question: { type: 'string' },
+
+                        // select
+                        options: {
+                            type: 'array',
+                            items: {
+                                type: 'object',
+                                required: ['label'],
+                                properties: {
+                                    label: { type: 'string' },
+                                    description: { type: 'string' },
+                                    value: { type: 'string' },
+                                },
+                            },
+                        },
+                        multi: { type: 'boolean' },
+                        allow_custom: { type: 'boolean' },
+
+                        // confirm
+                        buttons: {
+                            type: 'array',
+                            items: {
+                                type: 'object',
+                                required: ['label'],
+                                properties: {
+                                    label: { type: 'string' },
+                                    value: { type: 'string' },
+                                    style: { enum: ['primary', 'danger', 'default'] },
+                                },
+                            },
+                        },
+
+                        // text
+                        placeholder: { type: 'string' },
+                        multiline: { type: 'boolean' },
+                        default: { type: 'string' },
+
+                        // preview
+                        body: { type: 'string' },
+                        language: { type: 'string' },
+                        truncate_after_lines: { type: 'integer' },
+
+                        // wizard branching
+                        show_if: {
+                            type: 'object',
+                            properties: {
+                                question_id: { type: 'string' },
+                                equals: { type: 'string' },
+                                in: { type: 'array', items: { type: 'string' } },
+                            },
+                        },
+                    },
+                },
             },
 
-            // Common
             title: { type: 'string' },
             submit_label: { type: 'string' },
-            layout: { enum: ['auto', 'single_modal', 'wizard'] },
+            layout: { enum: ['auto', 'single', 'single_modal', 'wizard'] },
             timeout_ms: { type: 'integer' },
         },
     },
@@ -105,37 +128,14 @@ const askUserToolDefinition = {
 // ─── Input normalization ──────────────────────────────────────────────────
 
 function normalizeInput(input) {
-    if (input.questions && input.questions.length > 0) {
-        const layout = input.layout || pickAutoLayout(input.questions);
-        return {
-            layout,
-            questions: input.questions.map(normalizeQuestion),
-            title: input.title,
-            submitLabel: input.submit_label || 'Submit',
-            timeoutMs: input.timeout_ms || defaultTimeoutMs(),
-        };
+    if (!input || !Array.isArray(input.questions) || input.questions.length === 0) {
+        throw new Error('ask_user: input.questions[] is required (≥1 element)');
     }
-
-    // Single-question shorthand → one-element questions[]
-    const single = normalizeQuestion({
-        id: '_',
-        type: input.type,
-        question: input.question,
-        options: input.options,
-        multi: input.multi,
-        allow_custom: input.allow_custom,
-        buttons: input.buttons,
-        placeholder: input.placeholder,
-        multiline: input.multiline,
-        default: input.default,
-        body: input.body,
-        language: input.language,
-        truncate_after_lines: input.truncate_after_lines,
-    });
-
     return {
-        layout: 'single',
-        questions: [single],
+        layout: input.layout && input.layout !== 'auto'
+            ? input.layout
+            : pickAutoLayout(input.questions),
+        questions: input.questions.map(normalizeQuestion),
         title: input.title,
         submitLabel: input.submit_label || 'Submit',
         timeoutMs: input.timeout_ms || defaultTimeoutMs(),
@@ -239,17 +239,8 @@ async function handleAskUser(input, ctx) {
 
     const result = await answerPromise;
 
-    // Shape return per docs/mcp-ask-user.md: single-question call returns
-    // `answer`; multi-question returns `answers` keyed by question id.
-    if (normalized.layout === 'single') {
-        const onlyId = normalized.questions[0].id;
-        return {
-            content: [{ type: 'text', text: JSON.stringify({
-                answer: result.answers?.[onlyId] ?? result.answer,
-                status: result.status || 'ok',
-            }) }],
-        };
-    }
+    // Always return uniform `{answers, status}` keyed by question.id. The
+    // single-question caller just reads `answers[questions[0].id]`.
     return {
         content: [{ type: 'text', text: JSON.stringify({
             answers: result.answers || {},

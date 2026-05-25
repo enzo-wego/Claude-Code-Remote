@@ -74,53 +74,52 @@ select element, ≤2000 chars per text body before we attach as a file.
 
 ## Tool surface
 
+The input is uniform: **always** an array `questions[]`, even for a single
+question. The return is always `{answers, status}` keyed by `question.id`.
+This keeps the wizard layout from being a special case and makes the schema
+the agent sees consistent across CLIs.
+
 ```typescript
 ask_user(input: {
-  // Single-question shorthand
-  type?:    "select" | "confirm" | "text" | "preview"
-  question?: string
-
-  // select
-  options?:     { label: string, description?: string, value: string }[]
-  multi?:       boolean
-  allow_custom?: boolean
-
-  // confirm
-  buttons?: { label: string, value: string, style?: "primary" | "danger" | "default" }[]
-
-  // text
-  placeholder?: string
-  multiline?:   boolean
-  default?:     string
-
-  // preview
-  body?:                string
-  language?:            string
-  truncate_after_lines?: number
-
-  // Multi-question / wizard
-  questions?: Array<{
-    id:       string                          // result key
+  questions: Array<{
+    id?:      string   // result key. Auto-generated if omitted.
     type:     "select" | "confirm" | "text" | "preview"
     question: string
-    // ...per-type fields same as single
+
+    // select
+    options?:     { label: string, description?: string, value?: string }[]
+    multi?:       boolean
+    allow_custom?: boolean
+
+    // confirm
+    buttons?: { label: string, value: string, style?: "primary" | "danger" | "default" }[]
+
+    // text
+    placeholder?: string
+    multiline?:   boolean
+    default?:     string
+
+    // preview
+    body?:                string
+    language?:            string
+    truncate_after_lines?: number
+
+    // wizard branching
     show_if?: { question_id: string, equals?: string, in?: string[] }
   }>
 
-  // Common
-  title?:        string                       // modal title
-  submit_label?: string                       // defaults to "Submit"
-  layout?:       "auto" | "single_modal" | "wizard"
-  timeout_ms?:   number                       // default 1_800_000 (30 min)
+  title?:        string                                          // modal title
+  submit_label?: string                                          // defaults to "Submit"
+  layout?:       "auto" | "single" | "single_modal" | "wizard"   // default: auto
+  timeout_ms?:   number                                          // default 1_800_000 (30 min)
 }) -> {
-  // Single-question call → answer is the chosen value (or array if multi)
-  answer?: string | string[]
-  // Multi-question call → answers is keyed by question.id
-  answers?: Record<string, string | string[]>
-  // Either form may return:
-  status: "ok" | "cancelled" | "timeout"
+  answers: Record<string /* question id */, string | string[]>
+  status:  "ok" | "cancelled" | "timeout"
 }
 ```
+
+A one-question call is just `{ questions: [{ id: "scope", type: "select", … }] }`
+and reads back as `result.answers.scope`.
 
 ## Architecture
 
@@ -221,21 +220,70 @@ can read end-to-end without risk of regression.
 - File attachment fallback for `preview` bodies >2000 chars.
 - Telemetry: pending-question count, average resolve latency.
 
-## Open questions for review
+## Decisions
 
-1. **Endpoint sharing**: do we run the MCP HTTP server on the existing
-   Express port (`SLACK_HTTP_PORT`, default 9999) or a dedicated
-   `MCP_PORT`? Same port keeps firewall rules simple; dedicated port
-   makes it easier to bind 127.0.0.1-only for MCP while exposing Swagger
-   on 0.0.0.0.
-2. **Session-id leakage**: should `MCP_SLACK_ASK_URL` include the session
-   id in the path (cleartext on the tmux pane env) or as a bearer token
-   header? 127.0.0.1-only mitigates the risk but tokens are tidier.
-3. **System-prompt nudge vs `PreToolUse` redirect**: for Claude we can
-   *additionally* deny `AskUserQuestion` via `PreToolUse` and surface a
-   message "use slack-ask:ask_user instead". Belts and braces, or
-   unnecessary?
-4. **Multi-question shorthand**: do we keep the single-question fields
-   on the top-level `ask_user` input (current sketch), or always require
-   `questions[]`? Single-question shorthand is friendlier; multi-shape is
-   more uniform.
+Resolved before Phase 2 starts (was: Open questions in the original draft):
+
+1. **Endpoint** — Dedicated `MCP_PORT` (default `9998`), bound to `127.0.0.1`.
+   The bot's existing Express port (`SLACK_HTTP_PORT`, default `9999`) stays
+   on `0.0.0.0` for Swagger/health. No firewall config is needed either way
+   since MCP never reaches the network; the separation is purely for bind-host
+   isolation and to keep the option of moving MCP to a separate process later
+   without breaking URLs.
+2. **Session id transport** — In the URL path: `http://127.0.0.1:9998/mcp/<session_id>`.
+   The 127.0.0.1 bind means only same-host processes can hit the endpoint;
+   on a single-tenant host (VPS, MacBook) that's sufficient. **Caveat for
+   multi-tenant hosts**: any local user can read another user's
+   `MCP_SLACK_ASK_URL` via `/proc/<pid>/environ` and impersonate the session.
+   If we ever deploy to a shared host, swap to a bearer token in an
+   `Authorization` header.
+3. **Built-in picker redirect** — Phase 2 ships with a system-prompt nudge
+   only ("prefer `slack-ask:ask_user` over the built-in picker"). The
+   `PreToolUse` deny-with-reason for Claude's `AskUserQuestion` is documented
+   below as an optional Phase 3 hardening, applied only if we observe the
+   agent ignoring the nudge in practice (e.g. after a context compaction
+   wipes the prompt).
+4. **Schema shape** — Always `questions[]`, no single-question shorthand.
+   The return is always `{answers, status}` keyed by `question.id`. Slightly
+   more verbose for one-question calls but eliminates the wizard layout as
+   a special case and gives the agent one consistent schema across CLIs.
+
+### Phase 3 optional: PreToolUse deny for Claude
+
+If the system-prompt nudge proves unreliable, add this to
+`~/.claude/settings.json` via the Claude adapter's `installHooks()`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [{
+          "type": "command",
+          "command": "<abs-path>/cli-hook-notify.js deny_ask_user_question"
+        }]
+      }
+    ]
+  }
+}
+```
+
+And a new mode in `cli-hook-notify.js` that writes a deny payload to stdout:
+
+```js
+case 'deny_ask_user_question':
+    process.stdout.write(JSON.stringify({
+        decision: 'deny',
+        reason:
+            'You are running inside Claude-Code-Remote (Slack relay). The ' +
+            'AskUserQuestion picker is rendered in tmux, which the remote ' +
+            'Slack user cannot see. Use the `slack-ask:ask_user` MCP tool ' +
+            'instead — same shape, but delivered to Slack as Block Kit and ' +
+            'returns the user\'s answer as the tool result.',
+    }));
+    process.exit(0);
+```
+
+Codex and Gemini don't have an equivalent hook for their question tools
+(see openai/codex#9926), so this remains Claude-only.

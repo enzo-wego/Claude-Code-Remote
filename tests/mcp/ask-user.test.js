@@ -23,29 +23,31 @@ const {
 // ─── _normalizeInput ──────────────────────────────────────────────────────
 
 describe('_normalizeInput', () => {
-    test('single-question shorthand becomes one-element questions[] with layout=single', () => {
+    test('one-element questions[] picks layout=single', () => {
         const n = _normalizeInput({
-            type: 'select',
-            question: 'Pick',
-            options: [{ label: 'a' }, { label: 'b' }],
+            questions: [{ type: 'select', question: 'Pick', options: [{ label: 'a' }, { label: 'b' }] }],
         });
         expect(n.layout).toBe('single');
         expect(n.questions).toHaveLength(1);
         expect(n.questions[0].type).toBe('select');
-        expect(n.questions[0].id).toBeTruthy();
+        expect(n.questions[0].id).toBeTruthy(); // auto-assigned when omitted
     });
 
     test('option.value defaults to label when omitted', () => {
         const n = _normalizeInput({
-            type: 'select',
-            question: 'Pick',
-            options: [{ label: 'Plans only' }, { label: 'Plans + skeleton', value: 'skel' }],
+            questions: [{
+                type: 'select',
+                question: 'Pick',
+                options: [{ label: 'Plans only' }, { label: 'Plans + skeleton', value: 'skel' }],
+            }],
         });
         expect(n.questions[0].options.map((o) => o.value)).toEqual(['Plans only', 'skel']);
     });
 
     test('confirm without buttons defaults to primary Yes / danger No', () => {
-        const n = _normalizeInput({ type: 'confirm', question: 'Apply this patch?' });
+        const n = _normalizeInput({
+            questions: [{ type: 'confirm', question: 'Apply this patch?' }],
+        });
         expect(n.questions[0].buttons).toEqual([
             { label: 'Yes', value: 'yes', style: 'primary' },
             { label: 'No', value: 'no', style: 'danger' },
@@ -54,7 +56,7 @@ describe('_normalizeInput', () => {
 
     test('select without options throws', () => {
         expect(() =>
-            _normalizeInput({ type: 'select', question: 'Pick', options: [] })
+            _normalizeInput({ questions: [{ type: 'select', question: 'Pick', options: [] }] })
         ).toThrow(/needs options/);
     });
 
@@ -64,7 +66,12 @@ describe('_normalizeInput', () => {
         ).toThrow(/type is required/);
     });
 
-    test('multi-question with all input-style picks layout=single_modal', () => {
+    test('missing or empty questions[] throws', () => {
+        expect(() => _normalizeInput({})).toThrow(/questions\[\] is required/);
+        expect(() => _normalizeInput({ questions: [] })).toThrow(/questions\[\] is required/);
+    });
+
+    test('two-or-more questions, all input-style, picks layout=single_modal', () => {
         const n = _normalizeInput({
             questions: [
                 { id: 'a', type: 'select', question: 'A?', options: [{ label: 'x' }] },
@@ -104,17 +111,26 @@ describe('_normalizeInput', () => {
         });
         expect(n.layout).toBe('wizard');
     });
+
+    test('layout=auto falls through to auto-pick', () => {
+        const n = _normalizeInput({
+            layout: 'auto',
+            questions: [{ type: 'text', question: 'Q?' }],
+        });
+        expect(n.layout).toBe('single');
+    });
 });
 
 // ─── Tool definition ──────────────────────────────────────────────────────
 
 describe('askUserToolDefinition', () => {
-    test('declares name, description, and an inputSchema', () => {
+    test('declares name, description, and a questions[]-required schema', () => {
         expect(askUserToolDefinition.name).toBe('ask_user');
         expect(askUserToolDefinition.description).toMatch(/Slack/i);
         expect(askUserToolDefinition.inputSchema.type).toBe('object');
-        expect(askUserToolDefinition.inputSchema.properties).toHaveProperty('type');
-        expect(askUserToolDefinition.inputSchema.properties).toHaveProperty('questions');
+        expect(askUserToolDefinition.inputSchema.required).toEqual(['questions']);
+        expect(askUserToolDefinition.inputSchema.properties.questions.type).toBe('array');
+        expect(askUserToolDefinition.inputSchema.properties.questions.minItems).toBe(1);
     });
 });
 

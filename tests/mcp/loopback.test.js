@@ -111,24 +111,27 @@ maybeDescribe('MCP loopback — ask_user end-to-end', () => {
         expect(def.description).toMatch(/Slack/i);
     });
 
-    test('single-select call posts to Slack and returns the resolved answer', async () => {
+    test('single-question call posts to Slack and returns the resolved answer', async () => {
         const callPromise = client.callTool({
             name: 'ask_user',
             arguments: {
-                type: 'select',
-                question: 'Scope of work?',
-                options: [
-                    { label: 'Plans only', value: 'plans' },
-                    { label: 'Plans + skeleton', value: 'skel' },
-                    { label: 'Plans + full PR', value: 'full' },
-                ],
+                questions: [{
+                    id: 'scope',
+                    type: 'select',
+                    question: 'Scope of work?',
+                    options: [
+                        { label: 'Plans only', value: 'plans' },
+                        { label: 'Plans + skeleton', value: 'skel' },
+                        { label: 'Plans + full PR', value: 'full' },
+                    ],
+                }],
             },
         });
 
         // Wait until the handler has registered a pending entry, then
         // resolve as if Slack delivered a button-tap event.
         const requestId = await waitForPending();
-        resolvePending(requestId, { answers: { _: 'skel' }, status: 'ok' });
+        resolvePending(requestId, { answers: { scope: 'skel' }, status: 'ok' });
 
         const result = await callPromise;
         expect(slackApp.client.chat.postMessage).toHaveBeenCalledTimes(1);
@@ -138,7 +141,7 @@ maybeDescribe('MCP loopback — ask_user end-to-end', () => {
         expect(slackArgs.thread_ts).toBe('1700000000.000100');
 
         const answer = JSON.parse(result.content[0].text);
-        expect(answer).toEqual({ answer: 'skel', status: 'ok' });
+        expect(answer).toEqual({ answers: { scope: 'skel' }, status: 'ok' });
     });
 
     test('multi-question call returns answers keyed by question id', async () => {
@@ -169,8 +172,7 @@ maybeDescribe('MCP loopback — ask_user end-to-end', () => {
         const callPromise = client.callTool({
             name: 'ask_user',
             arguments: {
-                type: 'text',
-                question: 'You there?',
+                questions: [{ id: 'q', type: 'text', question: 'You there?' }],
                 timeout_ms: 100,
             },
         });
@@ -190,7 +192,7 @@ maybeDescribe('MCP loopback — ask_user end-to-end', () => {
         await expect(
             client.callTool({
                 name: 'ask_user',
-                arguments: { type: 'text', question: 'Q?' },
+                arguments: { questions: [{ id: 'q', type: 'text', question: 'Q?' }] },
             }),
         ).rejects.toThrow(/no Slack session/i);
     });
