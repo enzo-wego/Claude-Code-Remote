@@ -215,6 +215,8 @@ async function handleAskUser(input, ctx) {
             viewId: null,
             layout: normalized.layout,
             questions: normalized.questions,
+            title: normalized.title,
+            submitLabel: normalized.submitLabel,
             answers: {},
             step: 0,
             timeout,
@@ -282,7 +284,7 @@ function cancelPending(requestId, reason = 'cancelled') {
     return true;
 }
 
-/** Read-only view for tests / debugging. */
+/** Read-only stripped view for telemetry / debugging. */
 function listPending() {
     return Array.from(pending.entries()).map(([id, e]) => ({
         requestId: id,
@@ -294,12 +296,48 @@ function listPending() {
     }));
 }
 
-module.exports = {
+/**
+ * Return the full pending entry for a requestId (or null). Used by the
+ * Slack interaction handler when building modal views — it needs
+ * questions[], title, accumulated answers, etc.
+ */
+function getPending(requestId) {
+    return pending.get(requestId) || null;
+}
+
+/** Merge a partial answers map into a pending entry. Returns true if found. */
+function setPendingAnswers(requestId, partial) {
+    const entry = pending.get(requestId);
+    if (!entry) return false;
+    entry.answers = { ...entry.answers, ...(partial || {}) };
+    return true;
+}
+
+/** Advance the wizard step pointer. Returns true if the entry exists. */
+function advancePendingStep(requestId, nextStep) {
+    const entry = pending.get(requestId);
+    if (!entry) return false;
+    entry.step = nextStep;
+    return true;
+}
+
+// Mutate (don't replace) module.exports so poster.js's namespace import
+// (`const askUserTool = require('./ask-user-tool')`) sees the populated
+// shape. Node's circular-require resolves poster's reference to the
+// original exports object created at the start of this module's load;
+// replacing it via `module.exports = {...}` would orphan that reference
+// and make every askUserTool.<name> call from poster undefined at
+// runtime (caught by Phase 3 wizard tests).
+Object.assign(module.exports, {
     askUserToolDefinition,
     handleAskUser,
     resolvePending,
     cancelPending,
     listPending,
+    getPending,
+    setPendingAnswers,
+    advancePendingStep,
     // Exposed for tests
     _normalizeInput: normalizeInput,
-};
+    _injectPendingForTests: (requestId, entry) => pending.set(requestId, entry),
+});

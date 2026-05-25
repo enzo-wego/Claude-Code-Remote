@@ -168,7 +168,7 @@ async function handleAction({ body, action, client }) {
 
     if (kind === '__bootstrap__') {
         // Open the single_modal for this question.
-        const entry = findPendingEntry(requestId);
+        const entry = askUserTool.getPending(requestId);
         if (!entry) {
             logger.warn(`bootstrap: pending entry for ${requestId} missing`);
             return;
@@ -182,8 +182,37 @@ async function handleAction({ body, action, client }) {
     }
 
     if (kind === '__wizard__') {
-        // TODO Phase 3: open step 1 of the wizard.
-        logger.warn(`wizard: step machinery is stubbed (Phase 3)`);
+        // Open the first visible step (skip leading questions whose show_if
+        // can never fire — they'd block the wizard before the user can
+        // answer anything).
+        const entry = askUserTool.getPending(requestId);
+        if (!entry) {
+            logger.warn(`wizard: pending entry for ${requestId} missing`);
+            return;
+        }
+        const firstStep = findNextVisibleStep(entry.questions, 0, entry.answers);
+        if (firstStep >= entry.questions.length) {
+            // No question is visible (all guarded by show_if that's false).
+            // Resolve immediately with whatever answers exist (likely empty).
+            askUserTool.resolvePending(requestId, {
+                answers: entry.answers,
+                status: 'ok',
+            });
+            return;
+        }
+        askUserTool.advancePendingStep(requestId, firstStep);
+        const view = buildWizardStepView(
+            requestId,
+            entry.questions[firstStep],
+            {
+                title: entry.title,
+                step: firstStep,
+                totalSteps: entry.questions.length,
+                isLast: firstStep === entry.questions.length - 1,
+                hasPrev: false,
+            },
+        );
+        await client.views.open({ trigger_id: body.trigger_id, view });
         return;
     }
 
@@ -218,6 +247,91 @@ async function handleViewSubmission({ body, view }) {
     if (!meta || !meta.requestId) return null;
     const { requestId } = meta;
 
+    const callbackId = view.callback_id || '';
+    if (callbackId.endsWith(':wizard')) {
+        return handleWizardStep({ requestId, currentStep: meta.step ?? 0, view });
+    }
+
+    // Single-modal path: extract every question's answer from view.state and
+    // resolve in one shot.
+    const answers = extractAnswersFromView(view);
+    askUserTool.resolvePending(requestId, { answers, status: 'ok' });
+    return null; // close the modal
+}
+
+/**
+ * Wizard step submit. Merges the current step's answer into accumulated
+ * state, then either:
+ *   - resolves the MCP call (last visible step) and closes the modal, OR
+ *   - returns response_action=update with the next step's view so Slack
+ *     swaps the modal contents in place.
+ */
+function handleWizardStep({ requestId, currentStep, view }) {
+    const entry = askUserTool.getPending(requestId);
+    if (!entry) return null;
+
+    // Merge the answers on this view into the entry.
+    const stepAnswers = extractAnswersFromView(view);
+    askUserTool.setPendingAnswers(requestId, stepAnswers);
+    const updated = askUserTool.getPending(requestId);
+
+    const nextStep = findNextVisibleStep(
+        entry.questions,
+        currentStep + 1,
+        updated.answers,
+    );
+
+    if (nextStep >= entry.questions.length) {
+        // Done — resolve and let Slack close the modal (omit response_action).
+        askUserTool.resolvePending(requestId, {
+            answers: updated.answers,
+            status: 'ok',
+        });
+        return null;
+    }
+
+    askUserTool.advancePendingStep(requestId, nextStep);
+    return {
+        response_action: 'update',
+        view: buildWizardStepView(
+            requestId,
+            entry.questions[nextStep],
+            {
+                title: entry.title,
+                step: nextStep,
+                totalSteps: entry.questions.length,
+                isLast: nextStep === entry.questions.length - 1,
+                hasPrev: true,
+            },
+        ),
+    };
+}
+
+/**
+ * Walk forward from `from` over the question list and return the first index
+ * whose show_if evaluates true (or that has no show_if). Returns
+ * questions.length when none qualifies — caller treats that as "done".
+ */
+function findNextVisibleStep(questions, from, answers) {
+    for (let i = from; i < questions.length; i++) {
+        if (shouldShowQuestion(questions[i], answers)) return i;
+    }
+    return questions.length;
+}
+
+/** Evaluate one question's show_if against accumulated answers. */
+function shouldShowQuestion(question, answers) {
+    const cond = question.show_if;
+    if (!cond) return true;
+    const ans = answers ? answers[cond.question_id] : undefined;
+    if (ans == null) return false;
+    if (cond.equals !== undefined && ans !== cond.equals) return false;
+    if (Array.isArray(cond.in) && !cond.in.includes(ans)) return false;
+    return true;
+}
+
+/** Extract { questionId → value } from a view's state.values, for either layout. */
+function extractAnswersFromView(view) {
     const state = view.state?.values || {};
     const answers = {};
     for (const [blockId, blockValues] of Object.entries(state)) {
@@ -229,9 +343,7 @@ async function handleViewSubmission({ body, view }) {
             answers[questionId] = extractAnswerValue(v);
         }
     }
-
-    askUserTool.resolvePending(requestId, { answers, status: 'ok' });
-    return null; // close the modal
+    return answers;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -246,9 +358,22 @@ function parseActionId(actionId) {
     return { requestId, questionId, kind, value: rest.join(':') };
 }
 
+// Legacy lookup kept for any external callers; new code uses
+// askUserTool.getPending directly so it gets the full entry shape.
 function findPendingEntry(requestId) {
-    // Cheap lookup via listPending — fine for low cardinality.
-    return askUserTool.listPending().find((p) => p.requestId === requestId);
+    const entry = askUserTool.getPending(requestId);
+    if (!entry) return null;
+    return {
+        requestId,
+        sessionId: entry.sessionId,
+        channel: entry.channel,
+        threadTs: entry.threadTs,
+        layout: entry.layout,
+        step: entry.step,
+        questions: entry.questions,
+        title: entry.title,
+        submitLabel: entry.submitLabel,
+    };
 }
 
 function extractAnswerValue(v) {
@@ -267,4 +392,7 @@ module.exports = {
     wireSlackInteractions,
     // Exposed for tests
     _parseActionId: parseActionId,
+    _findNextVisibleStep: findNextVisibleStep,
+    _shouldShowQuestion: shouldShowQuestion,
+    _handleViewSubmission: handleViewSubmission,
 };
