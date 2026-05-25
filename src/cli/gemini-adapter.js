@@ -250,4 +250,28 @@ module.exports = {
             },
         };
     },
+
+    // ─── MCP slack-ask wiring ─────────────────────────────────────────
+    //
+    // STUB — Phase 2 Step 3.
+    //
+    // Gemini CLI accepts `mcpServers` under ~/.gemini/settings.json, with
+    // stdio AND HTTP transports both supported. But since Gemini has no
+    // structured AskUserQuestion-equivalent tool, prompting redirection
+    // would need to flow through the AfterAgent hook rather than a
+    // PreToolUse-style intercept. See docs/mcp-ask-user.md Phase 3
+    // follow-up for the implementation path.
+    //
+    // For now we expose the contract (matching claude-adapter) but return
+    // an empty result. Step 4 calls installMcp on every adapter uniformly;
+    // an empty result is a no-op. Gemini sessions will not route
+    // questions through Slack until the follow-up lands.
+
+    installMcp(/* { sessionKey, mcpServerUrl } */) {
+        return { launchFlag: '', launchEnv: {}, configPath: null };
+    },
+
+    uninstallMcp(/* { sessionKey } */) {
+        return false;
+    },
 };
