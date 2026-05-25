@@ -12,6 +12,12 @@ const SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
 const HOOK_MARKERS = ['cli-hook-notify', 'claude-hook-notify'];
 const HOOK_TIMEOUT = 15;
 
+// Per-session MCP configs live here so each tmux session points Claude at
+// `http://127.0.0.1:<port>/mcp/<session_id>`. We don't write into the repo's
+// .mcp.json because multiple sessions may share repoPath.
+const MCP_CONFIG_DIR = path.join(os.tmpdir(), 'claude-code-remote-mcp');
+const MCP_SAFE_KEY_RE = /[^a-zA-Z0-9_-]/g;
+
 function hookScriptPath() {
     const preferred = path.join(REPO_ROOT, 'cli-hook-notify.js');
     if (fs.existsSync(preferred)) return preferred;
@@ -214,6 +220,54 @@ module.exports = {
         }
         if (changed) saveSettings(settings);
         return { path: SETTINGS_PATH, changed };
+    },
+
+    // ─── MCP slack-ask wiring ─────────────────────────────────────────
+    //
+    // Write a session-scoped `.mcp.json`-style config that Claude reads via
+    // its `--mcp-config <file>` launch flag. The flag must be appended to
+    // the launch command by the caller (socket.js, Phase 2 Step 4).
+    //
+    // Generates: ${tmpdir}/claude-code-remote-mcp/claude-<safeKey>.json
+    // Returns:   { launchFlag, configPath } — launchFlag is empty when MCP
+    //            is disabled / args missing, so callers can unconditionally
+    //            concat without guarding.
+
+    installMcp({ sessionKey, mcpServerUrl } = {}) {
+        if (!sessionKey || !mcpServerUrl) {
+            return { launchFlag: '', configPath: null };
+        }
+        if (!fs.existsSync(MCP_CONFIG_DIR)) {
+            fs.mkdirSync(MCP_CONFIG_DIR, { recursive: true });
+        }
+        const safeKey = String(sessionKey).replace(MCP_SAFE_KEY_RE, '_');
+        const configPath = path.join(MCP_CONFIG_DIR, `claude-${safeKey}.json`);
+        const base = String(mcpServerUrl).replace(/\/+$/, '');
+        const config = {
+            mcpServers: {
+                'slack-ask': {
+                    type: 'http',
+                    url: `${base}/${encodeURIComponent(sessionKey)}`,
+                },
+            },
+        };
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+        return {
+            launchFlag: `--mcp-config "${configPath}"`,
+            configPath,
+        };
+    },
+
+    uninstallMcp({ sessionKey } = {}) {
+        if (!sessionKey) return false;
+        const safeKey = String(sessionKey).replace(MCP_SAFE_KEY_RE, '_');
+        const configPath = path.join(MCP_CONFIG_DIR, `claude-${safeKey}.json`);
+        try {
+            fs.unlinkSync(configPath);
+            return true;
+        } catch {
+            return false;
+        }
     },
 
     hooksStatus() {
