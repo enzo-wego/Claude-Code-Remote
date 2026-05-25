@@ -91,6 +91,13 @@ function removeOurHooks(list) {
 module.exports = {
     type: 'gemini',
 
+    // installMcp() is currently a stub; do not nudge the agent to call a
+    // tool that isn't wired. Gemini has no structured question tool, so
+    // the redirect would flow through AfterAgent rather than PreToolUse —
+    // see docs/mcp-ask-user.md Phase 3 follow-up.
+    supportsAskUser: false,
+    askUserGuidance() { return ''; },
+
     // --yolo  : auto-approve tools (Claude --dangerously-skip-permissions analog).
     // --skip-trust : bypass first-run "Trust folder?" numbered-choice modal.
     buildLaunchCommand(/* sessionName, repoPath, sessionKey */) {

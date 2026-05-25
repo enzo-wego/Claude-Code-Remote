@@ -78,6 +78,11 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 module.exports = {
     type: 'claude',
 
+    // True when this adapter's installMcp() actually wires the agent to our
+    // slack-ask MCP server. Socket.js gates the askUserGuidance prepend on
+    // this flag so we don't nudge the agent to call a tool that isn't there.
+    supportsAskUser: true,
+
     buildLaunchCommand(/* sessionName, repoPath, sessionKey */) {
         return process.env.SLACK_CLAUDE_COMMAND || 'claude --dangerously-skip-permissions';
     },
@@ -97,6 +102,25 @@ module.exports = {
     // Claude Code shows ) or ❯ or > alone on a line when it's accepting input.
     isReady(output) {
         return /^[)❯>]\s*$/m.test(output);
+    },
+
+    // One-line nudge prepended to a fresh-CLI-boot turn when MCP slack-ask
+    // is enabled. Tells the agent that AskUserQuestion is unreachable
+    // (rendered in tmux, invisible to the Slack user) and to call the
+    // slack-ask:ask_user MCP tool instead. See _processCommand in
+    // src/channels/slack/socket.js for the prepend logic — gated on the
+    // adapter's supportsAskUser flag so Codex/Gemini sessions don't get a
+    // nudge to call a tool that isn't wired for them yet.
+    askUserGuidance() {
+        return [
+            '[Interactive questions: if you need to ask the user a clarifying',
+            'question or pick from options, call the `slack-ask:ask_user` MCP',
+            'tool — pass `questions:[{type, question, options?, ...}]`. The',
+            'built-in AskUserQuestion picker is rendered in tmux which the',
+            'remote Slack user cannot see; only ask_user reaches them.]',
+            '',
+            '',
+        ].join('\n');
     },
 
     // Brief Slack mrkdwn reminder prepended to every non-skill chat turn so

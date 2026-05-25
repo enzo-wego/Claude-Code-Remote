@@ -119,6 +119,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 module.exports = {
     type: 'codex',
 
+    // installMcp() is currently a stub; do not nudge the agent to call a
+    // tool that isn't wired. Will flip to true when the stdio MCP proxy
+    // for Codex lands (see docs/mcp-ask-user.md Phase 3 follow-up).
+    supportsAskUser: false,
+    askUserGuidance() { return ''; },
+
     buildLaunchCommand(/* sessionName, repoPath, sessionKey */) {
         return process.env.CODEX_COMMAND || 'codex --dangerously-bypass-approvals-and-sandbox';
     },

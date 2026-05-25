@@ -7,13 +7,14 @@
  * Nothing here runs unless MCP_ENABLED=true at startup.
  */
 
-const { startMcpServer, stopMcpServer } = require('./server');
+const { startMcpServer, stopMcpServer, getServerUrl } = require('./server');
 const { resolvePending, listPending, cancelPending } = require('./ask-user-tool');
 const { wireSlackInteractions } = require('./poster');
 
 module.exports = {
     startMcpServer,
     stopMcpServer,
+    getServerUrl,
     wireSlackInteractions,
     resolvePending,
     listPending,

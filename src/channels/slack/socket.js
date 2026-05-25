@@ -2049,6 +2049,19 @@ ${formatted}`
                 if (guidance) {
                     fullCommand = `${guidance}${fullCommand}`;
                 }
+                // MCP slack-ask: prepend a one-line nudge when this adapter
+                // actually wires the ask_user tool (Claude today). Gated by
+                // MCP_ENABLED so disabled installs stay clean.
+                if (
+                    process.env.MCP_ENABLED === 'true'
+                    && chatAdapter.supportsAskUser
+                    && typeof chatAdapter.askUserGuidance === 'function'
+                ) {
+                    const askGuidance = chatAdapter.askUserGuidance();
+                    if (askGuidance) {
+                        fullCommand = `${askGuidance}${fullCommand}`;
+                    }
+                }
             }
 
             // Inject the command into the tmux session.
@@ -2186,8 +2199,8 @@ ${formatted}`
         }
     }
 
-    async _createTmuxSession(sessionName, repoPath, cliCmd, sessionKey = null, cliType = 'claude') {
-        const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType);
+    async _createTmuxSession(sessionName, repoPath, cliCmd, sessionKey = null, cliType = 'claude', extraEnv = {}) {
+        const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType, extraEnv);
         return result.ok;
     }
 
@@ -2198,7 +2211,7 @@ ${formatted}`
     //                                        session is killed so caller can retry
     //                                        with the next CLI in the chain.
     //   { ok: false, fatalError: null }    — tmux itself failed to launch.
-    async _createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey = null, cliType = 'claude') {
+    async _createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey = null, cliType = 'claude', extraEnv = {}) {
         try {
             execSync('which tmux', { stdio: 'ignore' });
         } catch {
@@ -2216,7 +2229,7 @@ ${formatted}`
 
         return new Promise((resolve) => {
             const { buildTmuxCommand } = require('../../utils/tmux-helper');
-            const cmd = buildTmuxCommand(sessionName, repoPath, cliCmd, sessionKey, cliType);
+            const cmd = buildTmuxCommand(sessionName, repoPath, cliCmd, sessionKey, cliType, extraEnv);
             this.logger.info(`Creating tmux session (cli=${cliType}): ${cmd}`);
 
             exec(cmd, (error) => {
@@ -2316,7 +2329,22 @@ ${formatted}`
             if (!cliCmd) {
                 cliCmd = adapter.buildLaunchCommand(sessionName, repoPath, sessionKey);
             }
-            const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType);
+            // MCP slack-ask wiring: ask the adapter for a per-session launch
+            // flag + env. Stubs return empty strings/objects, so this is a
+            // no-op when MCP is disabled or the adapter hasn't implemented it.
+            const mcp = require('../../mcp');
+            const mcpServerUrl = mcp.getServerUrl ? mcp.getServerUrl() : null;
+            let extraEnv = {};
+            if (mcpServerUrl && typeof adapter.installMcp === 'function') {
+                try {
+                    const mcpInstall = adapter.installMcp({ sessionKey, mcpServerUrl });
+                    if (mcpInstall.launchFlag) cliCmd = `${cliCmd} ${mcpInstall.launchFlag}`;
+                    if (mcpInstall.launchEnv) extraEnv = mcpInstall.launchEnv;
+                } catch (err) {
+                    this.logger.warn(`mcp installMcp failed for ${cliType}/${sessionName}: ${err.message}`);
+                }
+            }
+            const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType, extraEnv);
 
             if (result.ok) {
                 return { ok: true, cliType, fellBackFrom, remainingChain: chain.slice(i), resumed };
