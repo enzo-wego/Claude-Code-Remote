@@ -91,6 +91,13 @@ function removeOurHooks(list) {
 module.exports = {
     type: 'gemini',
 
+    // installMcp() is currently a stub; do not nudge the agent to call a
+    // tool that isn't wired. Gemini has no structured question tool, so
+    // the redirect would flow through AfterAgent rather than PreToolUse —
+    // see docs/mcp-ask-user.md Phase 3 follow-up.
+    supportsAskUser: false,
+    askUserGuidance() { return ''; },
+
     // --yolo  : auto-approve tools (Claude --dangerously-skip-permissions analog).
     // --skip-trust : bypass first-run "Trust folder?" numbered-choice modal.
     buildLaunchCommand(/* sessionName, repoPath, sessionKey */) {
@@ -249,5 +256,29 @@ module.exports = {
                 AfterAgent: listHasOurHook(hooks.AfterAgent),
             },
         };
+    },
+
+    // ─── MCP slack-ask wiring ─────────────────────────────────────────
+    //
+    // STUB — Phase 2 Step 3.
+    //
+    // Gemini CLI accepts `mcpServers` under ~/.gemini/settings.json, with
+    // stdio AND HTTP transports both supported. But since Gemini has no
+    // structured AskUserQuestion-equivalent tool, prompting redirection
+    // would need to flow through the AfterAgent hook rather than a
+    // PreToolUse-style intercept. See docs/mcp-ask-user.md Phase 3
+    // follow-up for the implementation path.
+    //
+    // For now we expose the contract (matching claude-adapter) but return
+    // an empty result. Step 4 calls installMcp on every adapter uniformly;
+    // an empty result is a no-op. Gemini sessions will not route
+    // questions through Slack until the follow-up lands.
+
+    installMcp(/* { sessionKey, mcpServerUrl } */) {
+        return { launchFlag: '', launchEnv: {}, configPath: null };
+    },
+
+    uninstallMcp(/* { sessionKey } */) {
+        return false;
     },
 };

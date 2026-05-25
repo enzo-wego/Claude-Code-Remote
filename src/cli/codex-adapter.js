@@ -119,6 +119,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 module.exports = {
     type: 'codex',
 
+    // installMcp() is currently a stub; do not nudge the agent to call a
+    // tool that isn't wired. Will flip to true when the stdio MCP proxy
+    // for Codex lands (see docs/mcp-ask-user.md Phase 3 follow-up).
+    supportsAskUser: false,
+    askUserGuidance() { return ''; },
+
     buildLaunchCommand(/* sessionName, repoPath, sessionKey */) {
         return process.env.CODEX_COMMAND || 'codex --dangerously-bypass-approvals-and-sandbox';
     },
@@ -289,5 +295,28 @@ module.exports = {
             },
             featureEnabled: codexHooksFeatureEnabled(),
         };
+    },
+
+    // ─── MCP slack-ask wiring ─────────────────────────────────────────
+    //
+    // STUB — Phase 2 Step 3.
+    //
+    // Codex's MCP config layer is global (~/.codex/config.toml [mcp_servers.X]
+    // blocks) with stdio-only transport. To carry session ids per launch, the
+    // intended design is a global `[mcp_servers.slack-ask]` entry that
+    // shells a stdio-to-HTTP proxy and reads `CLAUDE_REMOTE_SESSION_ID` from
+    // its env at runtime — see docs/mcp-ask-user.md Phase 3 follow-up.
+    //
+    // For now we expose the contract (matching claude-adapter) but return an
+    // empty result. Step 4 calls installMcp on every adapter uniformly; an
+    // empty result is a no-op. Codex sessions therefore will NOT route
+    // AskUserQuestion-style prompts through Slack until the proxy lands.
+
+    installMcp(/* { sessionKey, mcpServerUrl } */) {
+        return { launchFlag: '', launchEnv: {}, configPath: null };
+    },
+
+    uninstallMcp(/* { sessionKey } */) {
+        return false;
     },
 };

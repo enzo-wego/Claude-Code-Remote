@@ -47,6 +47,7 @@ function loadMcpSdk() {
 // handle so stopMcpServer() can shut it down cleanly on bot restart.
 let logger = null;
 let httpServer = null;
+let serverUrl = null;
 const transports = new Map(); // sessionId → { transport, mcpServer }
 
 /**
@@ -118,8 +119,18 @@ async function startMcpServer({ config, db, slackApp, port, host, force } = {}) 
     // After listen, address() carries the actual port (matters for port: 0).
     const actualPort = httpServer.address().port;
     const url = `http://${bindHost}:${actualPort}/mcp`;
+    serverUrl = url;
     logger.info(`mcp: slack-ask server listening at ${url}/<sessionId>`);
     return { url, port: actualPort };
+}
+
+/**
+ * Return the base URL of the running MCP server (e.g. http://127.0.0.1:9998/mcp),
+ * or null if the server hasn't been started. Callers append `/<sessionId>` for
+ * per-session routing.
+ */
+function getServerUrl() {
+    return serverUrl;
 }
 
 /**
@@ -171,6 +182,7 @@ async function stopMcpServer() {
     if (!httpServer) return;
     await new Promise((resolve) => httpServer.close(resolve));
     httpServer = null;
+    serverUrl = null;
     for (const [, entry] of transports) {
         try {
             await entry.mcpServer.close?.();
@@ -186,4 +198,5 @@ module.exports = {
     startMcpServer,
     stopMcpServer,
     createMcpServer,
+    getServerUrl,
 };
