@@ -12,6 +12,7 @@ const Logger = require('./src/core/logger');
 const SlackSocketHandler = require('./src/channels/slack/socket');
 const { runDailySummary, parseChannelsConfig } = require('./src/services/daily-summary');
 const { SsoPrewarm } = require('./src/services/sso-prewarm');
+const mcp = require('./src/mcp');
 
 // Load environment variables
 const envPath = path.join(__dirname, '.env');
@@ -218,8 +219,31 @@ async function start() {
     logger.info(`- App Mode: ${config.appMode}`);
     logger.info(`- SSO Pre-warm: ${config.ssoPrewarmEnabled ? `${config.ssoPrewarmProfiles.join(', ')} every ${config.ssoPrewarmIntervalMs}ms via ${config.ssoPrewarmUrl}` : 'Disabled'}`);
 
+    // MCP slack-ask: wire Bolt action/view handlers BEFORE socket connect so
+    // we don't miss button taps that arrive during the start window.
+    // No-op unless MCP_ENABLED=true.
+    const mcpEnabled = process.env.MCP_ENABLED === 'true';
+    if (mcpEnabled) {
+        mcp.wireSlackInteractions(handler.app);
+    }
+
     await handler.start();
     logger.info('Slack Socket Mode is running. Listening for messages...');
+
+    // MCP slack-ask: bring up the HTTP server now that handler.app + handler.db
+    // are live. Same env gate — silent no-op when disabled.
+    if (mcpEnabled) {
+        try {
+            const { url } = await mcp.startMcpServer({
+                config,
+                db: handler.db,
+                slackApp: handler.app,
+            });
+            if (url) logger.info(`MCP slack-ask server: ${url}/<sessionId>`);
+        } catch (err) {
+            logger.error(`MCP slack-ask server failed to start: ${err.message}`);
+        }
+    }
 
     // Schedule daily restart if configured
     const restartHour = parseInt(process.env.DAILY_RESTART_HOUR);
@@ -263,11 +287,12 @@ start().catch((error) => {
 function shutdown() {
     logger.info('Shutting down Slack Socket Mode server...');
     if (handler.ssoPrewarm) handler.ssoPrewarm.stop();
-    handler.stop().then(() => {
-        process.exit(0);
-    }).catch(() => {
-        process.exit(1);
-    });
+    Promise.resolve()
+        .then(() => mcp.stopMcpServer())
+        .catch((err) => logger.warn(`mcp stop failed: ${err.message}`))
+        .then(() => handler.stop())
+        .then(() => process.exit(0))
+        .catch(() => process.exit(1));
 }
 
 process.on('SIGINT', shutdown);
