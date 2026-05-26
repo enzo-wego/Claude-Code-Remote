@@ -8,7 +8,7 @@
  * last_assistant_message, transcript_path) mirrors Claude's Stop hook, so the
  * shared notify script handles both CLIs.
  *
- * Requires `[features] codex_hooks = true` in ~/.codex/config.toml — checked
+ * Requires `[features] hooks = true` in ~/.codex/config.toml — checked
  * at install time.
  */
 
@@ -78,17 +78,18 @@ function removeOurHooks(list) {
     return filtered.length > 0 ? filtered : undefined;
 }
 
-// codex_hooks is a Codex feature gate — hooks.json is ignored unless set.
+// hooks is a Codex feature gate — hooks.json is ignored unless set.
 function codexHooksFeatureEnabled() {
     if (!fs.existsSync(CONFIG_PATH)) return false;
     try {
-        return /codex_hooks\s*=\s*true/.test(fs.readFileSync(CONFIG_PATH, 'utf8'));
+        const body = fs.readFileSync(CONFIG_PATH, 'utf8');
+        return /\bhooks\s*=\s*true/.test(body) || /codex_hooks\s*=\s*true/.test(body);
     } catch {
         return false;
     }
 }
 
-// Idempotently set `codex_hooks = true` under `[features]` in config.toml.
+// Idempotently set `hooks = true` under `[features]` in config.toml.
 // Returns true if the file was changed. We use a regex-based merge instead of
 // a TOML parser to preserve comments and ordering of unrelated keys — the bot
 // is the only thing touching this flag, and the format is stable enough.
@@ -97,17 +98,17 @@ function enableCodexHooksFeature() {
     if (fs.existsSync(CONFIG_PATH)) {
         try { body = fs.readFileSync(CONFIG_PATH, 'utf8'); } catch { body = ''; }
     }
-    if (/codex_hooks\s*=\s*true/.test(body)) return false;
+    if (/\bhooks\s*=\s*true/.test(body)) return false;
 
     let next;
-    if (/codex_hooks\s*=\s*false/.test(body)) {
-        next = body.replace(/codex_hooks\s*=\s*false/, 'codex_hooks = true');
+    if (/\bhooks\s*=\s*false/.test(body)) {
+        next = body.replace(/\bhooks\s*=\s*false/, 'hooks = true');
     } else if (/^\s*\[features\]\s*$/m.test(body)) {
         // Insert immediately after the [features] header
-        next = body.replace(/^(\s*\[features\]\s*)$/m, `$1\ncodex_hooks = true`);
+        next = body.replace(/^(\s*\[features\]\s*)$/m, `$1\nhooks = true`);
     } else {
         const sep = body.length === 0 || body.endsWith('\n') ? '' : '\n';
-        next = body + `${sep}\n[features]\ncodex_hooks = true\n`;
+        next = body + `${sep}\n[features]\nhooks = true\n`;
     }
 
     if (!fs.existsSync(CODEX_HOME)) fs.mkdirSync(CODEX_HOME, { recursive: true });
