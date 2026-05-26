@@ -273,22 +273,35 @@ async function handleAction({ body, action, client }) {
     }
 }
 
-async function handleViewSubmission({ body, view }) {
+async function handleViewSubmission({ body, view, client }) {
     const meta = safeParseJson(view.private_metadata);
     if (!meta || !meta.requestId) return null;
     const { requestId } = meta;
 
     const callbackId = view.callback_id || '';
     if (callbackId.endsWith(':wizard')) {
-        return handleWizardStep({ requestId, currentStep: meta.step ?? 0, view });
+        return handleWizardStep({ requestId, currentStep: meta.step ?? 0, view, client });
     }
 
-    // Single-modal path: extract every question's answer from view.state and
-    // resolve in one shot.
+    // Capture the in-thread bootstrap/CTA message coordinates BEFORE we
+    // resolve, because resolvePending deletes the entry. After resolve we
+    // edit that message to show the answer landed — otherwise the modal
+    // closes silently and the user only sees "Open editor" / "Answer now"
+    // sitting in the thread, looking unanswered.
+    const entryBefore = askUserTool.getPending(requestId);
+    const slackTs = entryBefore?.slackTs;
+    const channel = entryBefore?.channel;
+
     const answers = extractAnswersFromView(view);
     logger.info(`single_modal submit: requestId=${requestId} answers=${JSON.stringify(answers)}`);
     const resolved = askUserTool.resolvePending(requestId, { answers, status: 'ok' });
     logger.info(`single_modal resolved: requestId=${requestId} ok=${resolved}`);
+
+    if (client && channel && slackTs) {
+        await updateBootstrapWithAnswers(client, channel, slackTs, answers).catch((err) =>
+            logger.warn(`failed to update bootstrap after modal submit: ${err.message}`),
+        );
+    }
     return null; // close the modal
 }
 
@@ -299,7 +312,7 @@ async function handleViewSubmission({ body, view }) {
  *   - returns response_action=update with the next step's view so Slack
  *     swaps the modal contents in place.
  */
-function handleWizardStep({ requestId, currentStep, view }) {
+function handleWizardStep({ requestId, currentStep, view, client }) {
     const entry = askUserTool.getPending(requestId);
     if (!entry) return null;
 
@@ -315,11 +328,20 @@ function handleWizardStep({ requestId, currentStep, view }) {
     );
 
     if (nextStep >= entry.questions.length) {
-        // Done — resolve and let Slack close the modal (omit response_action).
+        // Done — capture the bootstrap message coords from `updated` BEFORE
+        // resolve (resolvePending deletes the entry), then update the
+        // "Multi-step questions await" CTA to show the final answers.
+        const slackTs = updated.slackTs;
+        const channel = updated.channel;
         askUserTool.resolvePending(requestId, {
             answers: updated.answers,
             status: 'ok',
         });
+        if (client && channel && slackTs) {
+            updateBootstrapWithAnswers(client, channel, slackTs, updated.answers).catch((err) =>
+                logger.warn(`failed to update wizard bootstrap: ${err.message}`),
+            );
+        }
         return null;
     }
 
@@ -418,6 +440,36 @@ function extractAnswerValue(v) {
 
 function safeParseJson(s) {
     try { return JSON.parse(s); } catch { return null; }
+}
+
+/**
+ * After a modal flow resolves, edit the original bootstrap / in-thread CTA
+ * message to (a) drop the now-stale "Answer now" / "Open editor" / "Start"
+ * button and (b) show the user a short summary of what they answered.
+ * Matches the look the in-thread button path produces in handleAction.
+ */
+async function updateBootstrapWithAnswers(client, channel, ts, answers) {
+    const summary = formatAnswersSummary(answers);
+    return client.chat.update({
+        channel,
+        ts,
+        text: 'Question answered',
+        blocks: [
+            { type: 'section', text: { type: 'mrkdwn', text: '*Question answered.*' } },
+            { type: 'context', elements: [{ type: 'mrkdwn', text: `_${summary}_` }] },
+        ],
+    });
+}
+
+function formatAnswersSummary(answers) {
+    if (!answers || Object.keys(answers).length === 0) return 'You answered: (no values)';
+    return 'You answered: ' + Object.entries(answers)
+        .map(([k, v]) => {
+            const val = Array.isArray(v) ? v.join(', ') : (v == null ? '(none)' : String(v));
+            const trimmed = val.length > 200 ? `${val.slice(0, 200)}…` : val;
+            return `*${k}*=${trimmed}`;
+        })
+        .join(', ');
 }
 
 module.exports = {
