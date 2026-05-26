@@ -84,7 +84,20 @@ module.exports = {
     supportsAskUser: true,
 
     buildLaunchCommand(/* sessionName, repoPath, sessionKey */) {
-        return process.env.SLACK_CLAUDE_COMMAND || 'claude --dangerously-skip-permissions';
+        const base = process.env.SLACK_CLAUDE_COMMAND || 'claude --dangerously-skip-permissions';
+        // Optional model override appended composably so SLACK_CLAUDE_COMMAND
+        // can keep its default. Useful when Opus-with-xhigh-effort gets flaky
+        // at calling MCP tools — set SLACK_CLAUDE_MODEL=sonnet-4-6 to pin the
+        // bot's spawned Claude sessions to a less aggressive model without
+        // touching your interactive Claude config.
+        // Whitelist-validate: model strings are alphanumeric, dot, dash, or
+        // underscore. Anything else is silently dropped (no shell injection
+        // via tmux send-keys).
+        const model = process.env.SLACK_CLAUDE_MODEL;
+        if (model && /^[A-Za-z0-9._-]+$/.test(model)) {
+            return `${base} --model ${model}`;
+        }
+        return base;
     },
 
     // Returns the launch command with `--resume <uuid>` appended, or null when
