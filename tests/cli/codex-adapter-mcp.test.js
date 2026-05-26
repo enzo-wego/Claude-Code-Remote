@@ -96,4 +96,38 @@ describe('codex-adapter installMcp', () => {
         expect(adapter.askUserGuidance()).toContain('mcp__slackask__.ask_user');
         expect(adapter.uninstallMcp()).toBe(false);
     });
+
+    test('askUserToolName returns mcp__slackask__.ask_user (with dot)', () => {
+        expect(adapter.askUserToolName()).toBe('mcp__slackask__.ask_user');
+    });
+
+    test('uninstallMcpGlobal strips both current and legacy blocks', () => {
+        fs.writeFileSync(CONFIG_PATH, [
+            '[features]',
+            'hooks = true',
+            '',
+            '[mcp_servers.slackask]',
+            'url = "http://x/mcp/a"',
+            '',
+            '[mcp_servers.slack-ask]',
+            'url = "http://x/mcp/legacy"',
+            '',
+            '[other.section]',
+            'kept = "value"',
+            '',
+        ].join('\n'));
+        const result = adapter.uninstallMcpGlobal();
+        expect(result.changed).toBe(true);
+        const body = fs.readFileSync(CONFIG_PATH, 'utf8');
+        expect(body).not.toContain('[mcp_servers.slackask]');
+        expect(body).not.toContain('[mcp_servers.slack-ask]');
+        expect(body).toContain('[features]');
+        expect(body).toContain('[other.section]');
+    });
+
+    test('uninstallMcpGlobal is a no-op when no blocks present', () => {
+        fs.writeFileSync(CONFIG_PATH, '[features]\nhooks = true\n');
+        const result = adapter.uninstallMcpGlobal();
+        expect(result.changed).toBe(false);
+    });
 });

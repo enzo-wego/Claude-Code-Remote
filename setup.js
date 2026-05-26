@@ -64,8 +64,10 @@ function writeEnvFile(values, existingEnv) {
     const orderedKeys = [
         'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_CHANNEL_ID',
         'SLACK_REPO_PATH', 'SLACK_REPO_ROOT', 'SLACK_CLAUDE_COMMAND',
+        'SLACK_CLAUDE_MODEL',
         'SLACK_WHITELIST', 'SLACK_HTTP_PORT',
         'ALERT_CLI', 'DELAY_ALERT_CLI',
+        'MCP_ENABLED', 'MCP_BIND_HOST', 'MCP_PORT', 'MCP_DEFAULT_TIMEOUT_MS',
         'LOG_LEVEL'
     ];
 
@@ -143,6 +145,24 @@ async function main() {
         existingEnv.DELAY_ALERT_CLI || 'claude'
     )).toLowerCase();
 
+    console.log('\n  MCP slack-ask (interactive questions in Slack)\n');
+    console.log('  When enabled, agents can call mcp__slack-ask__ask_user to surface');
+    console.log('  modal/button questions in Slack instead of TUI pickers the remote');
+    console.log('  user can\'t see. Bound to 127.0.0.1 only — never exposed externally.');
+    console.log('');
+    const mcpDefault = (existingEnv.MCP_ENABLED || 'true').toLowerCase() === 'true';
+    const enableMcp = await askYesNo('Enable slack-ask MCP server?', mcpDefault);
+    const mcpEnabled = enableMcp ? 'true' : 'false';
+    const mcpBindHost = enableMcp
+        ? (existingEnv.MCP_BIND_HOST || '127.0.0.1')
+        : (existingEnv.MCP_BIND_HOST || '');
+    const mcpPort = enableMcp
+        ? (existingEnv.MCP_PORT || '9998')
+        : (existingEnv.MCP_PORT || '');
+    const mcpTimeout = enableMcp
+        ? (existingEnv.MCP_DEFAULT_TIMEOUT_MS || '1800000')
+        : (existingEnv.MCP_DEFAULT_TIMEOUT_MS || '');
+
     console.log('\n  System Configuration\n');
 
     const logLevel = await ask('Log level (debug/info/warn/error)', existingEnv.LOG_LEVEL || 'info');
@@ -158,6 +178,10 @@ async function main() {
         SLACK_HTTP_PORT: httpPort,
         ALERT_CLI: alertCli,
         DELAY_ALERT_CLI: delayAlertCli,
+        MCP_ENABLED: mcpEnabled,
+        MCP_BIND_HOST: mcpBindHost,
+        MCP_PORT: mcpPort,
+        MCP_DEFAULT_TIMEOUT_MS: mcpTimeout,
         LOG_LEVEL: logLevel
     };
 

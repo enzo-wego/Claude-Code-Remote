@@ -8,6 +8,8 @@
     "hooks:install": "node hooks-manage.js install",
     "hooks:uninstall": "node hooks-manage.js uninstall",
     "hooks:status": "node hooks-manage.js status",
+    "mcp:status": "node mcp-manage.js status",
+    "mcp:uninstall": "node mcp-manage.js uninstall",
     "slack": "node start-slack-socket.js",
     "test": "jest --verbose"
   },

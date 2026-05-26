@@ -17,6 +17,10 @@ const HOOK_TIMEOUT = 15;
 // .mcp.json because multiple sessions may share repoPath.
 const MCP_CONFIG_DIR = path.join(os.tmpdir(), 'claude-code-remote-mcp');
 const MCP_SAFE_KEY_RE = /[^a-zA-Z0-9_-]/g;
+// MCP server-name slug used in both the .mcp.json key and the agent-visible
+// tool name (`mcp__<server>__ask_user`). Keep aligned with the Gemini adapter
+// (same dash-form) — Codex uses its own no-dash form for TOML reasons.
+const MCP_SERVER_NAME = 'slack-ask';
 
 function hookScriptPath() {
     const preferred = path.join(REPO_ROOT, 'cli-hook-notify.js');
@@ -124,16 +128,21 @@ module.exports = {
     // src/channels/slack/socket.js for the prepend logic — gated on the
     // adapter's supportsAskUser flag so Codex/Gemini sessions don't get a
     // nudge to call a tool that isn't wired for them yet.
+    askUserToolName() {
+        return `mcp__${MCP_SERVER_NAME}__ask_user`;
+    },
+
     askUserGuidance() {
+        const tool = this.askUserToolName();
         return [
             '[INTERACTIVE QUESTIONS — IMPORTANT]',
             'When you need to ask the user a clarifying question or have them',
-            'pick from options, invoke the MCP tool `mcp__slack-ask__ask_user`',
+            `pick from options, invoke the MCP tool \`${tool}\``,
             '(it appears in your tool list with that exact name — it is a regular',
             'MCP tool, NOT a subagent — do not use `<to=team_name=...>` or any',
             'delegation syntax). Schema:',
             '',
-            '  mcp__slack-ask__ask_user({',
+            `  ${tool}({`,
             '    questions: [',
             '      { id: "scope", type: "select", question: "Which scope?",',
             '        options: [{label:"a", value:"a"}, {label:"b", value:"b"}] },',
@@ -144,7 +153,7 @@ module.exports = {
             '',
             'Returns { answers: { scope, note, go }, status: "ok" }. The built-in',
             'AskUserQuestion picker renders in a TUI the Slack user cannot see;',
-            'mcp__slack-ask__ask_user is the only path that reaches them.',
+            `${tool} is the only path that reaches them.`,
             '',
             '',
         ].join('\n');
@@ -296,7 +305,7 @@ module.exports = {
         const base = String(mcpServerUrl).replace(/\/+$/, '');
         const config = {
             mcpServers: {
-                'slack-ask': {
+                [MCP_SERVER_NAME]: {
                     type: 'http',
                     url: `${base}/${encodeURIComponent(sessionKey)}`,
                 },
@@ -320,6 +329,14 @@ module.exports = {
         } catch {
             return false;
         }
+    },
+
+    // Counterpart to uninstallMcp. Claude uses a per-session file model, so
+    // there is no shared global config to remove — per-session uninstall is
+    // automatic via `_deleteSession` in socket.js. Returning a structured
+    // result keeps mcp-manage.js output consistent across adapters.
+    uninstallMcpGlobal() {
+        return { changed: false, reason: 'per-session model — no global state to clean' };
     },
 
     hooksStatus() {

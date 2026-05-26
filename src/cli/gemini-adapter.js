@@ -25,6 +25,9 @@ const REPO_ROOT = path.resolve(__dirname, '../..');
 const GEMINI_HOME = path.join(os.homedir(), '.gemini');
 const SETTINGS_PATH = path.join(GEMINI_HOME, 'settings.json');
 const HOOK_MARKERS = ['cli-hook-notify', 'claude-hook-notify'];
+// MCP server-name slug used in both the ~/.gemini/settings.json mcpServers
+// key and the agent-visible tool name (`mcp__<server>__ask_user`).
+const MCP_SERVER_NAME = 'slack-ask';
 // Gemini's settings.json `timeout` is in MILLISECONDS — the existing
 // agent-mem entries in the same file use values like 2000 / 5000ms, and
 // the original `15` here was being interpreted as 15ms, killing the hook
@@ -92,15 +95,20 @@ module.exports = {
     type: 'gemini',
 
     supportsAskUser: true,
+    askUserToolName() {
+        return `mcp__${MCP_SERVER_NAME}__ask_user`;
+    },
+
     askUserGuidance() {
+        const tool = this.askUserToolName();
         return [
             '[INTERACTIVE QUESTIONS — IMPORTANT]',
             'When you need to ask the user a clarifying question or have them',
-            'pick from options, invoke the MCP tool `mcp__slack-ask__ask_user`',
+            `pick from options, invoke the MCP tool \`${tool}\``,
             '(it appears in your tool list with that exact name — it is a regular',
             'MCP tool, NOT a sub-agent). Schema:',
             '',
-            '  mcp__slack-ask__ask_user({',
+            `  ${tool}({`,
             '    questions: [',
             '      { id: "scope", type: "select", question: "Which scope?",',
             '        options: [{label:"a", value:"a"}, {label:"b", value:"b"}] }',
@@ -291,7 +299,7 @@ module.exports = {
 
         // Idempotently add/update the slack-ask server.
         // We use environment variable expansion for the URL.
-        settings.mcpServers['slack-ask'] = {
+        settings.mcpServers[MCP_SERVER_NAME] = {
             url: '${CLAUDE_REMOTE_MCP_URL_FULL}',
         };
 
@@ -313,5 +321,18 @@ module.exports = {
         // concurrent sessions all read the same file). Return false so the
         // session-teardown caller knows there's nothing to clean.
         return false;
+    },
+
+    // Explicit global uninstall — removes the slack-ask key from
+    // ~/.gemini/settings.json mcpServers. Used by `npm run mcp:uninstall`
+    // when the operator wants the bot fully off this machine.
+    uninstallMcpGlobal() {
+        const settings = loadSettings();
+        if (!settings.mcpServers || !settings.mcpServers[MCP_SERVER_NAME]) {
+            return { changed: false, path: SETTINGS_PATH };
+        }
+        delete settings.mcpServers[MCP_SERVER_NAME];
+        saveSettings(settings);
+        return { changed: true, path: SETTINGS_PATH };
     },
 };

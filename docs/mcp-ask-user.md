@@ -17,6 +17,30 @@ Existing hook + poller paths can't cleanly bridge this:
 - Scraping the tmux pane for the picker frame is brittle (frame chars, line
   wrap, multi-tab navigation) and CLI-specific.
 
+## Setup (fresh install)
+
+```sh
+npm install
+npm run setup          # answer Y to "Enable slack-ask MCP server?"
+npm run mcp:status     # confirm MCP_ENABLED=true and per-CLI tool names
+npm run slack          # start the bot — MCP HTTP server boots on 127.0.0.1:9998
+```
+
+The wizard writes `MCP_ENABLED=true`, `MCP_BIND_HOST=127.0.0.1`, `MCP_PORT=9998`,
+`MCP_DEFAULT_TIMEOUT_MS=1800000` to `.env`. Per-CLI configs (Claude's per-session
+`.mcp.json`, Gemini's `~/.gemini/settings.json` entry, Codex's per-launch `-c`
+flag) are written **lazily at first tmux session launch** — there's nothing to
+install at setup time.
+
+`mcp-manage.js` mirrors `hooks-manage.js`:
+
+| Command | Effect |
+|---|---|
+| `npm run mcp:status` | Show per-CLI tool names + whether each CLI has our config entry today |
+| `npm run mcp:uninstall <claude\|codex\|gemini\|all>` | Remove the global config entry (Codex/Gemini); Claude has no global state |
+
+There is no `mcp:install` — the install is implicit at session launch.
+
 ## Approach — MCP back-channel
 
 Add a `slack-ask` MCP server hosted **in-process by the bot** that exposes one

@@ -99,4 +99,31 @@ describe('gemini-adapter installMcp', () => {
         expect(adapter.uninstallMcp()).toBe(false);
         expect(fs.existsSync(SETTINGS_PATH)).toBe(true);
     });
+
+    test('uninstallMcpGlobal removes the slack-ask key and preserves the rest', () => {
+        fs.writeFileSync(SETTINGS_PATH, JSON.stringify({
+            mcpServers: {
+                'slack-ask': { url: '${X}' },
+                'other-server': { command: 'other', args: [] }
+            }
+        }, null, 2));
+        const result = adapter.uninstallMcpGlobal();
+        expect(result.changed).toBe(true);
+        const after = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8'));
+        expect(after.mcpServers['slack-ask']).toBeUndefined();
+        expect(after.mcpServers['other-server']).toBeDefined();
+    });
+
+    test('uninstallMcpGlobal is a no-op when no entry exists', () => {
+        fs.writeFileSync(SETTINGS_PATH, JSON.stringify({
+            mcpServers: { 'other': { command: 'other' } }
+        }, null, 2));
+        const result = adapter.uninstallMcpGlobal();
+        expect(result.changed).toBe(false);
+    });
+
+    test('askUserToolName returns mcp__slack-ask__ask_user', () => {
+        expect(adapter.askUserToolName()).toBe('mcp__slack-ask__ask_user');
+        expect(adapter.askUserGuidance()).toContain('mcp__slack-ask__ask_user');
+    });
 });

@@ -155,15 +155,23 @@ module.exports = {
     serializeLaunches: true,
 
     supportsAskUser: true,
+    askUserToolName() {
+        // Codex prefixes MCP tools as `mcp__<server>__.<tool>` with a literal
+        // dot before the tool name (verified empirically via `/mcp list`);
+        // different from Claude/Gemini's `mcp__<server>__<tool>` shape.
+        return `mcp__${MCP_SERVER_NAME}__.ask_user`;
+    },
+
     askUserGuidance() {
+        const tool = this.askUserToolName();
         return [
             '[INTERACTIVE QUESTIONS — IMPORTANT]',
             'When you need to ask the user a clarifying question or have them',
-            'pick from options, invoke the MCP tool `mcp__slackask__.ask_user`',
+            `pick from options, invoke the MCP tool \`${tool}\``,
             '(it appears in your tool list with that exact name — it is a regular',
             'MCP tool, NOT a sub-agent). Schema:',
             '',
-            '  mcp__slackask__.ask_user({',
+            `  ${tool}({`,
             '    questions: [',
             '      { id: "scope", type: "select", question: "Which scope?",',
             '        options: [{label:"a", value:"a"}, {label:"b", value:"b"}] }',
@@ -376,5 +384,15 @@ module.exports = {
         // Codex MCP wiring is per-launch (`-c mcp_servers.slackask.url=...`),
         // so there is no per-session file to remove.
         return false;
+    },
+
+    // Explicit global uninstall — strips both the current
+    // [mcp_servers.slackask] block and any legacy [mcp_servers.slack-ask]
+    // block from ~/.codex/config.toml. Safe even though Codex's runtime
+    // wiring is per-launch (-c flag): older versions may still have left
+    // a stale block behind.
+    uninstallMcpGlobal() {
+        const changed = removeMcpServerBlocksFromConfig([MCP_SERVER_NAME, 'slack-ask']);
+        return { changed, path: CONFIG_PATH };
     },
 };

@@ -1,6 +1,18 @@
 #!/usr/bin/env node
 /**
- * Bridge MCP stdio clients (Codex) to the bot's HTTP slack-ask MCP server.
+ * Bridge MCP stdio clients to the bot's HTTP slack-ask MCP server.
+ *
+ * STATUS — currently UNUSED. All three CLIs (Claude / Codex / Gemini) now
+ * connect to the in-process MCP server over native streamable HTTP:
+ *   - Claude: `--mcp-config <file>` per session (claude-adapter.js)
+ *   - Codex:  `-c mcp_servers.slackask.url=...` per launch (codex-adapter.js)
+ *   - Gemini: ~/.gemini/settings.json with `${CLAUDE_REMOTE_MCP_URL_FULL}`
+ *             expansion (gemini-adapter.js)
+ *
+ * Kept here as a tested fallback in case any CLI ever drops HTTP transport
+ * support (e.g. a future regression that forces stdio-only MCP). To use:
+ * wire it in via the adapter's installMcp, set CLAUDE_REMOTE_SESSION_ID
+ * and CLAUDE_REMOTE_MCP_URL in extraEnv, and the proxy bridges stdio↔HTTP.
  *
  * Stdout is reserved for JSON-RPC frames. Diagnostics must go to stderr.
  */
