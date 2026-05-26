@@ -172,10 +172,11 @@ and reads back as `result.answers.scope`.
   Endpoint `http://127.0.0.1:<MCP_PORT>/mcp/<tmux_session_id>`. One MCP
   transport instance per session, all sharing the same `ask_user` tool
   registry.
-- **Session identity**: each CLI's launch prelude exports
-  `MCP_SLACK_ASK_URL=http://127.0.0.1:<port>/mcp/<session_id>` and writes a
-  session-scoped MCP config (`.mcp.json` for Claude / `--config` for
-  Codex / `~/.gemini/settings.json` for Gemini — see Phase 2 below).
+- **Session identity**: each CLI launch receives session-scoped env and uses
+  its native MCP config surface: Claude gets a session-scoped `.mcp.json`,
+  Codex uses a global `~/.codex/config.toml` stdio proxy entry plus
+  `CLAUDE_REMOTE_SESSION_ID` / `CLAUDE_REMOTE_MCP_URL`, and Gemini uses a
+  global `~/.gemini/settings.json` URL template.
 - **Pending registry**: in-process `Map<requestId, { resolve, sessionId,
   channel, ts/viewId, timeout, layout, questions }>`. Bot restart loses
   pending state — the agent's tool call errors out; acceptable for a sketch.
@@ -204,13 +205,16 @@ can read end-to-end without risk of regression.
 - `package.json` — `@modelcontextprotocol/sdk` dependency.
 - This design doc.
 
-**Phase 2 (follow-up PR):**
+**Phase 2:**
 
 - Wire `mcp.startServer()` into `start-slack-socket.js` start-up.
 - Wire `wireSlackInteractions(app)` into `socket.js _setupListeners()`.
-- Per-adapter `installMcp()` registering the proxy URL with the CLI's
-  config layer (Claude / Codex / Gemini).
-- Tmux prelude exports `MCP_SLACK_ASK_URL` per session.
+- **Gemini**: Global configuration in `~/.gemini/settings.json` via the `mcpServers` key. Uses Strategy A (HTTP with environment variable expansion in the URL) to support concurrent sessions with a single global entry. The tool is exposed as `mcp__slack-ask__ask_user`.
+- **Codex**: Global configuration in `~/.codex/config.toml` via
+  `[mcp_servers.slack-ask]`. Codex spawns `bin/mcp-stdio-proxy.js`, which
+  bridges Codex's stdio-only MCP client to the bot's HTTP MCP server. The
+  proxy reads `CLAUDE_REMOTE_SESSION_ID` and `CLAUDE_REMOTE_MCP_URL` from the
+  Codex process env.
 - System-prompt nudge: "prefer `slack-ask:ask_user` over the built-in
   question picker."
 
