@@ -264,6 +264,23 @@ class SlackSocketHandler {
     }
 
     _deleteSession(sessionKey) {
+        // Best-effort MCP per-session config cleanup before the row goes.
+        // Read cli_type so we route to the right adapter (today only Claude
+        // writes a real .mcp.json; Codex/Gemini installMcp are stubs and
+        // their adapters don't define uninstallMcp at all). Failure here
+        // must never block the DB delete.
+        try {
+            const row = this._stmts.get.get(sessionKey);
+            const cliType = row && row.cli_type;
+            if (cliType) {
+                const adapter = getCliAdapter(cliType);
+                if (typeof adapter.uninstallMcp === 'function') {
+                    adapter.uninstallMcp({ sessionKey });
+                }
+            }
+        } catch (err) {
+            this.logger.warn(`uninstallMcp on session delete failed for ${sessionKey}: ${err.message}`);
+        }
         this._stmts.delete.run(sessionKey);
     }
 
