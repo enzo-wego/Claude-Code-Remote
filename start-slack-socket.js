@@ -94,7 +94,7 @@ const config = {
         .map(s => s.trim())
         .filter(Boolean),
     ssoPrewarmIntervalMs: parseInt(process.env.SSO_PREWARM_INTERVAL_MS) || 1800000, // 30 min
-    ssoPrewarmTimeoutMs: parseInt(process.env.SSO_PREWARM_TIMEOUT_MS) || 10000, // 10s — a healthy cached call returns <1s; longer means we've fallen into the broken headless-Chrome path, so fail fast.
+    ssoPrewarmTimeoutMs: parseInt(process.env.SSO_PREWARM_TIMEOUT_MS) || 120000, // 2 min. (Briefly tried 10s on 2026-05-26 to "fail fast" past the broken headless-login, but measured `/credentials` latency for legit cached responses is 20-40s due to serial socat handling + repeated aws shell-outs in serve-credentials.sh. 10s would alert false-positive. Revisit if serve-credentials.sh is ever profiled and sped up.)
 };
 
 // Validate configuration
