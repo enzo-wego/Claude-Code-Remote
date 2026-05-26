@@ -45,6 +45,7 @@ class SlackSocketHandler {
         // Polling state per session (in-memory only, rebuilt on start)
         this.pollers = new Map();
         this.sessionTimers = new Map(); // sessionKey -> setTimeout handle
+        this._serializedCliLaunches = new Map(); // cliType -> Promise tail
 
         this.app = new App({
             token: config.botToken,
@@ -264,11 +265,10 @@ class SlackSocketHandler {
     }
 
     _deleteSession(sessionKey) {
-        // Best-effort MCP per-session config cleanup before the row goes.
-        // Read cli_type so we route to the right adapter (today only Claude
-        // writes a real .mcp.json; Codex/Gemini installMcp are stubs and
-        // their adapters don't define uninstallMcp at all). Failure here
-        // must never block the DB delete.
+        // Best-effort MCP cleanup before the row goes. Read cli_type so we
+        // route to the right adapter: Claude removes a session file, while
+        // Codex/Gemini keep global shared config entries in place. Failure
+        // here must never block the DB delete.
         try {
             const row = this._stmts.get.get(sessionKey);
             const cliType = row && row.cli_type;
@@ -2346,22 +2346,30 @@ ${formatted}`
             if (!cliCmd) {
                 cliCmd = adapter.buildLaunchCommand(sessionName, repoPath, sessionKey);
             }
-            // MCP slack-ask wiring: ask the adapter for a per-session launch
-            // flag + env. Stubs return empty strings/objects, so this is a
-            // no-op when MCP is disabled or the adapter hasn't implemented it.
-            const mcp = require('../../mcp');
-            const mcpServerUrl = mcp.getServerUrl ? mcp.getServerUrl() : null;
-            let extraEnv = {};
-            if (mcpServerUrl && typeof adapter.installMcp === 'function') {
-                try {
-                    const mcpInstall = adapter.installMcp({ sessionKey, mcpServerUrl });
-                    if (mcpInstall.launchFlag) cliCmd = `${cliCmd} ${mcpInstall.launchFlag}`;
-                    if (mcpInstall.launchEnv) extraEnv = mcpInstall.launchEnv;
-                } catch (err) {
-                    this.logger.warn(`mcp installMcp failed for ${cliType}/${sessionName}: ${err.message}`);
+
+            const launchAttempt = async () => {
+                let launchCmd = cliCmd;
+                // MCP slack-ask wiring: ask the adapter for a per-session launch
+                // flag + env. Stubs return empty strings/objects, so this is a
+                // no-op when MCP is disabled or the adapter hasn't implemented it.
+                const mcp = require('../../mcp');
+                const mcpServerUrl = mcp.getServerUrl ? mcp.getServerUrl() : null;
+                let extraEnv = {};
+                if (mcpServerUrl && typeof adapter.installMcp === 'function') {
+                    try {
+                        const mcpInstall = adapter.installMcp({ sessionKey, mcpServerUrl });
+                        if (mcpInstall.launchFlag) launchCmd = `${launchCmd} ${mcpInstall.launchFlag}`;
+                        if (mcpInstall.launchEnv) extraEnv = mcpInstall.launchEnv;
+                    } catch (err) {
+                        this.logger.warn(`mcp installMcp failed for ${cliType}/${sessionName}: ${err.message}`);
+                    }
                 }
-            }
-            const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType, extraEnv);
+                return this._createTmuxSessionDetailed(sessionName, repoPath, launchCmd, sessionKey, cliType, extraEnv);
+            };
+
+            const result = adapter.serializeLaunches
+                ? await this._runSerializedCliLaunch(cliType, sessionName, launchAttempt)
+                : await launchAttempt();
 
             if (result.ok) {
                 return { ok: true, cliType, fellBackFrom, remainingChain: chain.slice(i), resumed };
@@ -2389,6 +2397,31 @@ ${formatted}`
         }
 
         return { ok: false, cliType: chain[chain.length - 1], fatalError: null };
+    }
+
+    async _runSerializedCliLaunch(cliType, sessionName, launchAttempt) {
+        if (!this._serializedCliLaunches) this._serializedCliLaunches = new Map();
+        const previous = this._serializedCliLaunches.get(cliType) || Promise.resolve();
+        let waited = false;
+        const run = previous.catch(() => {}).then(async () => {
+            if (waited) {
+                this.logger.info(`Serialized ${cliType} launch starting for ${sessionName}`);
+            }
+            return launchAttempt();
+        });
+        const tail = run.catch(() => {});
+        if (this._serializedCliLaunches.has(cliType)) {
+            waited = true;
+            this.logger.info(`Serializing ${cliType} launch for ${sessionName} until prior launch finishes MCP startup`);
+        }
+        this._serializedCliLaunches.set(cliType, tail);
+        try {
+            return await run;
+        } finally {
+            if (this._serializedCliLaunches.get(cliType) === tail) {
+                this._serializedCliLaunches.delete(cliType);
+            }
+        }
     }
 
     async _injectCommand(sessionName, command, cliType = 'claude') {
@@ -2675,7 +2708,6 @@ ${formatted}`
         const wallCeilingMs = this.config.pollerMaxWallMs || (idleTimeoutMs * 4); // hard cap, default 2h
         const pollerStartedAt = Date.now();
         let lastActivityAt = pollerStartedAt;
-        let lastSessionTimerArm = pollerStartedAt;
         const stableThreshold = 3;
 
         const interval = setInterval(async () => {
@@ -2863,14 +2895,13 @@ ${formatted}`
             // depending on tmux refresh), so we need both signals.
             if (isWorking || stableCount === 0) {
                 lastActivityAt = Date.now();
-                // Re-arm the parallel session-inactivity timer so it doesn't
-                // fire and kill a busy session. Throttle to once per minute —
-                // re-arming setTimeout every poll tick is unnecessary churn.
-                if (sessionKey && Date.now() - lastSessionTimerArm > 60000) {
-                    this._startSessionTimeout(sessionKey);
-                    lastSessionTimerArm = Date.now();
-                }
             }
+            // Session-inactivity timer is anchored to `last_bot_ts` inside
+            // `_startSessionTimeout` (it reschedules itself when it fires and
+            // sees a recent bot post), so the poller no longer needs to
+            // re-arm it during working windows. The old re-arm here missed
+            // long silent tool calls (Athena queries) where neither
+            // `isWorking` nor `stableCount === 0` held for many minutes.
 
             if (attempts % 10 === 0) {
                 const lastFiveLines = lines.slice(-5).map(l => l.trim()).join(' | ');
@@ -3011,10 +3042,36 @@ ${formatted}`
         const configTimeout = this.config.sessionInactivityTimeoutMs;
         // For alerts, use the longer default unless config explicitly exceeds it
         const timeoutMs = isAlert ? Math.max(configTimeout || 0, defaultTimeout) : (configTimeout || defaultTimeout);
+
+        // Anchor the delay to `last_bot_ts` so the countdown is measured from
+        // the bot's most recent reply, not from whenever this function was
+        // called. Without this anchor, an arming during user-message intake
+        // (or an inherited timer from session reconciliation) can race ahead
+        // of a long-running response and fire moments after the bot finally
+        // posts — see thread C08S954G2LX/p1779784228361329 where a 16-min
+        // Athena query was followed by a "15min inactivity" notice 37s later.
+        const lastBotMs = this._parseBotTsMs(session?.lastBotTs);
+        let delayMs = timeoutMs;
+        if (lastBotMs) {
+            delayMs = Math.max(0, (lastBotMs + timeoutMs) - Date.now());
+        }
         const timer = setTimeout(async () => {
             const session = this._getSession(sessionKey);
             if (!session) {
                 this.sessionTimers.delete(sessionKey);
+                return;
+            }
+
+            // Re-check `last_bot_ts` at fire time. `cli-hook-notify.js` posts
+            // regular @mention responses from a separate process and updates
+            // `last_bot_ts` in SQLite — it can't reach our in-memory timer
+            // map. If a fresh bot post landed while we were sleeping, the
+            // user's inactivity window restarts from that post; reschedule
+            // for the remaining time instead of timing out.
+            const freshBotMs = this._parseBotTsMs(session.lastBotTs);
+            if (freshBotMs && Date.now() - freshBotMs < timeoutMs) {
+                this.sessionTimers.delete(sessionKey);
+                this._startSessionTimeout(sessionKey);
                 return;
             }
 
@@ -3063,9 +3120,19 @@ ${formatted}`
             // Keep DB record — repo_path and alert_message_ts preserved for session resumption.
             // Stale entries are cleaned up by the 7-day startup cleanup.
             this.sessionTimers.delete(sessionKey);
-        }, timeoutMs);
+        }, delayMs);
 
         this.sessionTimers.set(sessionKey, timer);
+    }
+
+    // Slack timestamps are "seconds.microseconds" strings (e.g. "1779784191.636949").
+    // Convert to ms for arithmetic with Date.now(). Returns null on parse failure
+    // so callers can fall back to "no anchor" behavior cleanly.
+    _parseBotTsMs(ts) {
+        if (!ts) return null;
+        const f = parseFloat(ts);
+        if (!Number.isFinite(f) || f <= 0) return null;
+        return Math.floor(f * 1000);
     }
 
     _clearSessionTimeout(sessionKey) {

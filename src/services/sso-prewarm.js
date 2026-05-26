@@ -218,7 +218,9 @@ class SsoPrewarm {
             `*Profile:* \`${profile}\``,
             `*Duration:* ${durationMs}ms`,
             `*Error:* ${errMsg}`,
-            '*Action:* Check `docker logs sso_server --tail 80`. PagerDuty investigations may stall on token refresh until this is resolved.',
+            '*First check:* `ls -la /var/go/src/github.com/wego-infra/sso/.aws/sso/cache/` — both `.json` files must be present. If only one (the client-reg) is there, the SSO token file is gone — re-rsync from laptop per `docs/ai/notes/sso-keepalive-2026-05-25.md`.',
+            '*Then:* `docker logs sso_server --tail 80` if cache files look intact.',
+            'PagerDuty investigations on this profile will stall until this is resolved.',
         ].join('\n');
         try {
             await this.slackClient.chat.postMessage({ channel: this.ownerUserId, text });
