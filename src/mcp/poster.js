@@ -135,7 +135,6 @@ function wireSlackInteractions(slackApp) {
     // Catch-all action handler (regex matches anything we own).
     slackApp.action(/^ask_user:/, async ({ ack, body, action, client }) => {
         await ack();
-        logger.info(`action received: action_id=${action.action_id} user=${body.user?.id || '?'}`);
         try {
             await handleAction({ body, action, client });
         } catch (err) {
@@ -143,14 +142,11 @@ function wireSlackInteractions(slackApp) {
         }
     });
 
-    // Modal submission handler. Logs entry so we can confirm Slack is even
-    // delivering view_submission events (debugging Phase 3 E2E silent failures).
+    // Modal submission handler.
     slackApp.view(/^ask_user:/, async ({ ack, body, view, client }) => {
-        logger.info(`view received: type=${body.type} callback_id=${view.callback_id} meta=${view.private_metadata}`);
         try {
             const ackPayload = await handleViewSubmission({ body, view, client });
             await ack(ackPayload || {});
-            logger.info(`view handled: callback_id=${view.callback_id} ack=${ackPayload ? JSON.stringify(ackPayload).slice(0, 100) : 'close'}`);
         } catch (err) {
             logger.error(`view handler failed: ${err.message} stack=${err.stack}`);
             await ack({ response_action: 'errors', errors: {} });
@@ -187,8 +183,7 @@ async function handleAction({ body, action, client }) {
             title: entry.title,
             submitLabel: entry.submitLabel,
         });
-        const openResult = await client.views.open({ trigger_id: body.trigger_id, view });
-        logger.info(`bootstrap modal opened: requestId=${requestId} view_id=${openResult?.view?.id || '?'}`);
+        await client.views.open({ trigger_id: body.trigger_id, view });
         return;
     }
 
@@ -293,9 +288,7 @@ async function handleViewSubmission({ body, view, client }) {
     const channel = entryBefore?.channel;
 
     const answers = extractAnswersFromView(view);
-    logger.info(`single_modal submit: requestId=${requestId} answers=${JSON.stringify(answers)}`);
-    const resolved = askUserTool.resolvePending(requestId, { answers, status: 'ok' });
-    logger.info(`single_modal resolved: requestId=${requestId} ok=${resolved}`);
+    askUserTool.resolvePending(requestId, { answers, status: 'ok' });
 
     if (client && channel && slackTs) {
         await updateBootstrapWithAnswers(client, channel, slackTs, answers).catch((err) =>
