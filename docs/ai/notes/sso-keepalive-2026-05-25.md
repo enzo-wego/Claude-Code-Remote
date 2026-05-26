@@ -1,5 +1,22 @@
 # SSO refresh — 90-day hands-off state
 
+> **⚠️ 2026-05-26 update.** The original "laptop `aws sso login` + rsync to
+> VPS" flow described below is **DEPRECATED**. It shared the OIDC client_id
+> between laptop and VPS, which meant any `aws sso login` on the laptop
+> rotated the refresh token via AWS's sliding-token rule and silently
+> invalidated the VPS's copy. Confirmed twice in one day on 2026-05-26 — see
+> [`sso-prewarm-fail-2026-05-26.md`](sso-prewarm-fail-2026-05-26.md) for
+> root-cause + the new device-code-from-inside-`sso_server` re-seed flow.
+>
+> Also: the headless-Chrome fallback in `get-credentials-lib.sh:get_credentials()`
+> was removed the same day, so `/credentials` no longer hangs 120s and
+> spams DMs — it fails fast in ~5s. Two local-only VPS patches; see memory
+> file `reference_sso_server_local_patches.md` for verification commands.
+>
+> Filenames + clientIds below are obsolete after the 2026-05-26 09:00 UTC
+> re-seed. Current VPS clientId is `dYAU_9itDHe6VtOw8G4UoG...`, registration
+> expires ~2026-08-24.
+
 **Last seeded:** 2026-05-25 04:52 UTC (laptop-side `aws sso login`, rsynced to VPS)
 **Expected re-seed by:** 2026-08-13 (80 days, buffer before 90-day expiry on 2026-08-23)
 **Next-up token files on VPS:**

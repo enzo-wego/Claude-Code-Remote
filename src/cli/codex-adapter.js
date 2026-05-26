@@ -22,6 +22,7 @@ const HOOKS_PATH = path.join(CODEX_HOME, 'hooks.json');
 const CONFIG_PATH = path.join(CODEX_HOME, 'config.toml');
 const HOOK_MARKERS = ['cli-hook-notify', 'claude-hook-notify'];
 const HOOK_TIMEOUT = 15;
+const MCP_SERVER_NAME = 'slackask';
 
 function hookScriptPath() {
     const preferred = path.join(REPO_ROOT, 'cli-hook-notify.js');
@@ -114,16 +115,68 @@ function enableCodexHooksFeature() {
     return true;
 }
 
+function tomlString(value) {
+    return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function ensureMcpServerBlockInConfig({ name, url }) {
+    let body = '';
+    if (fs.existsSync(CONFIG_PATH)) {
+        try { body = fs.readFileSync(CONFIG_PATH, 'utf8'); } catch { body = ''; }
+    }
+
+    const header = `[mcp_servers.${name}]`;
+    const blockRe = new RegExp(
+        `\\n?\\[mcp_servers\\.${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]\\n[\\s\\S]*?(?=\\n\\[|$)`,
+    );
+    const legacyBlockRe = /\n?\[mcp_servers\.slack-ask\]\n[\s\S]*?(?=\n\[|$)/;
+
+    const block = [
+        header,
+        `url = ${tomlString(url)}`,
+        '',
+    ].join('\n');
+    let next = body.replace(blockRe, '').replace(legacyBlockRe, '');
+    const sep = next.length === 0 || next.endsWith('\n') ? '' : '\n';
+    next = `${next}${sep}${block}`;
+
+    try {
+        if (!fs.existsSync(CODEX_HOME)) fs.mkdirSync(CODEX_HOME, { recursive: true });
+        fs.writeFileSync(CONFIG_PATH, next);
+        return true;
+    } catch (err) {
+        console.error(`codex-adapter: failed to install MCP server config: ${err.message}`);
+        return false;
+    }
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 module.exports = {
     type: 'codex',
 
-    // installMcp() is currently a stub; do not nudge the agent to call a
-    // tool that isn't wired. Will flip to true when the stdio MCP proxy
-    // for Codex lands (see docs/mcp-ask-user.md Phase 3 follow-up).
-    supportsAskUser: false,
-    askUserGuidance() { return ''; },
+    supportsAskUser: true,
+    askUserGuidance() {
+        return [
+            '[INTERACTIVE QUESTIONS — IMPORTANT]',
+            'When you need to ask the user a clarifying question or have them',
+            'pick from options, invoke the MCP tool `mcp__slackask__.ask_user`',
+            '(it appears in your tool list with that exact name — it is a regular',
+            'MCP tool, NOT a sub-agent). Schema:',
+            '',
+            '  mcp__slackask__.ask_user({',
+            '    questions: [',
+            '      { id: "scope", type: "select", question: "Which scope?",',
+            '        options: [{label:"a", value:"a"}, {label:"b", value:"b"}] }',
+            '    ]',
+            '  })',
+            '',
+            'Returns { answers: { <id>: <value> }, status: "ok" }. Use this any',
+            'time you need a Slack-side response from the user.',
+            '',
+            '',
+        ].join('\n');
+    },
 
     buildLaunchCommand(/* sessionName, repoPath, sessionKey */) {
         return process.env.CODEX_COMMAND || 'codex --dangerously-bypass-approvals-and-sandbox';
@@ -299,24 +352,36 @@ module.exports = {
 
     // ─── MCP slack-ask wiring ─────────────────────────────────────────
     //
-    // STUB — Phase 2 Step 3.
-    //
-    // Codex's MCP config layer is global (~/.codex/config.toml [mcp_servers.X]
-    // blocks) with stdio-only transport. To carry session ids per launch, the
-    // intended design is a global `[mcp_servers.slack-ask]` entry that
-    // shells a stdio-to-HTTP proxy and reads `CLAUDE_REMOTE_SESSION_ID` from
-    // its env at runtime — see docs/mcp-ask-user.md Phase 3 follow-up.
-    //
-    // For now we expose the contract (matching claude-adapter) but return an
-    // empty result. Step 4 calls installMcp on every adapter uniformly; an
-    // empty result is a no-op. Codex sessions therefore will NOT route
-    // AskUserQuestion-style prompts through Slack until the proxy lands.
+    // Codex reads MCP servers from the global ~/.codex/config.toml. Current
+    // Codex supports streamable HTTP servers, so we write the session URL
+    // directly before launching the process. The running process keeps its
+    // initialized MCP transport even if a later session rewrites the global
+    // entry for its own startup.
+    installMcp({ sessionKey, mcpServerUrl } = {}) {
+        if (!sessionKey || !mcpServerUrl) {
+            return { launchFlag: '', launchEnv: {}, configPath: null };
+        }
 
-    installMcp(/* { sessionKey, mcpServerUrl } */) {
-        return { launchFlag: '', launchEnv: {}, configPath: null };
+        const base = String(mcpServerUrl).replace(/\/+$/, '');
+        const installed = ensureMcpServerBlockInConfig({
+            name: MCP_SERVER_NAME,
+            url: `${base}/${encodeURIComponent(sessionKey)}`,
+        });
+        if (!installed) {
+            return { launchFlag: '', launchEnv: {}, configPath: null };
+        }
+
+        return {
+            launchFlag: '',
+            launchEnv: {},
+            configPath: CONFIG_PATH,
+        };
     },
 
-    uninstallMcp(/* { sessionKey } */) {
+    uninstallMcp() {
+        // The Codex entry is global and shared by concurrent sessions. Per
+        // session teardown must leave it in place; a future explicit global
+        // uninstall command can remove the block if needed.
         return false;
     },
 };

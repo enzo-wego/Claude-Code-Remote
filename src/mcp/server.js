@@ -77,7 +77,7 @@ async function startMcpServer({ config, db, slackApp, getDb, port, host, force }
     const sdk = loadMcpSdk();
     const { Server, StreamableHTTPServerTransport } = sdk;
 
-    const bindPort = Number(port || process.env.MCP_PORT || 9998);
+    const bindPort = Number(port ?? process.env.MCP_PORT ?? 9998);
     const bindHost = host || process.env.MCP_BIND_HOST || '127.0.0.1';
 
     const app = express();
