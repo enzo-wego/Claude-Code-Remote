@@ -20,6 +20,7 @@ const {
     buildInThreadBlocks,
     buildModalView,
     buildWizardStepView,
+    _maybeTruncateBody,
 } = require('./slack-blocks');
 // Namespace-import to dodge the ask-user-tool ↔ poster circular require —
 // destructuring at module load time would capture undefined for these.
@@ -47,6 +48,7 @@ async function postQuestion({ slackApp, requestId, entry }) {
             blocks,
         });
         entry.slackTs = result.ts;
+        await maybeAttachLongPreviewBodies({ slackApp, questions, channel, threadTs });
         return;
     }
 
@@ -80,6 +82,7 @@ async function postQuestion({ slackApp, requestId, entry }) {
             ],
         });
         entry.slackTs = result.ts;
+        await maybeAttachLongPreviewBodies({ slackApp, questions, channel, threadTs });
         return;
     }
 
@@ -112,10 +115,41 @@ async function postQuestion({ slackApp, requestId, entry }) {
             ],
         });
         entry.slackTs = result.ts;
+        await maybeAttachLongPreviewBodies({ slackApp, questions, channel, threadTs });
         return;
     }
 
     throw new Error(`postQuestion: unknown layout ${layout}`);
+}
+
+/**
+ * For every `preview` question whose body would be truncated in the
+ * Slack-side render (mrkdwn sections cap around 3000 chars), upload the
+ * FULL body as a thread file so the user has the complete content to
+ * review before answering. Best-effort: failures log but don't break the
+ * surrounding flow (the user can still answer based on the truncated view).
+ */
+async function maybeAttachLongPreviewBodies({ slackApp, questions, channel, threadTs }) {
+    if (!Array.isArray(questions)) return;
+    for (const q of questions) {
+        if (!q || q.type !== 'preview') continue;
+        const body = q.body || '';
+        const tr = _maybeTruncateBody(body, q.truncate_after_lines);
+        if (!tr.didTruncate) continue;
+        try {
+            const lang = (q.language || '').replace(/[^A-Za-z0-9._-]/g, '') || 'txt';
+            const filename = `preview-${q.id || 'q'}-${Date.now()}.${lang}`;
+            await slackApp.client.files.uploadV2({
+                channel_id: channel,
+                thread_ts: threadTs,
+                filename,
+                content: body,
+                initial_comment: `_Full body for "${(q.question || '').slice(0, 80)}" — the in-modal preview is truncated._`,
+            });
+        } catch (err) {
+            logger.warn(`preview attach failed for question ${q.id || '?'}: ${err.message}`);
+        }
+    }
 }
 
 // ─── Inbound — Slack interaction routing ──────────────────────────────────
