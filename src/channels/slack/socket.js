@@ -45,6 +45,7 @@ class SlackSocketHandler {
         // Polling state per session (in-memory only, rebuilt on start)
         this.pollers = new Map();
         this.sessionTimers = new Map(); // sessionKey -> setTimeout handle
+        this._serializedCliLaunches = new Map(); // cliType -> Promise tail
 
         this.app = new App({
             token: config.botToken,
@@ -2345,22 +2346,30 @@ ${formatted}`
             if (!cliCmd) {
                 cliCmd = adapter.buildLaunchCommand(sessionName, repoPath, sessionKey);
             }
-            // MCP slack-ask wiring: ask the adapter for a per-session launch
-            // flag + env. Stubs return empty strings/objects, so this is a
-            // no-op when MCP is disabled or the adapter hasn't implemented it.
-            const mcp = require('../../mcp');
-            const mcpServerUrl = mcp.getServerUrl ? mcp.getServerUrl() : null;
-            let extraEnv = {};
-            if (mcpServerUrl && typeof adapter.installMcp === 'function') {
-                try {
-                    const mcpInstall = adapter.installMcp({ sessionKey, mcpServerUrl });
-                    if (mcpInstall.launchFlag) cliCmd = `${cliCmd} ${mcpInstall.launchFlag}`;
-                    if (mcpInstall.launchEnv) extraEnv = mcpInstall.launchEnv;
-                } catch (err) {
-                    this.logger.warn(`mcp installMcp failed for ${cliType}/${sessionName}: ${err.message}`);
+
+            const launchAttempt = async () => {
+                let launchCmd = cliCmd;
+                // MCP slack-ask wiring: ask the adapter for a per-session launch
+                // flag + env. Stubs return empty strings/objects, so this is a
+                // no-op when MCP is disabled or the adapter hasn't implemented it.
+                const mcp = require('../../mcp');
+                const mcpServerUrl = mcp.getServerUrl ? mcp.getServerUrl() : null;
+                let extraEnv = {};
+                if (mcpServerUrl && typeof adapter.installMcp === 'function') {
+                    try {
+                        const mcpInstall = adapter.installMcp({ sessionKey, mcpServerUrl });
+                        if (mcpInstall.launchFlag) launchCmd = `${launchCmd} ${mcpInstall.launchFlag}`;
+                        if (mcpInstall.launchEnv) extraEnv = mcpInstall.launchEnv;
+                    } catch (err) {
+                        this.logger.warn(`mcp installMcp failed for ${cliType}/${sessionName}: ${err.message}`);
+                    }
                 }
-            }
-            const result = await this._createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey, cliType, extraEnv);
+                return this._createTmuxSessionDetailed(sessionName, repoPath, launchCmd, sessionKey, cliType, extraEnv);
+            };
+
+            const result = adapter.serializeLaunches
+                ? await this._runSerializedCliLaunch(cliType, sessionName, launchAttempt)
+                : await launchAttempt();
 
             if (result.ok) {
                 return { ok: true, cliType, fellBackFrom, remainingChain: chain.slice(i), resumed };
@@ -2388,6 +2397,31 @@ ${formatted}`
         }
 
         return { ok: false, cliType: chain[chain.length - 1], fatalError: null };
+    }
+
+    async _runSerializedCliLaunch(cliType, sessionName, launchAttempt) {
+        if (!this._serializedCliLaunches) this._serializedCliLaunches = new Map();
+        const previous = this._serializedCliLaunches.get(cliType) || Promise.resolve();
+        let waited = false;
+        const run = previous.catch(() => {}).then(async () => {
+            if (waited) {
+                this.logger.info(`Serialized ${cliType} launch starting for ${sessionName}`);
+            }
+            return launchAttempt();
+        });
+        const tail = run.catch(() => {});
+        if (this._serializedCliLaunches.has(cliType)) {
+            waited = true;
+            this.logger.info(`Serializing ${cliType} launch for ${sessionName} until prior launch finishes MCP startup`);
+        }
+        this._serializedCliLaunches.set(cliType, tail);
+        try {
+            return await run;
+        } finally {
+            if (this._serializedCliLaunches.get(cliType) === tail) {
+                this._serializedCliLaunches.delete(cliType);
+            }
+        }
     }
 
     async _injectCommand(sessionName, command, cliType = 'claude') {

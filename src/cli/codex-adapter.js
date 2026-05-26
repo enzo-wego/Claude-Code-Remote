@@ -116,30 +116,23 @@ function enableCodexHooksFeature() {
     return true;
 }
 
-function tomlString(value) {
-    return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+function shellArg(value) {
+    return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
-function ensureMcpServerBlockInConfig({ name, url }) {
+function removeMcpServerBlocksFromConfig(names) {
     let body = '';
     if (fs.existsSync(CONFIG_PATH)) {
         try { body = fs.readFileSync(CONFIG_PATH, 'utf8'); } catch { body = ''; }
     }
 
-    const header = `[mcp_servers.${name}]`;
-    const blockRe = new RegExp(
-        `\\n?\\[mcp_servers\\.${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]\\n[\\s\\S]*?(?=\\n\\[|$)`,
-    );
-    const legacyBlockRe = /\n?\[mcp_servers\.slack-ask\]\n[\s\S]*?(?=\n\[|$)/;
-
-    const block = [
-        header,
-        `url = ${tomlString(url)}`,
-        '',
-    ].join('\n');
-    let next = body.replace(blockRe, '').replace(legacyBlockRe, '');
-    const sep = next.length === 0 || next.endsWith('\n') ? '' : '\n';
-    next = `${next}${sep}${block}`;
+    let next = body;
+    for (const name of names) {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const blockRe = new RegExp(`\\n?\\[mcp_servers\\.${escaped}\\]\\n[\\s\\S]*?(?=\\n\\[|$)`);
+        next = next.replace(blockRe, '');
+    }
+    if (next === body) return false;
 
     try {
         if (!fs.existsSync(CODEX_HOME)) fs.mkdirSync(CODEX_HOME, { recursive: true });
@@ -155,6 +148,11 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 module.exports = {
     type: 'codex',
+
+    // Keep rapid duplicate Codex starts from racing the TUI startup/paste path.
+    // The session-specific MCP URL is passed per launch via `-c`, not written
+    // to the shared ~/.codex/config.toml.
+    serializeLaunches: true,
 
     supportsAskUser: true,
     askUserGuidance() {
@@ -353,36 +351,30 @@ module.exports = {
 
     // ─── MCP slack-ask wiring ─────────────────────────────────────────
     //
-    // Codex reads MCP servers from the global ~/.codex/config.toml. Current
-    // Codex supports streamable HTTP servers, so we write the session URL
-    // directly before launching the process. The running process keeps its
-    // initialized MCP transport even if a later session rewrites the global
-    // entry for its own startup.
+    // Codex accepts per-launch config overrides via `-c key=value`. Use that
+    // instead of writing a session URL into global ~/.codex/config.toml; two
+    // concurrent Codex launches can otherwise race and bind one Slack thread to
+    // another thread's MCP URL. We still remove legacy global blocks so old
+    // installs don't boot a second stale/broken slack-ask server.
     installMcp({ sessionKey, mcpServerUrl } = {}) {
         if (!sessionKey || !mcpServerUrl) {
             return { launchFlag: '', launchEnv: {}, configPath: null };
         }
 
         const base = String(mcpServerUrl).replace(/\/+$/, '');
-        const installed = ensureMcpServerBlockInConfig({
-            name: MCP_SERVER_NAME,
-            url: `${base}/${encodeURIComponent(sessionKey)}`,
-        });
-        if (!installed) {
-            return { launchFlag: '', launchEnv: {}, configPath: null };
-        }
+        const url = `${base}/${encodeURIComponent(sessionKey)}`;
+        const configChanged = removeMcpServerBlocksFromConfig([MCP_SERVER_NAME, 'slack-ask']);
 
         return {
-            launchFlag: '',
+            launchFlag: `-c ${shellArg(`mcp_servers.${MCP_SERVER_NAME}.url=${url}`)}`,
             launchEnv: {},
-            configPath: CONFIG_PATH,
+            configPath: configChanged ? CONFIG_PATH : null,
         };
     },
 
     uninstallMcp() {
-        // The Codex entry is global and shared by concurrent sessions. Per
-        // session teardown must leave it in place; a future explicit global
-        // uninstall command can remove the block if needed.
+        // Codex MCP wiring is per-launch (`-c mcp_servers.slackask.url=...`),
+        // so there is no per-session file to remove.
         return false;
     },
 };

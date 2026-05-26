@@ -174,9 +174,8 @@ and reads back as `result.answers.scope`.
   registry.
 - **Session identity**: each CLI launch receives session-scoped env and uses
   its native MCP config surface: Claude gets a session-scoped `.mcp.json`,
-  Codex writes a session-specific streamable HTTP URL into global
-  `~/.codex/config.toml`, and Gemini uses a global `~/.gemini/settings.json`
-  URL template.
+  Codex gets a per-launch `-c mcp_servers.slackask.url=...` override, and
+  Gemini uses a global `~/.gemini/settings.json` URL template.
 - **Pending registry**: in-process `Map<requestId, { resolve, sessionId,
   channel, ts/viewId, timeout, layout, questions }>`. Bot restart loses
   pending state — the agent's tool call errors out; acceptable for a sketch.
@@ -210,10 +209,10 @@ can read end-to-end without risk of regression.
 - Wire `mcp.startServer()` into `start-slack-socket.js` start-up.
 - Wire `wireSlackInteractions(app)` into `socket.js _setupListeners()`.
 - **Gemini**: Global configuration in `~/.gemini/settings.json` via the `mcpServers` key. Uses Strategy A (HTTP with environment variable expansion in the URL) to support concurrent sessions with a single global entry. The tool is exposed as `mcp__slack-ask__ask_user`.
-- **Codex**: Global configuration in `~/.codex/config.toml` via
-  `[mcp_servers.slackask]`. Codex uses its native streamable HTTP MCP
-  transport with a session-specific URL written before process launch. The
-  tool is exposed as `mcp__slackask__.ask_user`.
+- **Codex**: Per-launch configuration via
+  `-c mcp_servers.slackask.url=http://127.0.0.1:<port>/mcp/<session>`.
+  Codex uses its native streamable HTTP MCP transport. The tool is exposed as
+  `mcp__slackask__.ask_user`.
 - System-prompt nudge: "prefer `slack-ask:ask_user` over the built-in
   question picker."
 
