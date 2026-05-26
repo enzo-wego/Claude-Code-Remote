@@ -183,7 +183,14 @@ function defaultTimeoutMs() {
 // ─── Tool handler (MCP `tools/call` invocation) ───────────────────────────
 
 async function handleAskUser(input, ctx) {
-    const { sessionId, db, slackApp } = ctx;
+    const { sessionId, slackApp } = ctx;
+    // Resolve DB handle freshly on every call. The bot's daily-restart calls
+    // handler.stop() which closes this.db, then handler.start() reopens it
+    // with a NEW Database instance — but the MCP server's context was bound
+    // once at boot. Without ctx.getDb(), we'd reuse the closed handle and
+    // every tool call after the restart fails with "database connection is
+    // not open". Tests pass `db` directly; prod must pass `getDb`.
+    const db = typeof ctx.getDb === 'function' ? ctx.getDb() : ctx.db;
     const normalized = normalizeInput(input);
 
     // Look up Slack target from the session table — same path the regular
