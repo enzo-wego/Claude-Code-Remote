@@ -94,7 +94,7 @@ const config = {
         .map(s => s.trim())
         .filter(Boolean),
     ssoPrewarmIntervalMs: parseInt(process.env.SSO_PREWARM_INTERVAL_MS) || 1800000, // 30 min
-    ssoPrewarmTimeoutMs: parseInt(process.env.SSO_PREWARM_TIMEOUT_MS) || 120000, // 2 min
+    ssoPrewarmTimeoutMs: parseInt(process.env.SSO_PREWARM_TIMEOUT_MS) || 10000, // 10s — a healthy cached call returns <1s; longer means we've fallen into the broken headless-Chrome path, so fail fast.
 };
 
 // Validate configuration
@@ -236,7 +236,9 @@ async function start() {
         try {
             const { url } = await mcp.startMcpServer({
                 config,
-                db: handler.db,
+                // Use a getter so daily restarts (handler.stop/start replace
+                // this.db) don't leave the MCP server holding a closed handle.
+                getDb: () => handler.db,
                 slackApp: handler.app,
             });
             if (url) logger.info(`MCP slack-ask server: ${url}/<sessionId>`);

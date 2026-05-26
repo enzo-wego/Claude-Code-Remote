@@ -60,9 +60,14 @@ const transports = new Map(); // sessionId → { transport, mcpServer }
  * @param {number} [opts.port]           — bind port; defaults to MCP_PORT env. Pass 0 for ephemeral.
  * @param {string} [opts.host]           — bind host; defaults to MCP_BIND_HOST env
  * @param {boolean} [opts.force]         — start even if MCP_ENABLED!=true (tests only)
+ * @param {function} [opts.getDb]        — preferred over `db`: returns the
+ *     current better-sqlite3 handle on each call. Required for prod because
+ *     the bot's daily-restart replaces `handler.db` mid-process; a captured
+ *     handle goes stale and tool calls error with "database connection is
+ *     not open". Tests can keep passing a static `db`.
  * @returns {Promise<{ url: string, port: number }>}
  */
-async function startMcpServer({ config, db, slackApp, port, host, force } = {}) {
+async function startMcpServer({ config, db, slackApp, getDb, port, host, force } = {}) {
     if (!force && process.env.MCP_ENABLED !== 'true') {
         return { url: null, disabled: true };
     }
@@ -90,7 +95,7 @@ async function startMcpServer({ config, db, slackApp, port, host, force } = {}) 
 
         let entry = transports.get(sessionId);
         if (!entry) {
-            const mcpServer = createMcpServer({ db, slackApp, sessionId, config }, sdk);
+            const mcpServer = createMcpServer({ db, getDb, slackApp, sessionId, config }, sdk);
             const transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: () => sessionId,
             });
