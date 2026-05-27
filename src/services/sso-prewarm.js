@@ -78,6 +78,7 @@ class SsoPrewarm {
             });
         }
         this._scheduledTimer = null;
+        this._scheduledApprovalTimer = null;
     }
 
     start() {
@@ -106,6 +107,10 @@ class SsoPrewarm {
         if (this._scheduledTimer) {
             clearTimeout(this._scheduledTimer);
             this._scheduledTimer = null;
+        }
+        if (this._scheduledApprovalTimer) {
+            clearInterval(this._scheduledApprovalTimer);
+            this._scheduledApprovalTimer = null;
         }
         for (const state of this._state.values()) {
             if (state.retryTimer) {
@@ -400,13 +405,87 @@ class SsoPrewarm {
                 unfurl_links: false,
             });
             this.logger.info(`Scheduled re-seed DM sent (reused=${!!reseed.reused})`);
-            // Also kick off fast-poll so the operator sees a ✅ within ~10s
-            // of approving. Pick any configured profile; the recovery
-            // condition is "session works at all," not per-profile.
-            const probe = this.profiles[0];
-            if (probe) this._startFastPoll(probe);
+            // Capture the SSO token's expiresAt now so a poller can detect
+            // when the user actually approves (expiresAt advances). The
+            // existing fast-poll path doesn't help here — /credentials stays
+            // 200 the whole time when the session is healthy, so success
+            // alone isn't a usable signal for "approval landed."
+            const baseline = await this._callReseedStatus().catch(() => null);
+            if (baseline && baseline.sso_token_expires_at) {
+                this._pollScheduledApproval(baseline.sso_token_expires_at);
+            } else {
+                this.logger.warn('Scheduled re-seed: no baseline expiresAt, skipping approval poll');
+            }
         } catch (err) {
             this.logger.error(`Failed to DM owner about scheduled re-seed: ${err.message}`);
+        }
+    }
+
+    _callReseedStatus() {
+        return new Promise((resolve, reject) => {
+            let target;
+            try { target = new URL(this.url); }
+            catch (e) { return reject(new Error(`invalid SSO_PREWARM_URL: ${e.message}`)); }
+            target.pathname = '/admin/reseed/status';
+            target.search = '';
+            const lib = target.protocol === 'https:' ? https : http;
+            const req = lib.get(target, { timeout: ADMIN_RESEED_TIMEOUT_MS }, (res) => {
+                const chunks = [];
+                res.on('data', (c) => chunks.push(c));
+                res.on('end', () => {
+                    const body = Buffer.concat(chunks).toString('utf8');
+                    try { resolve(JSON.parse(body)); }
+                    catch { reject(new Error(`bad JSON from /admin/reseed/status: ${body.slice(0, 120)}`)); }
+                });
+            });
+            req.on('timeout', () => req.destroy(new Error('/admin/reseed/status timeout')));
+            req.on('error', reject);
+        });
+    }
+
+    // Watches for the user to approve a scheduled re-seed. The SSO token
+    // file's expiresAt advances when `aws sso login` writes a fresh token,
+    // so polling that is a clean signal — distinct from /credentials, which
+    // returns 200 the whole time when the existing session is still healthy.
+    _pollScheduledApproval(baselineExpiresAt) {
+        if (this._scheduledApprovalTimer) clearInterval(this._scheduledApprovalTimer);
+        const startedAt = Date.now();
+        this._scheduledApprovalTimer = setInterval(async () => {
+            if ((Date.now() - startedAt) > FAST_POLL_MAX_MS) {
+                clearInterval(this._scheduledApprovalTimer);
+                this._scheduledApprovalTimer = null;
+                this.logger.debug('Scheduled approval poll: aged out without approval');
+                return;
+            }
+            let status;
+            try { status = await this._callReseedStatus(); }
+            catch { return; } // transient; keep polling
+            if (status && status.sso_token_expires_at
+                && status.sso_token_expires_at !== baselineExpiresAt) {
+                clearInterval(this._scheduledApprovalTimer);
+                this._scheduledApprovalTimer = null;
+                await this._notifyScheduledApproved(status.sso_token_expires_at);
+            }
+        }, FAST_POLL_INTERVAL_MS);
+        if (this._scheduledApprovalTimer.unref) this._scheduledApprovalTimer.unref();
+    }
+
+    async _notifyScheduledApproved(newExpiresAt) {
+        if (!this.ownerUserId || !this.slackClient) return;
+        const text = [
+            ':white_check_mark: *SSO session extended*',
+            `_New SSO token valid until ${newExpiresAt}._`,
+            '_Next scheduled DM at 08:00 or 20:00 GMT+7._',
+        ].join('\n');
+        try {
+            await this.slackClient.chat.postMessage({
+                channel: this.ownerUserId,
+                text,
+                unfurl_links: false,
+            });
+            this.logger.info(`Scheduled approval confirmed DM sent (new expiresAt=${newExpiresAt})`);
+        } catch (err) {
+            this.logger.error(`Failed to DM owner about scheduled approval: ${err.message}`);
         }
     }
 
