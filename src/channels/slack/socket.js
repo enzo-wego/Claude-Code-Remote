@@ -17,6 +17,7 @@ const AlertMonitor = require('./alert-monitor');
 const DelayAlertMonitor = require('./delay-alert-monitor');
 const { runDailySummary, parseChannelsConfig } = require('../../services/daily-summary');
 const { getCliAdapter, adapterNames } = require('../../cli');
+const graphIngest = require('../../graph-ingest');
 
 // Alternation like "claude|codex" derived from registered adapters, so adding a
 // new adapter entry auto-enables its keyword in @mention chat regexes below.
@@ -1341,6 +1342,13 @@ ${formatted}`
                     }
                     await this._handleMonitoredMessage(event);
                     await this._handleDelayAlertMessage(event);
+
+                    // T11: Graph-ingest forwarder — fire-and-forget, never block Slack delivery
+                    if (process.env.GRAPH_INGEST_ENABLED === 'true') {
+                        graphIngest.handle(event, client).catch(err =>
+                            this.logger.debug(`graph-ingest handle failed: ${err.message}`)
+                        );
+                    }
                 } catch (err) {
                     if (err.message && (err.message.includes('no active connection') || err.message.includes('client is not ready'))) {
                         this.logger.warn(`Message handler failed (disconnected): ${err.message}`);
@@ -4528,6 +4536,11 @@ ${formatted}`
             this.logger.info(`[startup] total: ${Date.now() - t0}ms`);
         });
 
+        // T11: Start graph-ingest subsystem if enabled
+        if (process.env.GRAPH_INGEST_ENABLED === 'true') {
+            await graphIngest.start({ app: this.app, logger: this.logger });
+        }
+
         // Check for missed mentions after connection stabilizes
         setTimeout(() => this._replayMissedMentions().catch(err =>
             this.logger.error(`Failed to replay missed mentions: ${err.message}`)
@@ -4575,6 +4588,11 @@ ${formatted}`
 
         if (this.db) {
             this.db.close();
+        }
+
+        // T11: Stop graph-ingest subsystem
+        if (process.env.GRAPH_INGEST_ENABLED === 'true') {
+            await graphIngest.stop();
         }
 
         await this.app.stop();
