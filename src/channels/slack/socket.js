@@ -18,6 +18,40 @@ const DelayAlertMonitor = require('./delay-alert-monitor');
 const { runDailySummary, parseChannelsConfig } = require('../../services/daily-summary');
 const { getCliAdapter, adapterNames } = require('../../cli');
 const graphIngest = require('../../graph-ingest');
+const { buildContext, handleCommand: graphHandleCommand } = require('../../graph-context');
+const { GraphContextConfig } = require('../../graph-context/config');
+const { AskerLookup } = require('../../graph-context/asker');
+
+// Load graph-context config once at startup (non-fatal if file missing)
+let _graphCfg = null;
+function _getGraphCfg() {
+    if (_graphCfg) return _graphCfg;
+    try {
+        const cfgPath = process.env.GRAPH_CONTEXT_CONFIG
+            || path.join(__dirname, '../../../config/graph-context.yaml');
+        _graphCfg = GraphContextConfig.load(cfgPath);
+    } catch (err) {
+        // Config file missing or malformed — treat as disabled
+        _graphCfg = new GraphContextConfig({});
+    }
+    return _graphCfg;
+}
+
+// Singleton asker lookup (5-min TTL cache shared across all handlers)
+let _askerLookup = null;
+function _getAskerLookup() {
+    if (!_askerLookup) _askerLookup = new AskerLookup({});
+    return _askerLookup;
+}
+
+/**
+ * Build a Slack archive URL from team, channel, and thread timestamp.
+ * Used as the graph resolve seed.
+ */
+function _buildSlackArchiveUrl(team, channel, ts) {
+    const tsNum = String(ts).replace('.', '');
+    return `https://slack.com/archives/${channel}/p${tsNum}`;
+}
 
 // Alternation like "claude|codex" derived from registered adapters, so adding a
 // new adapter entry auto-enables its keyword in @mention chat regexes below.
@@ -1340,6 +1374,19 @@ ${formatted}`
                             return;
                         }
                     }
+                    // DM slash commands (/whygraph, /search) in message events
+                    if (event.channel_type === 'im' && event.text?.startsWith('/') && !event.bot_id) {
+                        try {
+                            const reply = await graphHandleCommand({
+                                text: event.text, channel: event.channel, user: event.user,
+                            });
+                            await this.app.client.chat.postMessage({ channel: event.channel, text: reply });
+                        } catch (err) {
+                            this.logger.warn(`graph DM command (message event) failed: ${err.message}`);
+                        }
+                        return;
+                    }
+
                     await this._handleMonitoredMessage(event);
                     await this._handleDelayAlertMessage(event);
 
@@ -1574,6 +1621,18 @@ ${formatted}`
 
         let text = rawText.replace(/<@[A-Z0-9]+>/g, '').trim();
 
+        // DM slash commands: route /whygraph and /search before any other handling
+        if (event.channel_type === 'im' && text.startsWith('/')) {
+            try {
+                const reply = await graphHandleCommand({ text, channel: channelId, user: userId });
+                await this.app.client.chat.postMessage({ channel: channelId, text: reply, thread_ts: threadTs });
+            } catch (err) {
+                this.logger.warn(`graph DM command failed: ${err.message}`);
+                await say({ text: `Graph command error: ${err.message}`, thread_ts: threadTs });
+            }
+            return;
+        }
+
         // Download any attached images and append file paths to the message
         const imagePaths = await this._downloadSlackImages(event.files, `slack-${channelId}-${threadTs.replace('.', '')}`);
         if (imagePaths.length > 0) {
@@ -1595,7 +1654,34 @@ ${formatted}`
             if (promoted) return;
         }
 
-        await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId);
+        // Graph context injection — only when GRAPH_CONTEXT_ENABLED and channel not denied
+        let graphSystemBlock = '';
+        if (process.env.GRAPH_CONTEXT_ENABLED === 'true') {
+            try {
+                const channelCfg = _getGraphCfg().forChannel(channelId);
+                if (channelCfg.enabled) {
+                    const threadUrl = _buildSlackArchiveUrl(event.team, channelId, threadTs);
+                    const askerEEID = await _getAskerLookup().eeidForSlackUid(userId);
+                    graphSystemBlock = await buildContext({
+                        enabled: true,
+                        seeds: [threadUrl],
+                        query: text,
+                        askerEEID,
+                        depth: channelCfg.depth,
+                        budget_tokens: channelCfg.budget_tokens,
+                        timeoutMs: channelCfg.timeout_ms,
+                    });
+                    if (graphSystemBlock) {
+                        this.logger.info(`Graph context injected for channel=${channelId} thread=${threadTs} (${graphSystemBlock.length} chars)`);
+                    }
+                }
+            } catch (err) {
+                this.logger.warn(`graph context injection failed: ${err.message}`);
+                graphSystemBlock = '';
+            }
+        }
+
+        await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId, null, graphSystemBlock);
     }
 
     /**
@@ -1665,7 +1751,7 @@ ${formatted}`
 
     // ─── Command Processing ──────────────────────────────────────────
 
-    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliHint = null) {
+    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliHint = null, graphSystemBlock = '') {
         // Create a say function if one wasn't provided (e.g. alert triggers)
         if (!say) {
             say = async (msg) => {
@@ -2087,6 +2173,14 @@ ${formatted}`
                         fullCommand = `${askGuidance}${fullCommand}`;
                     }
                 }
+            }
+
+            // Prepend graph system block when provided. Only on fresh CLI boots
+            // to avoid re-injecting graph context on every turn of a live session
+            // (the graph context is already in the model's conversation history).
+            if (graphSystemBlock && isFreshCliBoot) {
+                fullCommand = `${graphSystemBlock}\n\n---\n\n${fullCommand}`;
+                this.logger.info(`Graph system block prepended (${graphSystemBlock.length} chars) for session ${session.sessionName}`);
             }
 
             // Inject the command into the tmux session.
