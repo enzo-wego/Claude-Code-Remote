@@ -277,6 +277,57 @@ node claude-remote.js config                    # Interactive config manager
 - **Session isolation** — Each thread gets its own tmux session
 - **Auto-cleanup** — Sessions older than 7 days are automatically removed
 
+## Graph Ingest — Slack Forwarder
+
+EnzoBot can forward Slack messages to [agent-mem](https://github.com/agent-mem)'s knowledge graph
+so it can answer questions like "what's the TRY currency issue?" by walking links between
+Slack threads, Jira tickets, PRs, and PagerDuty incidents.
+
+### Feature flag
+
+The forwarder is **fully disabled by default**. Set `GRAPH_INGEST_ENABLED=true` to enable it.
+When the flag is off the bot behaves byte-for-byte as before.
+
+### Environment variables
+
+```
+GRAPH_INGEST_ENABLED=true                       # feature flag (default: off)
+AGENT_MEM_GRAPH_URL=http://localhost:34567       # agent-mem base URL
+AGENT_MEM_API_KEY=<your-key>                    # Bearer token for agent-mem
+GRAPH_INGEST_BUFFER_PATH=~/.enzobot/graph-buffer  # NDJSON buffer directory
+GRAPH_INGEST_RETRY_INTERVAL_MS=30000            # retry loop interval (default: 30s)
+GRAPH_INGEST_CACHE_PATH=~/.enzobot/cache/slack-names.json
+ENZOBOT_USER_ID=<your-bot-user-id>              # used to filter the bot's own messages
+```
+
+### Adding a channel
+
+Edit `config/graph-ingest.yaml` and add the Slack channel ID to `slack.allowed_channels`:
+
+```yaml
+slack:
+  allowed_channels:
+    - C08S954G2LX   # payments-incidents
+    - C05RNSE8TBR   # payments-cko
+    - CUV9EAYGY     # payments-eng
+    - C0597404MS6   # payments-pr-review
+    - CNEWCHANNEL   # add new channels here
+```
+
+The bot must be a member of the channel to receive events.
+
+### Architecture
+
+- `src/graph-ingest/handler.js` — entry point, < 5 ms hot path (filter + buffer)
+- `src/graph-ingest/filter.js` — channel allowlist, subtype skip, bot-self filter
+- `src/graph-ingest/normalizer.js` — Slack mrkdwn → plain text (mirrors agent-mem rules)
+- `src/graph-ingest/cache.js` — user-id → display_name, bootstrapped from `users.list`
+- `src/graph-ingest/buffer.js` — NDJSON append-only file, fsync per line, drain loop
+- `src/graph-ingest/forwarder.js` — HTTP POST to agent-mem with 2 s timeout
+
+Messages are buffered to disk first, then forwarded asynchronously. If agent-mem is
+unreachable, no Slack events are lost — they replay on the next 30-second drain cycle.
+
 ## License
 
 MIT License
