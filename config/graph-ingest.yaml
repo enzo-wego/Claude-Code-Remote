@@ -1,0 +1,12 @@
+slack:
+  allowed_channels:
+    - C08S954G2LX   # payments-incidents
+    - C05RNSE8TBR   # payments-cko
+    - CUV9EAYGY     # payments-eng
+    - C0597404MS6   # payments-pr-review
+    # add channels here as the bot is invited
+
+  skip_subtypes:
+    - channel_join
+    - channel_leave
+    - message_replied
