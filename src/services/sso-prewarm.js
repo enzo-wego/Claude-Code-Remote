@@ -29,10 +29,27 @@ const RETRY_AFTER_FAILURE_MS = 30000;
 // that point would leave the operator tapping a dead link. Aligns with the
 // /admin/reseed reuse window in get-credentials-lib.sh.
 const REDM_AFTER_MS = 11 * 60 * 1000;
-// Preemptive re-seed times. Bot host is UTC; these are 08:00 + 20:00 GMT+7
-// (= 01:00 + 13:00 UTC). Hits both natural hinge points of the day — morning
-// startup and pre-sleep — so the role-cred TTL never expires mid-workday.
-const SCHEDULED_RESEED_UTC_HOURS = [1, 13];
+// Preemptive re-seed cadence is dynamic: schedule the next re-seed
+// MIN_HOURS_BEFORE_RESEED hours after the SSO token's last mtime (= last
+// successful `aws sso login`). Wego's permission-set role-cred TTL is 12h,
+// so 10h gives a 2h buffer before the failure surface. Tracks the user's
+// actual session instead of pinning to fixed clock hours (which can leave
+// blind spots when expiry falls between slots).
+const MIN_HOURS_BEFORE_RESEED = 10;
+// Skip the scheduled DM when its firing would land between 22:00 and 07:00
+// GMT+7 — the operator is asleep, the URL expires before they wake up, and
+// the age-out path would otherwise hammer them with a fresh DM every ~12min
+// until they tap one. The reactive ⚠️ DM handles expiries that fall in this
+// window when the operator is back online.
+const QUIET_HOUR_START_GMT7 = 22;
+const QUIET_HOUR_END_GMT7 = 7;
+// Restored pending approvals older than this have an expired AWS device-code
+// URL (10min TTL + small margin). Auto re-fire /admin/reseed instead of
+// re-using a dead URL.
+const PENDING_STALE_MS = 12 * 60 * 1000;
+// Fallback reschedule delay when /admin/reseed/status fails or the bot
+// just sent a scheduled DM but couldn't capture a baseline.
+const RESCHEDULE_ON_ERROR_MS = 30 * 60 * 1000;
 const ADMIN_RESEED_TIMEOUT_MS = 15000;
 // Fast-poll cadence after a failure DM: hammer /credentials every 10s so the
 // operator gets a ✅ recovery DM within ~10s of tapping the URL instead of
@@ -42,8 +59,13 @@ const FAST_POLL_MAX_MS = 11 * 60 * 1000;
 
 const http = require('http');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 const { URL } = require('url');
 const Logger = require('../core/logger');
+
+// Pending-approval state file (survives bot restarts).
+const STATE_FILE = path.join(__dirname, '..', 'data', 'sso-prewarm-state.json');
 
 class SsoPrewarm {
     constructor({ url, profiles, intervalMs, timeoutMs, slackClient, ownerUserId }) {
@@ -96,7 +118,16 @@ class SsoPrewarm {
         setTimeout(() => { this._tick().catch(() => {}); }, 5000);
         this._timer = setInterval(() => { this._tick().catch(() => {}); }, this.intervalMs);
         if (this._timer.unref) this._timer.unref();
-        this._scheduleNextReseed();
+        // Restore any pending approval poll left over from a previous process
+        // first; if nothing restored, schedule the next re-seed normally.
+        this._bootSchedule().catch((err) => {
+            this.logger.error(`Boot schedule failed: ${err.message}`);
+        });
+    }
+
+    async _bootSchedule() {
+        const restored = await this._restorePendingApproval();
+        if (!restored) await this._scheduleNextReseed();
     }
 
     stop() {
@@ -193,6 +224,10 @@ class SsoPrewarm {
             this.logger.debug(`SSO pre-warm OK: ${profile} (${duration}ms)`);
             if (wasNotified) {
                 await this._notifyOwnerRecovered(profile, prevFailures);
+                // Reactive recovery advanced the SSO mtime. Recompute the
+                // schedule so the next preemptive DM fires from the new
+                // approval; otherwise we'd stay unscheduled until restart.
+                this._scheduleNextReseed().catch(() => {});
             }
         } catch (err) {
             const duration = Date.now() - started;
@@ -343,32 +378,60 @@ class SsoPrewarm {
         });
     }
 
-    _scheduleNextReseed() {
-        if (this._scheduledTimer) return;
-        const now = new Date();
-        // Walk forward through today's and tomorrow's slots, pick the soonest future one.
-        let next = null;
-        for (let dayOffset = 0; dayOffset <= 1 && !next; dayOffset++) {
-            for (const hourUtc of SCHEDULED_RESEED_UTC_HOURS) {
-                const candidate = new Date(Date.UTC(
-                    now.getUTCFullYear(),
-                    now.getUTCMonth(),
-                    now.getUTCDate() + dayOffset,
-                    hourUtc, 0, 0
-                ));
-                if (candidate > now && (!next || candidate < next)) next = candidate;
-            }
+    async _scheduleNextReseed() {
+        // Always recompute from scratch — callers fire this after any event
+        // that advances sso_token_mtime (scheduled approval, reactive
+        // recovery, boot). Clear any stale timer so we don't double-schedule.
+        if (this._scheduledTimer) {
+            clearTimeout(this._scheduledTimer);
+            this._scheduledTimer = null;
         }
-        const delayMs = next - now;
+        const now = new Date();
+        let lastMtimeMs = null;
+        try {
+            const status = await this._callReseedStatus();
+            if (status && Number.isFinite(status.sso_token_mtime) && status.sso_token_mtime > 0) {
+                lastMtimeMs = status.sso_token_mtime * 1000;
+            }
+        } catch (err) {
+            this.logger.warn(`/admin/reseed/status unavailable: ${err.message}`);
+        }
+        let nextAt;
+        if (lastMtimeMs) {
+            nextAt = new Date(lastMtimeMs + MIN_HOURS_BEFORE_RESEED * 3600 * 1000);
+            // Already overdue (session is > MIN_HOURS_BEFORE_RESEED old).
+            // Fire in 60s rather than immediately to give the rest of boot a
+            // moment to settle.
+            if (nextAt <= now) nextAt = new Date(now.getTime() + 60 * 1000);
+        } else {
+            // Fallback when mtime is unreadable.
+            nextAt = new Date(now.getTime() + MIN_HOURS_BEFORE_RESEED * 3600 * 1000);
+        }
+        // Skip if the firing would land in quiet hours (22:00–07:00 GMT+7).
+        // DMing while the operator is asleep wouldn't get acted on before
+        // the URL expires, and would just trigger a re-DM storm on each
+        // 11min age-out. The reactive ⚠️ flow catches the actual session
+        // expiry whenever the operator is back online, so silent skip is
+        // strictly better here.
+        const gmtPlus7Hour = (nextAt.getUTCHours() + 7) % 24;
+        if (gmtPlus7Hour >= QUIET_HOUR_START_GMT7 || gmtPlus7Hour < QUIET_HOUR_END_GMT7) {
+            this.logger.info(
+                `Skipping scheduled re-seed at ${nextAt.toISOString()} ` +
+                `(${String(gmtPlus7Hour).padStart(2, '0')}:00 GMT+7 is quiet hours). ` +
+                `Reactive failure DM will catch the expiry.`
+            );
+            return;
+        }
+        const delayMs = nextAt - now;
         this._scheduledTimer = setTimeout(() => {
             this._scheduledTimer = null;
-            this._runScheduledReseed().catch(() => {});
-            this._scheduleNextReseed();
+            this._runScheduledReseed().catch((err) => {
+                this.logger.error(`Scheduled re-seed run failed: ${err.message}`);
+            });
         }, delayMs);
         if (this._scheduledTimer.unref) this._scheduledTimer.unref();
-        const gmtPlus7Hour = (next.getUTCHours() + 7) % 24;
         this.logger.info(
-            `Next scheduled re-seed: ${next.toISOString()} ` +
+            `Next scheduled re-seed: ${nextAt.toISOString()} ` +
             `(${Math.round(delayMs / 60000)}min away; ${String(gmtPlus7Hour).padStart(2, '0')}:00 GMT+7)`
         );
     }
@@ -380,12 +443,36 @@ class SsoPrewarm {
             reseed = await this._callAdminReseed();
         } catch (err) {
             this.logger.error(`Scheduled re-seed: /admin/reseed failed: ${err.message}`);
+            this._rescheduleSoon();
             return;
         }
         if (!reseed || !reseed.verification_url) {
             this.logger.warn(`Scheduled re-seed: no URL returned (${JSON.stringify(reseed)})`);
+            this._rescheduleSoon();
             return;
         }
+        await this._sendScheduledDm(reseed);
+        // Capture the SSO token's expiresAt now so a poller can detect when
+        // the user actually approves (expiresAt advances). The existing
+        // fast-poll path doesn't help here — /credentials stays 200 the
+        // whole time when the session is healthy, so success alone isn't a
+        // usable signal for "approval landed."
+        const baseline = await this._callReseedStatus().catch(() => null);
+        if (baseline && baseline.sso_token_expires_at) {
+            this._savePending({
+                dmTs: Date.now(),
+                baselineExpiresAt: baseline.sso_token_expires_at,
+                verificationUrl: reseed.verification_url,
+                userCode: reseed.user_code,
+            });
+            this._pollScheduledApproval(baseline.sso_token_expires_at);
+        } else {
+            this.logger.warn('Scheduled re-seed: no baseline expiresAt, skipping approval poll');
+            this._rescheduleSoon();
+        }
+    }
+
+    async _sendScheduledDm(reseed) {
         const mins = Math.max(1, Math.round((reseed.expires_in || 600) / 60));
         // Pick an icon by the GMT+7 hour so it actually reads right ("morning"
         // for 8am, "evening" for 8pm). Bot host is UTC so we add 7.
@@ -405,20 +492,17 @@ class SsoPrewarm {
                 unfurl_links: false,
             });
             this.logger.info(`Scheduled re-seed DM sent (reused=${!!reseed.reused})`);
-            // Capture the SSO token's expiresAt now so a poller can detect
-            // when the user actually approves (expiresAt advances). The
-            // existing fast-poll path doesn't help here — /credentials stays
-            // 200 the whole time when the session is healthy, so success
-            // alone isn't a usable signal for "approval landed."
-            const baseline = await this._callReseedStatus().catch(() => null);
-            if (baseline && baseline.sso_token_expires_at) {
-                this._pollScheduledApproval(baseline.sso_token_expires_at);
-            } else {
-                this.logger.warn('Scheduled re-seed: no baseline expiresAt, skipping approval poll');
-            }
         } catch (err) {
             this.logger.error(`Failed to DM owner about scheduled re-seed: ${err.message}`);
         }
+    }
+
+    // Fallback when /admin/reseed or the baseline lookup fails: try again in
+    // 30min rather than waiting another full N-hour cycle.
+    _rescheduleSoon() {
+        setTimeout(() => {
+            this._scheduleNextReseed().catch(() => {});
+        }, RESCHEDULE_ON_ERROR_MS).unref?.();
     }
 
     _callReseedStatus() {
@@ -454,7 +538,11 @@ class SsoPrewarm {
             if ((Date.now() - startedAt) > FAST_POLL_MAX_MS) {
                 clearInterval(this._scheduledApprovalTimer);
                 this._scheduledApprovalTimer = null;
+                this._clearPending();
                 this.logger.debug('Scheduled approval poll: aged out without approval');
+                // Reschedule from current mtime so we try again before the
+                // 12h role-cred TTL bites.
+                this._scheduleNextReseed().catch(() => {});
                 return;
             }
             let status;
@@ -464,10 +552,92 @@ class SsoPrewarm {
                 && status.sso_token_expires_at !== baselineExpiresAt) {
                 clearInterval(this._scheduledApprovalTimer);
                 this._scheduledApprovalTimer = null;
+                this._clearPending();
                 await this._notifyScheduledApproved(status.sso_token_expires_at);
+                // Approval landed → schedule next at new_mtime + 10h.
+                this._scheduleNextReseed().catch(() => {});
             }
         }, FAST_POLL_INTERVAL_MS);
         if (this._scheduledApprovalTimer.unref) this._scheduledApprovalTimer.unref();
+    }
+
+    // ---- Pending-approval persistence (survives bot restarts) ----
+
+    _savePending(state) {
+        try {
+            fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+            fs.writeFileSync(STATE_FILE, JSON.stringify({ pendingApproval: state }, null, 2));
+        } catch (err) {
+            this.logger.warn(`Failed to persist pending approval state: ${err.message}`);
+        }
+    }
+
+    _clearPending() {
+        try {
+            if (fs.existsSync(STATE_FILE)) fs.unlinkSync(STATE_FILE);
+        } catch (err) {
+            this.logger.warn(`Failed to clear pending approval state: ${err.message}`);
+        }
+    }
+
+    _loadPending() {
+        try {
+            if (!fs.existsSync(STATE_FILE)) return null;
+            const raw = fs.readFileSync(STATE_FILE, 'utf8');
+            const obj = JSON.parse(raw);
+            return obj && obj.pendingApproval ? obj.pendingApproval : null;
+        } catch (err) {
+            this.logger.warn(`Failed to load pending approval state: ${err.message}`);
+            return null;
+        }
+    }
+
+    // Returns true if a poll was resumed/re-issued (caller should NOT also
+    // call _scheduleNextReseed — the poll completion will reschedule).
+    async _restorePendingApproval() {
+        const pending = this._loadPending();
+        if (!pending) return false;
+        const age = Date.now() - (pending.dmTs || 0);
+        if (age <= PENDING_STALE_MS) {
+            this.logger.info(
+                `Resuming pending approval poll (DM age ${Math.round(age / 60000)}min` +
+                `${pending.userCode ? `, code=${pending.userCode}` : ''})`
+            );
+            this._pollScheduledApproval(pending.baselineExpiresAt);
+            return true;
+        }
+        // URL has expired AWS-side. Re-fire /admin/reseed and DM the user
+        // with a fresh URL. This covers the case where the bot or sso_server
+        // container was restarted mid-flight, killing the original
+        // `aws sso login` child before the user could approve.
+        this.logger.info(
+            `Restored pending approval is stale (${Math.round(age / 60000)}min old) — re-issuing /admin/reseed`
+        );
+        this._clearPending();
+        let reseed;
+        try {
+            reseed = await this._callAdminReseed();
+        } catch (err) {
+            this.logger.error(`Restore re-issue: /admin/reseed failed: ${err.message}`);
+            return false;
+        }
+        if (!reseed || !reseed.verification_url) {
+            this.logger.warn(`Restore re-issue: no URL returned (${JSON.stringify(reseed)})`);
+            return false;
+        }
+        await this._sendScheduledDm(reseed);
+        const baseline = await this._callReseedStatus().catch(() => null);
+        if (baseline && baseline.sso_token_expires_at) {
+            this._savePending({
+                dmTs: Date.now(),
+                baselineExpiresAt: baseline.sso_token_expires_at,
+                verificationUrl: reseed.verification_url,
+                userCode: reseed.user_code,
+            });
+            this._pollScheduledApproval(baseline.sso_token_expires_at);
+            return true;
+        }
+        return false;
     }
 
     async _notifyScheduledApproved(newExpiresAt) {
@@ -475,7 +645,7 @@ class SsoPrewarm {
         const text = [
             ':white_check_mark: *SSO session extended*',
             `_New SSO token valid until ${newExpiresAt}._`,
-            '_Next scheduled DM at 08:00 or 20:00 GMT+7._',
+            `_Next scheduled DM in ~${MIN_HOURS_BEFORE_RESEED}h._`,
         ].join('\n');
         try {
             await this.slackClient.chat.postMessage({
