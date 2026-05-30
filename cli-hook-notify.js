@@ -597,7 +597,7 @@ async function sendHookNotification() {
     }
 
     // ─── SessionStart: register session_id in DB ─────────────────────
-    // (Claude-only — Codex's notify hook doesn't have a session_start equivalent.)
+    // (Claude/Gemini — Codex's notify hook doesn't have a session_start equivalent.)
     if (notificationType === 'session_start') {
         const sessionId = hookInput.session_id;
         if (!sessionId || !slackSessionKey) {
@@ -611,8 +611,16 @@ async function sendHookNotification() {
             if (fs.existsSync(dbPath)) {
                 const db = new Database(dbPath);
                 db.pragma('journal_mode = WAL');
+                // Overwrite unconditionally (NOT COALESCE): in a CLI fallback
+                // chain (e.g. gemini -> codex -> claude), the earlier CLI's
+                // SessionStart already stamped its own session_id here. COALESCE
+                // would keep that stale id, so when the CLI that actually runs
+                // (claude) finishes, its real Stop session_id wouldn't match the
+                // stored "root" and the alert-post path would wrongly treat the
+                // final report as an internal subagent turn and skip it. The
+                // latest SessionStart is the live session, so it must win.
                 const result = db.prepare(
-                    'UPDATE sessions SET claude_session_id = COALESCE(claude_session_id, ?), updated_at = ? WHERE session_key = ?'
+                    'UPDATE sessions SET claude_session_id = ?, updated_at = ? WHERE session_key = ?'
                 ).run(sessionId, Date.now(), slackSessionKey);
                 db.close();
                 console.error(`SessionStart: mapped session_id=${sessionId} to key=${slackSessionKey} (rows=${result.changes})`);

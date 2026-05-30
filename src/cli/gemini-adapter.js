@@ -136,6 +136,15 @@ module.exports = {
 
     readinessTimeoutMs: 60000,
 
+    // gemini-cli paints `Type your message or @` very early in the ink/React
+    // mount — the placeholder shows up before the prompt-submit handler is
+    // wired. Pasting + Enter within that window gets eaten by a still-mounting
+    // component, so the bot's Enter-confirmation loop runs out of attempts and
+    // throws `did not accept Enter` (see _injectCommand in
+    // src/channels/slack/socket.js). 8s of grace covers the React-mount window
+    // observed on this VPS without slowing the common path materially.
+    postReadyGraceMs: 8000,
+
     // TUI ready when the input-box placeholder is rendered. Stable substring
     // across versions — the footer also shows "Auto (Gemini 3)" but that text
     // moves around, while the placeholder is anchored to the input row.

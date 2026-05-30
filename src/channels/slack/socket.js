@@ -1998,6 +1998,16 @@ ${formatted}`
                     cliType: resolvedCliType
                 };
                 this._saveSession(session);
+                // Alert sessions: stash the still-untried chain + the bare
+                // user prompt on the in-memory session so the response poller
+                // can run a runtime-fallback path when the resolved CLI hangs
+                // mid-investigation (e.g. Gemini API geo-blocked even though
+                // its TUI rendered the ready placeholder). Not persisted to
+                // DB — restart-safe enough via the queue's existing requeue.
+                if (alertMessageTs) {
+                    session.injectChain = injectChain;
+                    session.alertPrompt = command;
+                }
                 isFreshCliBoot = true;
                 if (userId) this._updateLastUserId(`${channelId}-${threadTs}`, userId);
 
@@ -2150,6 +2160,12 @@ ${formatted}`
                     }
                     session.cliType = retryResult.cliType;
                     injectChain = retryResult.remainingChain || [retryResult.cliType];
+                    // Keep session.injectChain in sync with the latest chain so
+                    // the response poller's runtime-fallback path sees the
+                    // correct "still-untried" CLIs after this inject recovery.
+                    if (session.alertMessageTs) {
+                        session.injectChain = injectChain;
+                    }
                     // Loop continues with the new CLI.
                 }
             }
@@ -2779,6 +2795,14 @@ ${formatted}`
                     ? `wall ceiling ${Math.round(wallMs / 60000)}min`
                     : `idle ${Math.round(idleMs / 60000)}min`;
                 this.logger.warn(`Poller timeout (${reason}) for ${sessionName} (alert=${isAlertSession}, everSawWorking=${everSawWorking})`);
+                // LAYER 6 — runtime fallback (set inside the alert branch
+                // below). Populated when the CLI's TUI looked ready and the
+                // spinner ran, but the hook never produced a valid report
+                // before the idle/wall window expired AND the alert chain has
+                // more CLIs left to try. Consumed after the existing tmux
+                // kill, before the reaction swap / queue completion — so the
+                // recursive _processCommand call gets a clean slate.
+                let runtimeFallbackContext = null;
                 try {
                     if (!everSawWorking) {
                         // LAYER 3 — silent-drop. Polled the full idle window and the
@@ -2790,16 +2814,50 @@ ${formatted}`
                             thread_ts: threadTs,
                         });
                     } else if (isAlertSession) {
-                        // Worked but never finished — long-running step exceeded the
-                        // idle window (Gemini-style). Don't retry on the same CLI;
-                        // surface a manual-triage notice. _completeQueueItem below
-                        // gets silent=false so the requeue path skips this item.
-                        await say({
-                            text: `:hourglass: Investigation did not complete (${reason}) — manual triage required.`,
-                            thread_ts: threadTs,
-                        });
-                        if (alertBuffer) {
-                            this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on idle timeout for ${sessionName}`);
+                        // Worked but never finished. Catches failure modes the
+                        // startup fatalErrorPatterns check can't see — e.g.
+                        // Gemini API geo-blocked after isReady matched,
+                        // mid-session quota exhaustion, an infinite tool-retry
+                        // loop. Skipped when a report was already posted
+                        // (lastBotTs set) — those are post-success idles.
+                        const fresh = sessionKey ? this._getSession(sessionKey) : null;
+                        const reportPosted = fresh?.lastBotTs ?? session.lastBotTs ?? null;
+                        const chain = Array.isArray(session.injectChain) ? session.injectChain : [];
+                        const nextCli = (!reportPosted && chain.length > 1 && session.alertPrompt) ? chain[1] : null;
+                        if (nextCli) {
+                            runtimeFallbackContext = {
+                                channelId: session.channelId,
+                                alertMessageTs: session.alertMessageTs,
+                                prompt: session.alertPrompt,
+                                remainingChain: chain.slice(1),
+                                failedCli: session.cliType || 'cli',
+                                nextCli,
+                            };
+                            await say({
+                                text: `:repeat: \`${runtimeFallbackContext.failedCli}\` ran ${reason} without producing a report — restarting investigation with \`${nextCli}\`...`,
+                                thread_ts: threadTs,
+                            });
+                            if (alertBuffer) {
+                                this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on runtime fallback for ${sessionName}`);
+                            }
+                        } else if (!reportPosted) {
+                            await say({
+                                text: `:hourglass: Investigation did not complete (${reason}) — manual triage required.`,
+                                thread_ts: threadTs,
+                            });
+                            if (alertBuffer) {
+                                this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on idle timeout for ${sessionName}`);
+                            }
+                        } else {
+                            // Post-success idle: the report already posted (lastBotTs set)
+                            // and the CLI just sat idle afterwards until the window
+                            // expired. The investigation completed — tearing down here is
+                            // expected, so stay silent rather than posting a misleading
+                            // "did not complete" triage notice on a finished alert.
+                            this.logger.info(`Post-success idle for ${sessionName} (${reason}, report already posted at last_bot_ts=${reportPosted}) — no triage notice`);
+                            if (alertBuffer) {
+                                this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on post-success idle for ${sessionName}`);
+                            }
                         }
                     } else if (alertBuffer) {
                         this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on idle timeout for ${sessionName}`);
@@ -2814,6 +2872,23 @@ ${formatted}`
                     execSync(`tmux kill-session -t ${sessionName} 2>/dev/null`);
                     this.logger.info(`Killed tmux session ${sessionName} after poller timeout`);
                 } catch (_) { /* already dead */ }
+                // Runtime fallback (LAYER 6): if the alert branch above flagged
+                // that the chain has more CLIs to try, delete the dead session
+                // row and re-trigger _processCommand on the same alert with the
+                // remaining chain. Reactions stay (👀 on the PD message), the
+                // queue row stays 'processing' — the recursive run re-arms
+                // everything when its inject lands, or swaps 👀→❌ via its own
+                // start-failure path if every remaining CLI also fails to boot.
+                if (runtimeFallbackContext) {
+                    if (sessionKey) {
+                        this._clearSessionTimeout(sessionKey);
+                        this._deleteSession(sessionKey);
+                    }
+                    const ctx = runtimeFallbackContext;
+                    this._processCommand(ctx.channelId, threadTs, ctx.prompt, null, ctx.alertMessageTs, ctx.alertMessageTs, null, ctx.remainingChain)
+                        .catch(err => this.logger.error(`Runtime fallback to ${ctx.nextCli} failed to launch: ${err.message}`));
+                    return;
+                }
                 if (sessionKey) {
                     this._clearSessionTimeout(sessionKey);
                     const sess = this._getSession(sessionKey);
@@ -3150,7 +3225,14 @@ ${formatted}`
             let dead = 0;
             for (const s of sessions) {
                 if (this._isTmuxSessionAlive(s.sessionName)) {
-                    if (!this.sessionTimers.has(s.sessionKey)) {
+                    // A live alert poller already owns this session's lifecycle
+                    // (idle/wall-ceiling timeouts + teardown). Arming a second,
+                    // independent inactivity timer here races the poller: anchored
+                    // to a NULL last_bot_ts it counts a flat 30min from sweep time
+                    // and ignores poller working-activity, so it can tear an active
+                    // investigation down seconds after the agent finally finishes.
+                    // Only adopt sessions that are genuinely unmanaged.
+                    if (!this.sessionTimers.has(s.sessionKey) && !this.pollers.has(s.sessionName)) {
                         this._startSessionTimeout(s.sessionKey);
                         orphaned++;
                         this.logger.info(`Sweep: started timeout for orphaned session ${s.sessionName}`);
