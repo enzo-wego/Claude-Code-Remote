@@ -64,6 +64,9 @@ const config = {
     alertCliChain: parseCliChain(process.env.ALERT_CLI),
     sessionInactivityTimeoutMs: parseInt(process.env.SESSION_INACTIVITY_TIMEOUT_MS) || 300000,
     pollerTimeoutMs: parseInt(process.env.POLLER_TIMEOUT_MS) || 1800000, // 30 min
+    // @mention reply watchdog: how long after injecting a command we post a
+    // single "still working" ping if the Stop hook hasn't delivered a reply yet.
+    inflightHeartbeatMs: parseInt(process.env.INFLIGHT_HEARTBEAT_MS) || 300000, // 5 min
     alertMaxConcurrent: parseInt(process.env.ALERT_MAX_CONCURRENT) || 1,
     pagerdutyApiToken: process.env.PAGERDUTY_API_TOKEN || '',
     pagerdutyFromEmail: process.env.PAGERDUTY_FROM_EMAIL || '',
@@ -210,6 +213,7 @@ async function start() {
     logger.info(`- Alert Max Concurrent: ${config.alertMaxConcurrent}`);
     logger.info(`- PagerDuty: ${config.pagerdutyApiToken ? 'Configured' : 'Not configured'}`);
     logger.info(`- Session Inactivity Timeout: ${config.sessionInactivityTimeoutMs}ms`);
+    logger.info(`- Inflight Heartbeat: ${config.inflightHeartbeatMs}ms`);
     logger.info(`- Poller Timeout: ${config.pollerTimeoutMs}ms`);
     logger.info(`- Delay Monitor Channels: ${config.monitorDelayChannels || 'None'}`);
     logger.info(`- Delay Alert Skill: ${config.delayAlertSkill}`);

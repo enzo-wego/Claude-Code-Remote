@@ -45,6 +45,12 @@ class SlackSocketHandler {
         // Polling state per session (in-memory only, rebuilt on start)
         this.pollers = new Map();
         this.sessionTimers = new Map(); // sessionKey -> setTimeout handle
+        // sessionKey -> { heartbeat, giveup } timers. Regular @mention replies
+        // are delivered solely by cli-hook-notify.js when the CLI fires its Stop
+        // hook. If the CLI never cleanly stops (stuck in a long sub-agent, or the
+        // tmux/process is torn down first) no hook fires and the thread gets total
+        // silence. This watchdog turns that silent failure into a visible notice.
+        this._inflightWatchdogs = new Map();
         this._serializedCliLaunches = new Map(); // cliType -> Promise tail
 
         this.app = new App({
@@ -139,6 +145,14 @@ class SlackSocketHandler {
         } catch {
             // Column already exists
         }
+        try {
+            // ms epoch of the last *user* message injected. Distinct from
+            // `updated_at` (bumped by bot replies too via the Stop hook), so it's
+            // the only reliable "did the bot still owe a reply?" signal on restart.
+            this.db.prepare('ALTER TABLE sessions ADD COLUMN last_user_ts INTEGER').run();
+        } catch {
+            // Column already exists
+        }
         this.db.exec('CREATE INDEX IF NOT EXISTS idx_claude_session_id ON sessions(claude_session_id)');
 
         // Alert investigation queue — process alerts sequentially to avoid resource contention
@@ -178,7 +192,7 @@ class SlackSocketHandler {
             deleteOld: this.db.prepare('DELETE FROM sessions WHERE updated_at < ?'),
             touch: this.db.prepare('UPDATE sessions SET updated_at = ? WHERE session_key = ?'),
             updateLastBotTs: this.db.prepare('UPDATE sessions SET last_bot_ts = ?, updated_at = ? WHERE session_key = ?'),
-            updateLastUserId: this.db.prepare('UPDATE sessions SET last_user_id = ?, updated_at = ? WHERE session_key = ?'),
+            updateLastUserId: this.db.prepare('UPDATE sessions SET last_user_id = ?, last_user_ts = ?, updated_at = ? WHERE session_key = ?'),
             deleteByNameExcept: this.db.prepare('DELETE FROM sessions WHERE session_name = ? AND session_key != ?'),
             getByClaudeSessionId: this.db.prepare('SELECT * FROM sessions WHERE claude_session_id = ? LIMIT 1'),
             updateClaudeSessionId: this.db.prepare('UPDATE sessions SET claude_session_id = ?, updated_at = ? WHERE session_key = ?')
@@ -470,6 +484,32 @@ class SlackSocketHandler {
                     await this._removeReaction(s.channelId, row.alert_message_ts, 'eyes');
                     await this._addReaction(s.channelId, row.alert_message_ts, 'white_check_mark');
                     this.logger.info(`Alert session ${s.sessionName} dead — swapped reactions`);
+                } else {
+                    // Non-alert session that didn't survive the restart. A full
+                    // process/systemd restart kills the whole control group, so
+                    // any @mention task that was in-flight (user message injected,
+                    // no Stop-hook reply after it) dies silently. Tell the thread
+                    // so the user can re-send — but only if the bot genuinely still
+                    // owed a reply: the last user message (`last_user_ts`, ms) is
+                    // newer than the last bot reply (`last_bot_ts`, Slack ts). We
+                    // can't use `updated_at` here — the Stop hook bumps it on every
+                    // reply too, so it would fire even for cleanly-answered turns.
+                    const userMs = row?.last_user_ts || 0;
+                    const botMs = this._parseBotTsMs(row?.last_bot_ts) || 0;
+                    const recencyMs = Math.max(this.config.sessionInactivityTimeoutMs || 300000, 3600000);
+                    const owedReply = userMs > botMs && (Date.now() - userMs) < recencyMs;
+                    if (owedReply && row?.last_user_id) {
+                        try {
+                            await this.app.client.chat.postMessage({
+                                channel: s.channelId,
+                                thread_ts: s.threadTs,
+                                text: `<@${row.last_user_id}> :recycle: I restarted before finishing your last request and lost the in-flight task — please re-send your message to retry.`,
+                            });
+                            this.logger.info(`Restart re-send notice posted for ${s.sessionName}`);
+                        } catch (err) {
+                            this.logger.warn(`Restart re-send notice failed for ${s.sessionName}: ${err.message}`);
+                        }
+                    }
                 }
                 this._deleteSession(s.sessionKey);
                 this._clearSessionTimeout(s.sessionKey);
@@ -852,7 +892,8 @@ ${formatted}`
     }
 
     _updateLastUserId(sessionKey, userId) {
-        this._stmts.updateLastUserId.run(userId, Date.now(), sessionKey);
+        const now = Date.now();
+        this._stmts.updateLastUserId.run(userId, now, now, sessionKey);
     }
 
     // ─── Slack Event Listeners ───────────────────────────────────────
@@ -2203,6 +2244,12 @@ ${formatted}`
             if (session.alertMessageTs) {
                 this.logger.info(`Starting alert poller for ${session.sessionName} (alertMessageTs=${session.alertMessageTs})`);
                 this._pollForResponse(session, say, sessionKey);
+            } else {
+                // Regular @mention chat: the reply is posted by cli-hook-notify.js
+                // when the CLI fires its Stop hook. Arm a watchdog so a stuck/long
+                // sub-agent — or a teardown before the hook fires — surfaces a
+                // status to the thread instead of leaving it silent.
+                this._startInflightWatchdog(sessionKey);
             }
 
         } catch (error) {
@@ -3211,9 +3258,86 @@ ${formatted}`
     }
 
     _clearSessionTimeout(sessionKey) {
+        // The inflight watchdog and the idle timer share a lifecycle: both are
+        // cancelled when the user re-engages, /exits, or the session dies.
+        this._clearInflightWatchdog(sessionKey);
         if (this.sessionTimers.has(sessionKey)) {
             clearTimeout(this.sessionTimers.get(sessionKey));
             this.sessionTimers.delete(sessionKey);
+        }
+    }
+
+    /**
+     * Watchdog for regular @mention sessions, where the reply is delivered only
+     * by the CLI's Stop hook (cli-hook-notify.js updates `last_bot_ts` when it
+     * posts). If no reply lands after injecting:
+     *   - heartbeat (default 5min): one ":hourglass: still working" ping so the
+     *     thread knows the agent is alive on a long task.
+     *   - give-up (>= 10min, anchored to the inject): a "re-send to retry" notice
+     *     — distinguishing a stuck-but-alive agent from one killed mid-task.
+     * Never kills tmux or deletes the row; cleanup stays with the idle timer,
+     * reconcile, and the orphan sweep. Both timers no-op once a reply has landed.
+     */
+    _startInflightWatchdog(sessionKey) {
+        this._clearInflightWatchdog(sessionKey);
+        const injectedAt = Date.now();
+        const heartbeatMs = this.config.inflightHeartbeatMs || 300000;
+        const giveupMs = Math.max(this.config.sessionInactivityTimeoutMs || 300000, 600000);
+
+        const repliedSinceInject = () => {
+            const s = this._getSession(sessionKey);
+            if (!s) return true; // session gone — nothing to watch
+            const botMs = this._parseBotTsMs(s.lastBotTs);
+            return !!(botMs && botMs >= injectedAt);
+        };
+
+        const heartbeat = setTimeout(async () => {
+            const s = this._getSession(sessionKey);
+            if (!s || repliedSinceInject()) return;
+            if (!this._isTmuxSessionAlive(s.sessionName)) return; // give-up handles dead sessions
+            try {
+                await this.app.client.chat.postMessage({
+                    channel: s.channelId,
+                    thread_ts: s.threadTs,
+                    text: ':hourglass_flowing_sand: Still working on it…',
+                });
+            } catch (err) {
+                this.logger.warn(`Inflight heartbeat post failed for ${s.sessionName}: ${err.message}`);
+            }
+        }, heartbeatMs);
+
+        const giveup = setTimeout(async () => {
+            // Leave a spent tombstone (don't delete) so the hourly orphan sweep
+            // keeps treating this session as watchdog-managed and won't arm a
+            // SECOND idle-timeout notice for the same stuck task. The entry is
+            // cleared on the next user message / teardown via _clearSessionTimeout.
+            const wd = this._inflightWatchdogs.get(sessionKey);
+            if (wd && wd.heartbeat) clearTimeout(wd.heartbeat);
+            this._inflightWatchdogs.set(sessionKey, { heartbeat: null, giveup: null, spent: true });
+            const s = this._getSession(sessionKey);
+            if (!s || repliedSinceInject()) return;
+            const alive = this._isTmuxSessionAlive(s.sessionName);
+            const mention = s.lastUserId ? `<@${s.lastUserId}> ` : '';
+            const minutes = Math.round(giveupMs / 60000);
+            const text = alive
+                ? `${mention}:warning: No response after ${minutes}min — the agent may be stuck. Re-send your message to retry.`
+                : `${mention}:warning: The agent was interrupted before it finished — re-send your message to retry.`;
+            try {
+                await this.app.client.chat.postMessage({ channel: s.channelId, thread_ts: s.threadTs, text });
+            } catch (err) {
+                this.logger.warn(`Inflight give-up post failed for ${s.sessionName}: ${err.message}`);
+            }
+        }, giveupMs);
+
+        this._inflightWatchdogs.set(sessionKey, { heartbeat, giveup });
+    }
+
+    _clearInflightWatchdog(sessionKey) {
+        const wd = this._inflightWatchdogs.get(sessionKey);
+        if (wd) {
+            clearTimeout(wd.heartbeat);
+            clearTimeout(wd.giveup);
+            this._inflightWatchdogs.delete(sessionKey);
         }
     }
 
@@ -3232,7 +3356,7 @@ ${formatted}`
                     // and ignores poller working-activity, so it can tear an active
                     // investigation down seconds after the agent finally finishes.
                     // Only adopt sessions that are genuinely unmanaged.
-                    if (!this.sessionTimers.has(s.sessionKey) && !this.pollers.has(s.sessionName)) {
+                    if (!this.sessionTimers.has(s.sessionKey) && !this.pollers.has(s.sessionName) && !this._inflightWatchdogs.has(s.sessionKey)) {
                         this._startSessionTimeout(s.sessionKey);
                         orphaned++;
                         this.logger.info(`Sweep: started timeout for orphaned session ${s.sessionName}`);
