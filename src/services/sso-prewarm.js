@@ -307,7 +307,16 @@ class SsoPrewarm {
             }
         }
 
-        const lines = [':warning: *SSO session expired — tap to re-seed*'];
+        // Header must match what the body actually offers: only claim
+        // "tap to re-seed" when we have a device-code URL to tap.
+        const lines = [];
+        if (reseed && reseed.verification_url) {
+            lines.push(':warning: *SSO session expired — tap to re-seed*');
+        } else if (isSsoExpiry) {
+            lines.push(':warning: *SSO session expired — auto re-seed failed*');
+        } else {
+            lines.push(':warning: *SSO pre-warm failed* (session may still be valid)');
+        }
         lines.push(`*Profile:* \`${profile}\``);
         if (reseed && reseed.verification_url) {
             lines.push(`*Approve:* <${reseed.verification_url}|${reseed.verification_url}>`);
