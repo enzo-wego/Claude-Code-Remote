@@ -2679,12 +2679,28 @@ ${formatted}`
     async _verifyTurnProgress(sessionName, cliType, baseline, sessionKey = null, injectStartedAt = null, timeoutMs = 90000) {
         const adapter = getCliAdapter(cliType);
         const fatalPatterns = adapter.fatalErrorPatterns || [];
+        const excludePatterns = adapter.workingExcludePatterns || [];
         const aboveTui = (text) => {
             const lines = (text || '').split('\n');
             return lines.slice(0, Math.max(0, lines.length - 10))
                 .join('\n')
                 .replace(/\s+/g, ' ')
                 .trim();
+        };
+        // Mirror of _injectCommand's indicatorHit: is the CLI visibly busy?
+        // A long tool-running turn (filing a ticket, auditing many endpoints)
+        // can spend >timeoutMs thinking before it commits anything to upper
+        // scrollback — the live spinner/timer sits in the bottom TUI rows that
+        // aboveTui() strips. Treating that as "silently rejected" is a false
+        // alarm: the input WAS accepted, the turn is just slow.
+        const isWorking = (text) => {
+            const filtered = (text || '')
+                .split('\n')
+                .filter(l => !excludePatterns.some(re => re.test(l)))
+                .join('\n')
+                .toLowerCase();
+            if (adapter.workingIndicators.some(ind => filtered.includes(ind))) return true;
+            return (adapter.workingRegexes || []).some(re => re.test(filtered));
         };
         const baselineUpper = aboveTui(baseline);
         const markerPath = sessionKey ? `/tmp/cli-hook-post-${sessionKey}` : null;
@@ -2721,6 +2737,17 @@ ${formatted}`
                 return;
             }
             if (Date.now() - start >= timeoutMs) {
+                // Before declaring the input lost, re-capture the pane and look
+                // for the adapter's working signal. If the CLI is actively busy
+                // (spinner verb / per-turn timer in the bottom rows), the turn
+                // is alive and just slow — hand off to the poller instead of
+                // posting a misleading "silently rejected, resend" warning that
+                // risks a duplicate command landing in the same session.
+                const freshOutput = this._captureOutput(sessionName);
+                if (isWorking(freshOutput)) {
+                    this.logger.info(`${cliType} still working after ${Math.round(timeoutMs / 1000)}s for ${sessionName} — slow turn, deferring to poller`);
+                    return;
+                }
                 throw new Error(`${cliType} accepted the paste but never produced output within ${Math.round(timeoutMs / 1000)}s — input was silently rejected (likely usage limit or dropped Enter)`);
             }
             await new Promise(r => setTimeout(r, intervalMs));
