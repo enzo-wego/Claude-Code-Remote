@@ -584,6 +584,23 @@ async function sendHookNotification() {
         process.exit(0);
     }
 
+    // ─── UserPromptSubmit: drop a "turn started" marker, never post ──
+    // Fires the instant Claude accepts a submitted prompt, before it runs.
+    // socket.js _verifyTurnProgress reads this marker as the authoritative
+    // proof that the injected paste + Enter was accepted — far stronger than
+    // scraping the TUI for a spinner. Mirror of the post-completion marker
+    // below (/tmp/cli-hook-post-<key>); keyed by SLACK_SESSION_KEY so the
+    // verifier can match it to this specific inject.
+    if (notificationType === 'prompt-submitted') {
+        try {
+            fs.writeFileSync(`/tmp/cli-hook-prompt-${slackSessionKey}`, String(Date.now()));
+            console.error(`UserPromptSubmit — wrote turn-start marker for key=${slackSessionKey}`);
+        } catch (err) {
+            console.error(`UserPromptSubmit marker write failed: ${err.message}`);
+        }
+        process.exit(0);
+    }
+
     // ─── SubagentStop: never post to Slack ──────────────────────────
     // SubagentStop fires when Claude finishes an internal sub-agent (e.g. the
     // Task tool, or the next-action / ghost-text suggester). The sub-agent's

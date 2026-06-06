@@ -239,6 +239,7 @@ module.exports = {
         settings.hooks.SessionStart = settings.hooks.SessionStart || [];
         settings.hooks.Stop = settings.hooks.Stop || [];
         settings.hooks.SubagentStop = settings.hooks.SubagentStop || [];
+        settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit || [];
 
         const script = hookScriptPath();
         const quoted = script.includes(' ') ? `"${script}"` : script;
@@ -254,6 +255,7 @@ module.exports = {
             SessionStart: `${nodeQuoted} ${quoted} session_start`,
             Stop: `${nodeQuoted} ${quoted} completed`,
             SubagentStop: `${nodeQuoted} ${quoted} waiting`,
+            UserPromptSubmit: `${nodeQuoted} ${quoted} prompt-submitted`,
         };
 
         let changed = false;
@@ -271,7 +273,7 @@ module.exports = {
         const settings = loadSettings();
         if (!settings.hooks) return { path: SETTINGS_PATH, changed: false };
         let changed = false;
-        for (const event of ['SessionStart', 'Stop', 'SubagentStop']) {
+        for (const event of ['SessionStart', 'Stop', 'SubagentStop', 'UserPromptSubmit']) {
             if (listHasOurHook(settings.hooks[event])) {
                 settings.hooks[event] = removeOurHooks(settings.hooks[event]);
                 if (!settings.hooks[event]) delete settings.hooks[event];
@@ -348,6 +350,7 @@ module.exports = {
                 SessionStart: listHasOurHook(hooks.SessionStart),
                 Stop: listHasOurHook(hooks.Stop),
                 SubagentStop: listHasOurHook(hooks.SubagentStop),
+                UserPromptSubmit: listHasOurHook(hooks.UserPromptSubmit),
             },
         };
     },

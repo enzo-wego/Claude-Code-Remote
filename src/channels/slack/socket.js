@@ -2149,6 +2149,7 @@ ${formatted}`
                     // would short-circuit on the previous marker and skip
                     // verification of THIS inject.
                     try { fs.unlinkSync(`/tmp/cli-hook-post-${sessionKey}`); } catch { /* no prior marker */ }
+                    try { fs.unlinkSync(`/tmp/cli-hook-prompt-${sessionKey}`); } catch { /* no prior marker */ }
                     const injectStartedAt = Date.now();
                     const baseline = await this._injectCommand(session.sessionName, fullCommand, session.cliType);
                     // Guard against silent rejection (Codex at usage limit, Enter
@@ -2704,6 +2705,13 @@ ${formatted}`
         };
         const baselineUpper = aboveTui(baseline);
         const markerPath = sessionKey ? `/tmp/cli-hook-post-${sessionKey}` : null;
+        // UserPromptSubmit marker: cli-hook-notify.js writes this the instant
+        // Claude accepts the submitted prompt. It's the strongest "the paste +
+        // Enter was accepted and a turn started" signal we have — event-driven,
+        // no dependence on TUI rendering — so it short-circuits the brittle
+        // scrollback/spinner heuristics entirely. Claude-only (Codex/Gemini
+        // have no submit hook), so the heuristics below remain the fallback.
+        const promptMarkerPath = sessionKey ? `/tmp/cli-hook-prompt-${sessionKey}` : null;
         const start = Date.now();
         const intervalMs = 2000;
         // Initial settle — paste retries and Enter keystrokes leave the TUI
@@ -2719,6 +2727,19 @@ ${formatted}`
             const fatal = fatalPatterns.find(p => p.regex.test(output));
             if (fatal) {
                 throw new Error(`${cliType} ${fatal.reason}`);
+            }
+            // Authoritative turn-start: the UserPromptSubmit hook dropped a
+            // marker newer than this inject's start, so Claude definitely
+            // accepted the prompt. That's exactly what this method exists to
+            // confirm — return without touching the TUI heuristics.
+            if (promptMarkerPath && injectStartedAt) {
+                try {
+                    const ts = parseInt(fs.readFileSync(promptMarkerPath, 'utf8'), 10);
+                    if (Number.isFinite(ts) && ts >= injectStartedAt) {
+                        this.logger.info(`${cliType} prompt-submit marker confirmed turn start for ${sessionName}`);
+                        return;
+                    }
+                } catch { /* no marker yet — fall through to other signals */ }
             }
             // Authoritative success: cli-hook-notify.js drops a marker file
             // when the Stop hook successfully posts the assistant message to
