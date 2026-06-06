@@ -3214,7 +3214,6 @@ ${formatted}`
             // Notify user/channel about session timeout
             try {
                 const isAlertWithUserChat = session.alertMessageTs && session.lastUserId;
-                const mention = session.lastUserId ? `<@${session.lastUserId}> ` : '';
 
                 if (session.alertMessageTs) {
                     // Alert session: swap reactions
@@ -3228,12 +3227,19 @@ ${formatted}`
                 }
 
                 if (!session.alertMessageTs || isAlertWithUserChat) {
-                    // Regular session or alert+user hybrid: send timeout notice
-                    await this.app.client.chat.postMessage({
-                        channel: session.channelId,
-                        text: `${mention}Session timed out after ${minutes}min of inactivity. Send a message to resume.`,
-                        thread_ts: session.threadTs
-                    });
+                    // Regular session or alert+user hybrid: mark the timeout quietly
+                    // with a ✅ reaction on the bot's latest reply instead of pinging
+                    // the user with a new message.
+                    if (session.lastBotTs) {
+                        await this._addReaction(session.channelId, session.lastBotTs, 'white_check_mark');
+                    } else {
+                        // No bot reply to react to — fall back to a non-mention notice.
+                        await this.app.client.chat.postMessage({
+                            channel: session.channelId,
+                            text: `Session timed out after ${minutes}min of inactivity. Send a message to resume.`,
+                            thread_ts: session.threadTs
+                        });
+                    }
                 }
             } catch (err) {
                 this.logger.warn(`Failed to send timeout notice: ${err.message}`);
