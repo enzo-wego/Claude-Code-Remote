@@ -24,12 +24,18 @@ const CLI_NAMES_ALT = adapterNames().join('|');
 const CLI_KEYWORD_RE = new RegExp(`\\bstart\\s+(${CLI_NAMES_ALT})\\b`, 'i');
 const INVESTIGATE_NOW_RE = /\binvestigate\s+(?:it\s+|this\s+)?now\b/i;
 const CLI_PREFIX_GROUP = `(?:(?:${CLI_NAMES_ALT})\\s+)?`;
-const ROOT_COMMAND_RE = new RegExp(`start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+root\\s*$`, 'i');
-const PROJECT_COMMAND_RE = new RegExp(`(?:start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+)?project\\s+(\\S+)(?:\\s+from\\s+root)?`, 'i');
-const START_FROM_RE = new RegExp(`start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+(\\S+?)(?:\\s+project)?\\s*$`, 'i');
+// Anchored to the start of the message (^\s*): these are explicit commands a
+// user types as the whole message, not phrases that may appear mid-sentence.
+// Without the anchor, PROJECT_COMMAND_RE's optional "start … from" prefix made
+// a bare "project <word>" match anywhere — e.g. "which config files does this
+// project read" captured "read" as a project name and reported the bogus path
+// /…/read as "Project folder not found".
+const ROOT_COMMAND_RE = new RegExp(`^\\s*start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+root\\s*$`, 'i');
+const PROJECT_COMMAND_RE = new RegExp(`^\\s*(?:start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+)?project\\s+(\\S+)(?:\\s+from\\s+root)?`, 'i');
+const START_FROM_RE = new RegExp(`^\\s*start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+(\\S+?)(?:\\s+project)?\\s*$`, 'i');
 // Strips used to remove the CLI/project suffix before sending the prompt to the CLI
-const PROJECT_STRIP_RE = new RegExp(`(?:start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+)?project\\s+\\S+(?:\\s+from\\s+root)?[,.]?\\s*`, 'i');
-const START_FROM_STRIP_RE = new RegExp(`start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+\\S+?(?:\\s+project)?\\s*$`, 'i');
+const PROJECT_STRIP_RE = new RegExp(`^\\s*(?:start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+)?project\\s+\\S+(?:\\s+from\\s+root)?[,.]?\\s*`, 'i');
+const START_FROM_STRIP_RE = new RegExp(`^\\s*start\\s+${CLI_PREFIX_GROUP}(?:from|in)\\s+\\S+?(?:\\s+project)?\\s*$`, 'i');
 // Matches a leading "resume" / "resume <cli>" / "resume from <X>" / "resume <cli> from <X>"
 // so the resumed CLI doesn't see the resume preamble as part of its prompt.
 const RESUME_PREFIX_STRIP_RE = new RegExp(
@@ -605,6 +611,33 @@ class SlackSocketHandler {
             if (!error.message?.includes('no_reaction')) {
                 this.logger.error(`Failed to remove reaction ${name}: ${error.message}`);
             }
+        }
+    }
+
+    // ─── Assistant Thinking Status ─────────────────────────────────────
+    // Drives Slack's native assistant status under the app name (OpenClaw's
+    // "Gathering information…" line) via assistant.threads.setStatus. The
+    // animation comes from `loading_messages` — Slack rotates through that
+    // array to produce the moving loading indicator; a bare `status` renders
+    // static. Pass an empty status (and no loading_messages) to clear it.
+    // Best-effort: the call fails harmlessly on non-assistant threads or if
+    // the workspace lacks the assistant feature, so errors are swallowed and
+    // never block polling. Uses apiCall() so it works across @slack/web-api
+    // versions that may not expose the typed assistant.threads method.
+    async _setThreadStatus(channelId, threadTs, status, loadingMessages = null) {
+        if (!channelId || !threadTs) return;
+        try {
+            const args = {
+                channel_id: channelId,
+                thread_ts: threadTs,
+                status: status || '',
+            };
+            if (Array.isArray(loadingMessages) && loadingMessages.length > 0) {
+                args.loading_messages = loadingMessages;
+            }
+            await this.app.client.apiCall('assistant.threads.setStatus', args);
+        } catch (error) {
+            this.logger.debug(`setStatus skipped for ${channelId}/${threadTs}: ${error.message}`);
         }
     }
 
@@ -2149,6 +2182,7 @@ ${formatted}`
                     // would short-circuit on the previous marker and skip
                     // verification of THIS inject.
                     try { fs.unlinkSync(`/tmp/cli-hook-post-${sessionKey}`); } catch { /* no prior marker */ }
+                    try { fs.unlinkSync(`/tmp/cli-hook-prompt-${sessionKey}`); } catch { /* no prior marker */ }
                     const injectStartedAt = Date.now();
                     const baseline = await this._injectCommand(session.sessionName, fullCommand, session.cliType);
                     // Guard against silent rejection (Codex at usage limit, Enter
@@ -2222,6 +2256,17 @@ ${formatted}`
                 return;
             }
             this.logger.info(`Command injected into ${session.sessionName}: ${fullCommand.substring(0, 120)}`);
+
+            // Show Slack's native assistant status under the app name while the
+            // CLI works (OpenClaw's "Gathering information…" effect). The
+            // animation is driven by loading_messages — Slack rotates through
+            // them. Regular @mention replies are posted by cli-hook-notify.js
+            // (the Stop hook), and Slack auto-clears the status the moment that
+            // message lands; the no-post timeout/teardown paths clear it too.
+            this._setThreadStatus(session.channelId, threadTs, 'Thinking…', [
+                'Thinking…', 'Working on it…', 'Reading the code…',
+                'Crunching…', 'Putting it together…', 'Almost there…',
+            ]);
 
             // Commands like /compact don't produce a standard response — just confirm
             // Skip confirmation for alert sessions (eyes reaction is sufficient)
@@ -2704,6 +2749,13 @@ ${formatted}`
         };
         const baselineUpper = aboveTui(baseline);
         const markerPath = sessionKey ? `/tmp/cli-hook-post-${sessionKey}` : null;
+        // UserPromptSubmit marker: cli-hook-notify.js writes this the instant
+        // Claude accepts the submitted prompt. It's the strongest "the paste +
+        // Enter was accepted and a turn started" signal we have — event-driven,
+        // no dependence on TUI rendering — so it short-circuits the brittle
+        // scrollback/spinner heuristics entirely. Claude-only (Codex/Gemini
+        // have no submit hook), so the heuristics below remain the fallback.
+        const promptMarkerPath = sessionKey ? `/tmp/cli-hook-prompt-${sessionKey}` : null;
         const start = Date.now();
         const intervalMs = 2000;
         // Initial settle — paste retries and Enter keystrokes leave the TUI
@@ -2719,6 +2771,19 @@ ${formatted}`
             const fatal = fatalPatterns.find(p => p.regex.test(output));
             if (fatal) {
                 throw new Error(`${cliType} ${fatal.reason}`);
+            }
+            // Authoritative turn-start: the UserPromptSubmit hook dropped a
+            // marker newer than this inject's start, so Claude definitely
+            // accepted the prompt. That's exactly what this method exists to
+            // confirm — return without touching the TUI heuristics.
+            if (promptMarkerPath && injectStartedAt) {
+                try {
+                    const ts = parseInt(fs.readFileSync(promptMarkerPath, 'utf8'), 10);
+                    if (Number.isFinite(ts) && ts >= injectStartedAt) {
+                        this.logger.info(`${cliType} prompt-submit marker confirmed turn start for ${sessionName}`);
+                        return;
+                    }
+                } catch { /* no marker yet — fall through to other signals */ }
             }
             // Authoritative success: cli-hook-notify.js drops a marker file
             // when the Stop hook successfully posts the assistant message to
@@ -2788,6 +2853,11 @@ ${formatted}`
         let attempts = 0;
         let processing = false;
         let everSawWorking = false; // LAYER 3 — silent-drop detector
+
+        // The assistant "thinking" status is set once at injection time (see
+        // _processCommand) with loading_messages, which Slack animates on its
+        // own. The poller just clears it on the no-post teardown paths below.
+        const clearStatus = () => this._setThreadStatus(session.channelId, threadTs, '');
         // Idle-based timeout: only fire after the CLI has been silent for too
         // long (no working spinner AND no output change). Wall-clock-only
         // timeouts kill actively-progressing sessions — e.g. Gemini 3's
@@ -2808,6 +2878,7 @@ ${formatted}`
             if (!this._isTmuxSessionAlive(sessionName)) {
                 clearInterval(interval);
                 this.pollers.delete(pollKey);
+                clearStatus();
                 if (alertBuffer) {
                     this.logger.info(`Alert buffer discarded (${alertBuffer.length} chars) on tmux death for ${sessionName}`);
                 }
@@ -2865,6 +2936,7 @@ ${formatted}`
             if (hitIdleTimeout || hitWallCeiling) {
                 clearInterval(interval);
                 this.pollers.delete(pollKey);
+                clearStatus();
                 const reason = hitWallCeiling
                     ? `wall ceiling ${Math.round(wallMs / 60000)}min`
                     : `idle ${Math.round(idleMs / 60000)}min`;
@@ -3143,6 +3215,10 @@ ${formatted}`
 
                             await this._sendResponse(say, threadTs, response, sessionStats);
                             this.logger.info(`Response sent to Slack thread ${threadTs}`);
+                            // Answer landed — drop the thinking shimmer. (Slack
+                            // also auto-clears status on an app message, but be
+                            // explicit so a later working window can re-arm it.)
+                            clearStatus();
 
                             // Track last bot response timestamp for thread context
                             if (sessionKey) {
@@ -3237,6 +3313,10 @@ ${formatted}`
                 clearInterval(this.pollers.get(session.sessionName).interval);
                 this.pollers.delete(session.sessionName);
             }
+
+            // Drop any lingering thinking shimmer — the quiet ✅ timeout path
+            // posts no message, so Slack won't auto-clear the status for us.
+            this._setThreadStatus(session.channelId, session.threadTs, '');
 
             // Notify user/channel about session timeout
             try {
