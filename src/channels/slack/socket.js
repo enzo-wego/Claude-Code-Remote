@@ -2371,6 +2371,15 @@ ${formatted}`
                 const maxWaitMs = readyAdapter.readinessTimeoutMs || 30000;
                 const fatalPatterns = readyAdapter.fatalErrorPatterns || [];
                 const pollIntervalMs = 1000;
+                // For adapters with requireStableReady (Codex): a passing
+                // isReady() capture is only trusted once a second capture
+                // taken stableCheckMs later is byte-identical. Codex prints
+                // its "Under-development features enabled" banner
+                // asynchronously after the prompt renders — a ready verdict
+                // taken before the banner lands is followed by a redraw that
+                // swallows Enter (incident Q15I3FLETD2FNC, 2026-06-09).
+                const stableCheckMs = 2500;
+                let lastReadyOutput = null;
                 let elapsed = 0;
                 const poll = () => {
                     elapsed += pollIntervalMs;
@@ -2394,6 +2403,18 @@ ${formatted}`
                             return;
                         }
                         if (readyAdapter.isReady && readyAdapter.isReady(output)) {
+                            if (readyAdapter.requireStableReady && output !== lastReadyOutput) {
+                                // First ready capture, or the pane changed since the
+                                // last one — a late banner may still be printing.
+                                // Re-capture after stableCheckMs and require an
+                                // identical pane before trusting readiness. The
+                                // readinessTimeoutMs backstop still applies.
+                                this.logger.debug(`${cliType} ready signal seen at ${elapsed}ms — verifying pane is stable`);
+                                lastReadyOutput = output;
+                                elapsed += stableCheckMs - pollIntervalMs;
+                                setTimeout(poll, stableCheckMs);
+                                return;
+                            }
                             this.logger.info(`${cliType} ready after ${elapsed}ms`);
                             const grace = readyAdapter.postReadyGraceMs || 0;
                             if (grace > 0) {
@@ -2404,6 +2425,9 @@ ${formatted}`
                             }
                             return;
                         }
+                        // Not ready (e.g. the banner guard kicked in) — any
+                        // earlier ready capture is stale, start stability over.
+                        lastReadyOutput = null;
                     } catch {
                         // capture failed, keep polling
                     }
@@ -2631,8 +2655,11 @@ ${formatted}`
                 }
             }
 
-            // Send Enter and verify the CLI started processing.
-            const maxAttempts = 5;
+            // Send Enter and verify the CLI started processing. 7 attempts
+            // with growing waits ≈ 31s total — 5 (~17s) was not enough for a
+            // TUI whose submit handler was still mounting on a loaded host
+            // (incident Q15I3FLETD2FNC, 2026-06-09).
+            const maxAttempts = 7;
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
                 execSync(`tmux send-keys -t ${sessionName} Enter`);
                 // Longer wait on later attempts — give Claude Code more time to process

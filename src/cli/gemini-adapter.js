@@ -141,9 +141,12 @@ module.exports = {
     // wired. Pasting + Enter within that window gets eaten by a still-mounting
     // component, so the bot's Enter-confirmation loop runs out of attempts and
     // throws `did not accept Enter` (see _injectCommand in
-    // src/channels/slack/socket.js). 8s of grace covers the React-mount window
-    // observed on this VPS without slowing the common path materially.
-    postReadyGraceMs: 8000,
+    // src/channels/slack/socket.js). 8s of grace covered the React-mount
+    // window originally observed on this VPS, but under CPU contention
+    // (another CLI session mid-turn on the same box) the mount took 30s+ and
+    // all 5 Enter attempts were swallowed (incident Q15I3FLETD2FNC,
+    // 2026-06-09). 15s trades a slower cold start for surviving a loaded host.
+    postReadyGraceMs: 15000,
 
     // TUI ready when the input-box placeholder is rendered. Stable substring
     // across versions — the footer also shows "Auto (Gemini 3)" but that text

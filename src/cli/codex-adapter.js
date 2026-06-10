@@ -245,9 +245,17 @@ module.exports = {
     // After isReady() returns true, wait this long before pasting. Codex prints
     // late banners ("Under-development features enabled", etc.) asynchronously
     // after the prompt is first rendered; a paste that lands during that
-    // redraw can end up with the first Enter silently dropped. This grace
-    // window lets the TUI settle.
-    postReadyGraceMs: 2000,
+    // redraw can end up with the first Enter silently dropped. 2s was not
+    // enough on a loaded host (incident Q15I3FLETD2FNC, 2026-06-09: ready
+    // after 8s, then every Enter swallowed by the late banner redraw).
+    postReadyGraceMs: 6000,
+
+    // The isReady() banner guards only help when the banner is already on
+    // screen at probe time. On a slow boot the prompt renders first and the
+    // banner prints seconds later, so a single ready capture is not
+    // trustworthy. Require two identical captures before declaring ready —
+    // see the readiness poll in socket.js.
+    requireStableReady: true,
 
     isReady(output) {
         if (/Starting MCP servers/.test(output)) return false;
