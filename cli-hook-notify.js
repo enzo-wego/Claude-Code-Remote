@@ -1138,6 +1138,21 @@ async function sendHookNotification() {
             } else {
                 await sendResponse(web, channelId, threadTs, assistantMessage, stats, lastUserId);
                 console.error(`Response posted (${assistantMessage.length} chars) to ${channelId} thread=${threadTs}`);
+                // Auto-upload files the CLI explicitly flagged with
+                // `Attachment written: <path>`. Relative paths resolve against
+                // the CLI's cwd from the hook payload — the directory the CLI
+                // actually wrote into, unlike the bot's repo_path guess.
+                // Alert sessions are excluded: their report upload is built
+                // into the alert branch above, and alert follow-up turns are
+                // scanned by the socket.js poller already.
+                const { uploadResponseAttachments } = require('./src/utils/attachments');
+                await uploadResponseAttachments({
+                    web,
+                    channelId,
+                    threadTs,
+                    response: assistantMessage,
+                    baseDir: hookInput.cwd || currentDir,
+                });
                 // Drop a marker so the bot's _verifyTurnProgress can confirm
                 // the turn really completed even when Claude's reply is short
                 // enough to stay inside the bottom-10 TUI rows (which the

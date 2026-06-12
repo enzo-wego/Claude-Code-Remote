@@ -212,6 +212,7 @@ module.exports = {
     chatFormattingGuidance() {
         return [
             '[Slack mrkdwn for Slack replies: *bold*, _italic_, ~strike~, `code`, <https://url|label>, "-" or "•" bullets. No `#` / `##` headings — they print as literal hashes. Standard GitHub markdown only inside attachment files.]',
+            '[To attach a file to the Slack thread (reports, logs, dumps, scripts): save it to disk, then put `Attachment written: <absolute path>` on its own line in your reply — it is uploaded automatically. Never paste long file contents inline.]',
             '',
             '',
         ].join('\n');

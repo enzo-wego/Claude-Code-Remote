@@ -172,6 +172,7 @@ module.exports = {
             '- Links: <https://example.com|label>  (NOT [label](url))',
             '- No `#` / `##` headings — they print as literal hashes in Slack.',
             'Standard GitHub-flavored markdown is OK ONLY inside attachment files saved to disk; never in the chat message body.',
+            'To attach a file to the Slack thread (reports, logs, dumps, scripts): save it to disk, then put `Attachment written: <absolute path>` on its own line in your reply — it is uploaded automatically. Never paste long file contents inline.',
             '',
             '',
         ].join('\n');
