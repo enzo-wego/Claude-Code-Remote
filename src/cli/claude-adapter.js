@@ -197,9 +197,12 @@ module.exports = {
     // → matches 'processing' → poller stuck working=true forever, never flushes).
     // The timer regex below is the reliable signal; verbs only catch the brief
     // window before the first `· ↑/↓ N tokens` chunk renders.
+    // Transcript lines that persist after a turn ends (e.g. '● Skill(…)') must
+    // also stay out — a finished turn's residue in the pane made _injectCommand
+    // skip its Enter retries and leave a prompt unsent (incident 2026-06-10).
     workingIndicators: [
         'brewing', 'clauding', 'flibbertigibbeting', 'esc to interrupt',
-        '● skill(', 'crunching', 'metamorphosing', 'burrowing', 'running…', '⏳'
+        'crunching', 'metamorphosing', 'burrowing', 'running…', '⏳'
     ],
 
     // Extra regexes evaluated against lowercased tail text. Claude Code renders a

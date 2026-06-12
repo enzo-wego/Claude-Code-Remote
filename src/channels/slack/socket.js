@@ -2857,6 +2857,22 @@ ${formatted}`
         }
     }
 
+    // Capture the pane and run the CLI adapter's working-indicator match —
+    // the same filtering `_injectCommand` and the poller use. Lets the idle
+    // timer distinguish "turn still running, nothing posted yet" from a
+    // genuinely idle session before killing tmux.
+    _isPaneWorking(sessionName, cliType = 'claude') {
+        const adapter = getCliAdapter(cliType || 'claude');
+        const excludePatterns = adapter.workingExcludePatterns || [];
+        const filtered = this._captureOutput(sessionName)
+            .split('\n')
+            .filter(l => !excludePatterns.some(re => re.test(l)))
+            .join('\n')
+            .toLowerCase();
+        if (adapter.workingIndicators.some(ind => filtered.includes(ind))) return true;
+        return (adapter.workingRegexes || []).some(re => re.test(filtered));
+    }
+
     // ─── Response Polling ────────────────────────────────────────────
 
     _pollForResponse(session, say, sessionKey = null) {
@@ -3282,7 +3298,7 @@ ${formatted}`
         this.pollers.set(pollKey, { interval, session });
     }
 
-    _startSessionTimeout(sessionKey) {
+    _startSessionTimeout(sessionKey, delayOverrideMs = null) {
         // Clear any existing timer
         if (this.sessionTimers.has(sessionKey)) {
             clearTimeout(this.sessionTimers.get(sessionKey));
@@ -3304,7 +3320,9 @@ ${formatted}`
         // Athena query was followed by a "15min inactivity" notice 37s later.
         const lastBotMs = this._parseBotTsMs(session?.lastBotTs);
         let delayMs = timeoutMs;
-        if (lastBotMs) {
+        if (delayOverrideMs != null) {
+            delayMs = delayOverrideMs;
+        } else if (lastBotMs) {
             delayMs = Math.max(0, (lastBotMs + timeoutMs) - Date.now());
         }
         const timer = setTimeout(async () => {
@@ -3324,6 +3342,20 @@ ${formatted}`
             if (freshBotMs && Date.now() - freshBotMs < timeoutMs) {
                 this.sessionTimers.delete(sessionKey);
                 this._startSessionTimeout(sessionKey);
+                return;
+            }
+
+            // `last_bot_ts` only sees Slack-side activity — a turn that is
+            // still mid-flight has posted nothing yet. That's routine after a
+            // service restart (KillMode=process): the tmux session survived
+            // with a turn in progress, reconciliation re-armed this timer, but
+            // no poller is watching the pane. Killing on staleness alone would
+            // execute the session mid-turn; check the pane's live working
+            // indicators and re-check soon instead.
+            if (this._isPaneWorking(session.sessionName, session.cliType)) {
+                this.logger.info(`Session ${session.sessionName} idle timer fired mid-turn — pane still working, rechecking in 5min`);
+                this.sessionTimers.delete(sessionKey);
+                this._startSessionTimeout(sessionKey, Math.min(timeoutMs, 300000));
                 return;
             }
 
