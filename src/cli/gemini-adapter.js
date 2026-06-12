@@ -234,8 +234,19 @@ module.exports = {
     confirmationPrompts: ['Shell awaiting input'],
     handlesConfirmationPrompts: true,
 
-    // No fatal startup banners observed yet. Add as we encounter them.
-    fatalErrorPatterns: [],
+    // Detected during readiness polling and _verifyTurnProgress in socket.js —
+    // on match the tmux session is killed and the next CLI in the chain takes over.
+    fatalErrorPatterns: [
+        {
+            // Google geo-blocks some VPS/datacenter IPs: every API call fails
+            // instantly with `400 "User location is not supported for the API
+            // use."` while the TUI still renders ready and idle. Without this
+            // pattern the alert poller idles the full 30min window before any
+            // fallback fires (incident Q2ORYNHDWLISDZ, 2026-06-12).
+            regex: /User location is not supported/i,
+            reason: 'gemini API geo-blocked (user location not supported)',
+        },
+    ],
 
     installHooks() {
         const settings = loadSettings();

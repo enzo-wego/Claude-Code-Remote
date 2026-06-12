@@ -306,6 +306,15 @@ module.exports = {
             regex: /You['’]ve hit your usage limit/i,
             reason: 'codex usage limit reached',
         },
+        {
+            // OAuth refresh token revoked (e.g. after logging in on another
+            // machine). Codex renders the prompt and accepts input, but every
+            // turn dies with: "Your access token could not be refreshed
+            // because your refresh token was revoked. Please log out and sign
+            // in again." (incident Q2ORYNHDWLISDZ, 2026-06-12).
+            regex: /refresh token was revoked/i,
+            reason: 'codex auth revoked — needs `codex login`',
+        },
     ],
 
     confirmationPrompts: [],

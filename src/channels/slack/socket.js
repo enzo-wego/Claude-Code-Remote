@@ -1922,6 +1922,16 @@ ${formatted}`
                 // first inject can fall back further (e.g. resumed Codex
                 // accepted readiness but won't take input → switch to Claude).
                 injectChain = resumeResult.remainingChain || [resumeResult.cliType];
+                // Re-stash the runtime-fallback context on the recreated
+                // session. The brand-new-session path does this below, but a
+                // requeued alert (attempt 2+) lands here instead — without the
+                // stash the poller's LAYER 6 check (`session.alertPrompt`)
+                // fails and the still-untried CLIs in the chain are never
+                // reached (incident Q2ORYNHDWLISDZ, 2026-06-12).
+                if (session.alertMessageTs) {
+                    session.injectChain = injectChain;
+                    session.alertPrompt = command;
+                }
                 this._touchSession(sessionKey);
                 if (resumeResult.resumed) {
                     // CLI restored its own conversation history — keep the saved
@@ -2940,10 +2950,11 @@ ${formatted}`
                         this.logger.error(`Failed to post silent-drop notice: ${err.message}`);
                     }
                 }
-                // Swap alert reactions (👀→✅) when tmux dies
+                // Swap alert reactions (👀→✅) when tmux dies — only if a report
+                // actually reached Slack. A ✅ on an uninvestigated alert reads
+                // as "handled"; with no report we keep 👀 so the alert stays
+                // visibly unresolved (the thread gets a triage notice instead).
                 if (isAlertSession && session.alertMessageTs) {
-                    await this._removeReaction(session.channelId, session.alertMessageTs, 'eyes').catch(() => {});
-                    await this._addReaction(session.channelId, session.alertMessageTs, 'white_check_mark').catch(() => {});
                     // Re-read session so lastBotTs reflects any post that happened during this turn.
                     // Silent-failure requeue is for the startup-race case only: CLI never started a
                     // turn, no output, no Stop hook. If the pane DID show working at any point,
@@ -2951,6 +2962,10 @@ ${formatted}`
                     // the item complete and surface a manual-triage notice instead.
                     const fresh = sessionKey ? this._getSession(sessionKey) : null;
                     const lastBotTs = fresh?.lastBotTs ?? session.lastBotTs;
+                    if (lastBotTs) {
+                        await this._removeReaction(session.channelId, session.alertMessageTs, 'eyes').catch(() => {});
+                        await this._addReaction(session.channelId, session.alertMessageTs, 'white_check_mark').catch(() => {});
+                    }
                     const silentStartup = !lastBotTs && !everSawWorking;
                     if (!silentStartup && !lastBotTs && everSawWorking) {
                         try {
@@ -3082,8 +3097,12 @@ ${formatted}`
                     this._clearSessionTimeout(sessionKey);
                     const sess = this._getSession(sessionKey);
                     if (sess?.alertMessageTs) {
-                        await this._removeReaction(sess.channelId, sess.alertMessageTs, 'eyes').catch(() => {});
-                        await this._addReaction(sess.channelId, sess.alertMessageTs, 'white_check_mark').catch(() => {});
+                        // ✅ only when a report was actually posted — a no-report
+                        // timeout keeps 👀 so the alert stays visibly unresolved.
+                        if (sess.lastBotTs) {
+                            await this._removeReaction(sess.channelId, sess.alertMessageTs, 'eyes').catch(() => {});
+                            await this._addReaction(sess.channelId, sess.alertMessageTs, 'white_check_mark').catch(() => {});
+                        }
                         // Requeue only on genuine startup race (no bot post AND
                         // the CLI never entered working state). In-progress timeouts
                         // get silent=false so the queue completes without retry.
