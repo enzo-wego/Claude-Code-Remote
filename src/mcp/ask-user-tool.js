@@ -244,6 +244,19 @@ async function handleAskUser(input, ctx) {
         throw new Error(`ask_user: failed to post to Slack: ${err.message}`);
     }
 
+    // Count the question post as bot activity. socket.js anchors its
+    // inflight watchdog ("No response after Nmin — the agent may be stuck")
+    // to `last_bot_ts`, and the poster path doesn't go through the Stop
+    // hook that normally updates it — without this, a question sitting in
+    // the thread waiting for the user still reads as a stuck agent.
+    try {
+        const postedTs = pending.get(requestId)?.slackTs || String(Date.now() / 1000);
+        db.prepare('UPDATE sessions SET last_bot_ts = ?, updated_at = ? WHERE session_key = ?')
+            .run(postedTs, Date.now(), sessionId);
+    } catch (err) {
+        logger.warn(`ask_user: failed to update last_bot_ts for ${sessionId}: ${err.message}`);
+    }
+
     logger.info(`ask_user: posted question ${requestId} for session ${sessionId}`);
 
     const result = await answerPromise;

@@ -33,6 +33,7 @@ function loadMcpSdk() {
             StreamableHTTPServerTransport: sdkTransport.StreamableHTTPServerTransport,
             ListToolsRequestSchema: sdkTypes.ListToolsRequestSchema,
             CallToolRequestSchema: sdkTypes.CallToolRequestSchema,
+            isInitializeRequest: sdkTypes.isInitializeRequest,
         };
     } catch (err) {
         throw new Error(
@@ -48,7 +49,15 @@ function loadMcpSdk() {
 let logger = null;
 let httpServer = null;
 let serverUrl = null;
-const transports = new Map(); // sessionId → { transport, mcpServer }
+const transports = new Map(); // sessionId → { transport, mcpServer, keepalive }
+
+// Read at call time (not module load) so tests can shrink the intervals.
+function keepaliveIntervalMs() {
+    return Number(process.env.MCP_KEEPALIVE_MS || 60000);
+}
+function progressIntervalMs() {
+    return Number(process.env.MCP_PROGRESS_INTERVAL_MS || 15000);
+}
 
 /**
  * Start the MCP HTTP server.
@@ -94,6 +103,25 @@ async function startMcpServer({ config, db, slackApp, getDb, port, host, force }
         }
 
         let entry = transports.get(sessionId);
+
+        // A fresh `initialize` for a sessionId we already hold means the
+        // client dropped its connection and is reconnecting. The cached
+        // transport is already initialized and would reject the handshake
+        // with "400 Server already initialized" — forever, bricking every
+        // reconnect (Claude Code gives up after 5 attempts and marks the
+        // server disconnected). Close the stale transport and start over.
+        if (entry && req.method === 'POST' && sdk.isInitializeRequest(req.body)) {
+            transports.delete(sessionId);
+            clearInterval(entry.keepalive);
+            try {
+                await entry.mcpServer.close();
+            } catch (err) {
+                logger.warn(`mcp: failed to close stale transport for ${sessionId}: ${err.message}`);
+            }
+            logger.info(`mcp: replaced stale transport for session ${sessionId} on re-initialize`);
+            entry = null;
+        }
+
         if (!entry) {
             const mcpServer = createMcpServer({ db, getDb, slackApp, sessionId, config }, sdk);
             const transport = new StreamableHTTPServerTransport({
@@ -101,8 +129,24 @@ async function startMcpServer({ config, db, slackApp, getDb, port, host, force }
             });
             await mcpServer.connect(transport);
 
-            entry = { transport, mcpServer };
+            // Server→client ping so the client's standalone SSE GET stream
+            // never goes silent: Claude Code aborts a stream that's quiet
+            // for 300s and treats it as a connection error (3 strikes →
+            // transport closed, killing any in-flight ask_user call). If
+            // the stream is down the SDK drops the message and the ping
+            // times out — harmless, hence the swallow.
+            const keepalive = setInterval(() => {
+                mcpServer.ping().catch(() => {});
+            }, keepaliveIntervalMs());
+            if (keepalive.unref) keepalive.unref();
+
+            entry = { transport, mcpServer, keepalive };
             transports.set(sessionId, entry);
+            transport.onclose = () => {
+                clearInterval(keepalive);
+                // Identity check: a reconnect may have already replaced us.
+                if (transports.get(sessionId) === entry) transports.delete(sessionId);
+            };
             logger.info(`mcp: opened transport for session ${sessionId}`);
         }
 
@@ -175,11 +219,38 @@ function registerAskUserTool(mcpServer, ctx, sdk) {
         tools: [askUserToolDefinition],
     }));
 
-    mcpServer.setRequestHandler(CallToolRequestSchema, async (req) => {
+    mcpServer.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         if (req.params.name !== 'ask_user') {
             throw new Error(`Unknown tool: ${req.params.name}`);
         }
-        return handleAskUser(req.params.arguments || {}, ctx);
+
+        // ask_user blocks until a human answers in Slack — routinely longer
+        // than the client's per-request timeout (60s in Claude Code, reset
+        // only by progress notifications). When the client sent a
+        // progressToken, tick progress while we wait so the call survives.
+        let progressTimer = null;
+        const progressToken = req.params._meta?.progressToken;
+        if (progressToken !== undefined && extra && typeof extra.sendNotification === 'function') {
+            let progress = 0;
+            progressTimer = setInterval(() => {
+                progress += 1;
+                Promise.resolve(extra.sendNotification({
+                    method: 'notifications/progress',
+                    params: {
+                        progressToken,
+                        progress,
+                        message: 'Waiting for the user to answer in Slack…',
+                    },
+                })).catch(() => {});
+            }, progressIntervalMs());
+            if (progressTimer.unref) progressTimer.unref();
+        }
+
+        try {
+            return await handleAskUser(req.params.arguments || {}, ctx);
+        } finally {
+            if (progressTimer) clearInterval(progressTimer);
+        }
     });
 }
 
@@ -189,6 +260,7 @@ async function stopMcpServer() {
     httpServer = null;
     serverUrl = null;
     for (const [, entry] of transports) {
+        clearInterval(entry.keepalive);
         try {
             await entry.mcpServer.close?.();
         } catch (err) {
