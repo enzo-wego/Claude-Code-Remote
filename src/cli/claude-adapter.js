@@ -114,7 +114,18 @@ module.exports = {
     },
 
     // How long to wait for the TUI to be ready before injecting the first command.
-    readinessTimeoutMs: 30000,
+    // 60s (was 30s) gives a CPU-starved host headroom: on a loaded VPS (load avg
+    // > cores) Claude Code's Node + Ink + MCP-handshake startup can exceed 60s,
+    // and a 30s budget timed out → the bot pasted into a still-initializing TUI
+    // and tcsetattr(TCSAFLUSH) silently flushed every paste (incident 1781303635,
+    // process-taxes delay alert, 2026-06-13). Matches the gemini adapter.
+    readinessTimeoutMs: 60000,
+
+    // After isReady() matches, wait this long before the first paste so the TUI
+    // input handler is fully wired. Without it, a paste fired the instant the ❯
+    // prompt renders races the handler init and is dropped. Codex/Gemini already
+    // carry an equivalent grace; Claude was the unhardened outlier.
+    postReadyGraceMs: 4000,
 
     // Claude Code shows ) or ❯ or > alone on a line when it's accepting input.
     isReady(output) {

@@ -58,6 +58,13 @@ class SlackSocketHandler {
         // silence. This watchdog turns that silent failure into a visible notice.
         this._inflightWatchdogs = new Map();
         this._serializedCliLaunches = new Map(); // cliType -> Promise tail
+        // sessionKey -> inject-failure retry count for alert sessions whose CLI
+        // chain is exhausted. A paste-never-landed failure on the last CLI in
+        // the chain is the startup-race signature (host CPU starvation), which a
+        // fresh tmux run after a short delay can recover. PagerDuty alerts have
+        // the alert_queue requeue for this; delay alerts bypass the queue, so
+        // without this they were a silent drop (incident 1781303635, 2026-06-13).
+        this._alertInjectRetries = new Map();
 
         this.app = new App({
             token: config.botToken,
@@ -1756,6 +1763,11 @@ ${formatted}`
         };
         const cliChainHint = normaliseChain(cliHint);
         const sessionKey = `${channelId}-${threadTs}`;
+        // Untouched copy of the inbound command, captured before any @mention
+        // keyword-stripping mutates `command`. The alert inject-retry path
+        // re-enters _processCommand with this so the rebuilt prompt is identical
+        // to the first attempt.
+        const originalCommand = command;
         let session = this._getSession(sessionKey);
         let threadContext = null; // Will hold formatted thread messages to prepend
         // True when the user @mentions the bot with only a `start <cli> from <project>`
@@ -2257,7 +2269,19 @@ ${formatted}`
 
             if (!injected) {
                 const message = lastInjectError ? lastInjectError.message : 'unknown error';
+                // Alert sessions: a paste-never-landed failure on the last CLI in
+                // the chain is the startup-race signature (host CPU starvation),
+                // not a genuine task failure. PagerDuty alerts get the alert_queue
+                // requeue; delay alerts bypass the queue, so without this they're
+                // a silent drop. Retry the whole investigation from a fresh tmux
+                // run before giving up. Returns true if a retry was scheduled.
                 if (session.alertMessageTs) {
+                    const scheduled = this._retryAlertInvestigation({
+                        channelId, threadTs, command: originalCommand, messageTs,
+                        alertMessageTs, userId, cliChainHint, reason: message,
+                    });
+                    if (scheduled) return;
+                    // Budget exhausted — flip 👀 → ❌ and fall through to give-up.
                     await this._removeReaction(channelId, session.alertMessageTs, 'eyes');
                     await this._addReaction(channelId, session.alertMessageTs, 'x');
                 }
@@ -2265,6 +2289,8 @@ ${formatted}`
                 this._startSessionTimeout(sessionKey);
                 return;
             }
+            // Injection succeeded — clear any inject-retry counter for this alert.
+            this._alertInjectRetries.delete(sessionKey);
             this.logger.info(`Command injected into ${session.sessionName}: ${fullCommand.substring(0, 120)}`);
 
             // Show Slack's native assistant status under the app name while the
@@ -2564,6 +2590,51 @@ ${formatted}`
                 this._serializedCliLaunches.delete(cliType);
             }
         }
+    }
+
+    // Bounded retry of a whole alert investigation when the CLI chain is
+    // exhausted and injection still failed (paste never landed / no turn
+    // progress = startup-race under host load). Tears down the dead tmux row and
+    // re-triggers _processCommand from scratch after a short delay so the CLI
+    // boots on a (hopefully) less-loaded box. Returns true if a retry was
+    // scheduled — the caller should NOT give up. Returns false when the retry
+    // budget is spent — the caller posts the give-up notice.
+    _retryAlertInvestigation({ channelId, threadTs, command, messageTs, alertMessageTs, userId, cliChainHint, reason }) {
+        const sessionKey = `${channelId}-${threadTs}`;
+        const maxRetries = this.config.alertSilentMaxRetries ?? 2;
+        const used = this._alertInjectRetries.get(sessionKey) || 0;
+        if (used >= maxRetries) {
+            this._alertInjectRetries.delete(sessionKey);
+            this.logger.error(`Alert inject-retry: giving up for ${sessionKey} after ${used} retr${used === 1 ? 'y' : 'ies'} (${reason})`);
+            return false;
+        }
+        this._alertInjectRetries.set(sessionKey, used + 1);
+
+        // Tear down the dead session so re-entry spins up a fresh tmux + CLI.
+        const session = this._getSession(sessionKey);
+        if (session) {
+            const killCmd = 'tmux kill-session -t ' + session.sessionName + ' 2>/dev/null';
+            try { execSync(killCmd); } catch { /* already gone */ }
+        }
+        this._clearSessionTimeout(sessionKey);
+        this._deleteSession(sessionKey);
+
+        // Keep 👀 on the alert (don't flip to ❌) — still being worked.
+        const total = maxRetries + 1;          // original attempt + retries
+        const attemptLabel = used + 2;          // human: 2nd, 3rd, ... attempt
+        const delayMs = 30000;
+        this.app.client.chat.postMessage({
+            channel: channelId,
+            thread_ts: threadTs,
+            text: `:repeat: CLI never accepted the prompt (${reason}) — likely a startup race under load. Retrying investigation (attempt ${attemptLabel}/${total}) in ${Math.round(delayMs / 1000)}s.`,
+        }).catch(err => this.logger.error(`Failed to post inject-retry notice: ${err.message}`));
+
+        setTimeout(() => {
+            this._processCommand(channelId, threadTs, command, null, messageTs, alertMessageTs, userId, cliChainHint)
+                .catch(err => this.logger.error(`Alert inject-retry re-trigger failed for ${sessionKey}: ${err.message}`));
+        }, delayMs);
+        this.logger.warn(`Alert inject-retry: scheduled attempt ${attemptLabel}/${total} for ${sessionKey} in ${delayMs}ms (${reason})`);
+        return true;
     }
 
     async _injectCommand(sessionName, command, cliType = 'claude') {
