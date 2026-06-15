@@ -2172,17 +2172,33 @@ ${formatted}`
                 if (guidance) {
                     fullCommand = `${guidance}${fullCommand}`;
                 }
-                // MCP slack-ask: prepend a one-line nudge when this adapter
-                // actually wires the ask_user tool (Claude today). Gated by
-                // MCP_ENABLED so disabled installs stay clean.
+            }
+
+            // MCP slack-ask: keep Claude pointed at the ask_user MCP tool so it
+            // never falls back to the built-in AskUserQuestion picker, which
+            // renders in a TUI invisible to the Slack user (a question asked
+            // there silently stalls the session — incident 2026-06-15). The
+            // full schema is taught ONCE on the fresh-boot turn; every later
+            // non-skill turn gets a cheap one-line reminder. The repeat matters
+            // because the boot-turn teach is defeated whenever the boot turn is
+            // a trivial `start <cli> from <project>` greeting — the model then
+            // reaches its first real question turn never having seen the nudge.
+            // Gated by MCP_ENABLED so disabled installs stay clean; skipped for
+            // skill turns (SKILL.md is authoritative there).
+            if (!isSkillInvocation && !isTrivialFirstMessage) {
+                const chatAdapter = getCliAdapter(session.cliType);
                 if (
                     process.env.MCP_ENABLED === 'true'
                     && chatAdapter.supportsAskUser
-                    && typeof chatAdapter.askUserGuidance === 'function'
                 ) {
-                    const askGuidance = chatAdapter.askUserGuidance();
-                    if (askGuidance) {
-                        fullCommand = `${askGuidance}${fullCommand}`;
+                    const askText = isFreshCliBoot
+                        && typeof chatAdapter.askUserGuidance === 'function'
+                        ? chatAdapter.askUserGuidance()
+                        : (typeof chatAdapter.askUserReminder === 'function'
+                            ? chatAdapter.askUserReminder()
+                            : '');
+                    if (askText) {
+                        fullCommand = `${askText}${fullCommand}`;
                     }
                 }
             }

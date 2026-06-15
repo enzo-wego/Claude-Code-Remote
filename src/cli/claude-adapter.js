@@ -170,6 +170,16 @@ module.exports = {
         ].join('\n');
     },
 
+    // One-line repeat reminder prepended to every later chat turn (the full
+    // schema above is taught once on the boot turn). Cheap enough to repeat:
+    // it just re-points the model at the MCP tool — whose full schema is
+    // already in its tool list — so a built-in AskUserQuestion picker (invisible
+    // to the Slack user) is never reached on a turn that missed the boot nudge.
+    askUserReminder() {
+        const tool = this.askUserToolName();
+        return `[To ask the user anything, call the MCP tool \`${tool}\` — NOT the built-in AskUserQuestion picker, which renders in a TUI the Slack user cannot see.]\n\n`;
+    },
+
     // Brief Slack mrkdwn reminder prepended to every non-skill chat turn so
     // Claude doesn't default to GitHub-style `**bold**` mid-thread. Skill
     // invocations skip this — SKILL.md is authoritative there. See
