@@ -20,6 +20,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const RUNTIME_FATAL_PATTERNS = require('./runtime-fatal-patterns');
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const GEMINI_HOME = path.join(os.homedir(), '.gemini');
@@ -93,6 +94,10 @@ function removeOurHooks(list) {
 
 module.exports = {
     type: 'gemini',
+    // Mid-turn fatal errors (missing AWS profile, expired SSO) that the poller
+    // escalates on instead of busy-looping until the wall ceiling. See
+    // runtime-fatal-patterns.js.
+    runtimeFatalPatterns: RUNTIME_FATAL_PATTERNS,
 
     supportsAskUser: true,
     askUserToolName() {

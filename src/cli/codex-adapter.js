@@ -15,6 +15,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const RUNTIME_FATAL_PATTERNS = require('./runtime-fatal-patterns');
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const CODEX_HOME = path.join(os.homedir(), '.codex');
@@ -148,6 +149,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 module.exports = {
     type: 'codex',
+    // Mid-turn fatal errors (missing AWS profile, expired SSO) that the poller
+    // escalates on instead of busy-looping until the wall ceiling. See
+    // runtime-fatal-patterns.js.
+    runtimeFatalPatterns: RUNTIME_FATAL_PATTERNS,
 
     // Keep rapid duplicate Codex starts from racing the TUI startup/paste path.
     // The session-specific MCP URL is passed per launch via `-c`, not written

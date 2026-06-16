@@ -64,6 +64,11 @@ const config = {
     alertCliChain: parseCliChain(process.env.ALERT_CLI),
     sessionInactivityTimeoutMs: parseInt(process.env.SESSION_INACTIVITY_TIMEOUT_MS) || 300000,
     pollerTimeoutMs: parseInt(process.env.POLLER_TIMEOUT_MS) || 1800000, // 30 min
+    pollerMaxWallMs: parseInt(process.env.POLLER_MAX_WALL_MS) || 0, // 0 → pollerTimeoutMs*4 (2h) in socket.js
+    // Busy-loop stall: escalate an alert CLI to the next chain member when the
+    // pane content (sans spinner/timer chrome) hasn't changed for this long while
+    // the spinner is still up. Must exceed the longest legit silent tool call.
+    pollerNoProgressMs: parseInt(process.env.POLLER_NO_PROGRESS_MS) || 360000, // 6 min
     // @mention reply watchdog: how long after injecting a command we post a
     // single "still working" ping if the Stop hook hasn't delivered a reply yet.
     inflightHeartbeatMs: parseInt(process.env.INFLIGHT_HEARTBEAT_MS) || 300000, // 5 min
@@ -215,6 +220,7 @@ async function start() {
     logger.info(`- Session Inactivity Timeout: ${config.sessionInactivityTimeoutMs}ms`);
     logger.info(`- Inflight Heartbeat: ${config.inflightHeartbeatMs}ms`);
     logger.info(`- Poller Timeout: ${config.pollerTimeoutMs}ms`);
+    logger.info(`- Poller No-Progress Stall: ${config.pollerNoProgressMs}ms`);
     logger.info(`- Delay Monitor Channels: ${config.monitorDelayChannels || 'None'}`);
     logger.info(`- Delay Alert Skill: ${config.delayAlertSkill}`);
     logger.info(`- Delay Alert CLI chain: ${config.delayAlertCliChain.join(' → ')}`);

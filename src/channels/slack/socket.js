@@ -6,7 +6,7 @@
  */
 
 const { App } = require('@slack/bolt');
-const { exec, execSync } = require('child_process');
+const { exec, execSync, execFileSync } = require('child_process');
 const express = require('express');
 const Database = require('better-sqlite3');
 const path = require('path');
@@ -92,6 +92,11 @@ class SlackSocketHandler {
         this._wsRestartWindowMs = 600000;     // 10 min window for restart tracking
         this._wsRestartStateFile = path.join(__dirname, '../../data/ws-restart-state.json');
         this._wsRestartTimestamps = this._loadRestartState(); // persisted across process restarts
+        // Pane scrollback snapshots — captured while a session is alive so a
+        // later recreate can replay the actual CLI conversation when native
+        // `--resume` isn't available (no captured session UUID). See
+        // `_snapshotPaneForResume` / `_readPaneSnapshot`.
+        this._paneSnapshotDir = path.join(__dirname, '../../data/pane-snapshots');
 
         this._initDb();
 
@@ -188,7 +193,17 @@ class SlackSocketHandler {
         } catch {
             // Column already exists
         }
-        this.db.exec('CREATE INDEX IF NOT EXISTS idx_alert_queue_status ON alert_queue(status)');
+        try {
+            // FIX C — the CLI chain to use when this item is (re)processed, as a
+            // JSON array. On requeue we rewrite it with the chain still untried
+            // after the failed run advanced past dead CLIs (e.g. the geo-blocked
+            // gemini), so retries don't re-burn the whole chain from the top.
+            // NULL → fall back to the configured alertCliChain.
+            this.db.prepare('ALTER TABLE alert_queue ADD COLUMN cli_chain TEXT').run();
+        } catch {
+            // Column already exists
+        }
+        this.db.prepare('CREATE INDEX IF NOT EXISTS idx_alert_queue_status ON alert_queue(status)').run();
 
         this._stmts = {
             upsert: this.db.prepare(`
@@ -224,6 +239,7 @@ class SlackSocketHandler {
             getLatestForMessage: this.db.prepare("SELECT * FROM alert_queue WHERE channel_id = ? AND message_ts = ? ORDER BY id DESC LIMIT 1"),
             updateStatus: this.db.prepare('UPDATE alert_queue SET status = ?, updated_at = ? WHERE id = ?'),
             requeueForRetry: this.db.prepare("UPDATE alert_queue SET status = 'pending', retry_count = retry_count + 1, updated_at = ? WHERE id = ? AND status = 'processing'"),
+            updateChain: this.db.prepare('UPDATE alert_queue SET cli_chain = ?, updated_at = ? WHERE id = ?'),
             complete: this.db.prepare("UPDATE alert_queue SET status = 'completed', updated_at = ? WHERE channel_id = ? AND message_ts = ? AND status = 'processing'"),
             // Atomic promotion: claim a pending row for a manual "investigate now"
             // override. Filter on status='pending' so we lose cleanly to a racing
@@ -378,7 +394,22 @@ class SlackSocketHandler {
 
         // Fire the investigation via the regular command flow. Queue only holds PagerDuty alerts,
         // so the CLI chain follows ALERT_CLI (delay alerts bypass the queue).
-        const queueCliChain = this.config.alertCliChain || ['claude'];
+        // FIX C — a requeued item carries the chain still untried after the
+        // previous run advanced past dead CLIs; use it so we don't restart from
+        // the geo-blocked first CLI every retry. Falls back to the full
+        // configured chain for fresh items (cli_chain NULL) or on parse error.
+        const fullChain = this.config.alertCliChain || ['claude'];
+        let queueCliChain = fullChain;
+        if (item.cli_chain) {
+            try {
+                const parsed = JSON.parse(item.cli_chain);
+                if (Array.isArray(parsed) && parsed.length > 0) {
+                    queueCliChain = parsed;
+                }
+            } catch (err) {
+                this.logger.warn(`Alert queue: bad cli_chain JSON for id=${item.id} (${err.message}) — using full chain`);
+            }
+        }
         this._processCommand(item.channel_id, item.message_ts, item.prompt, null, item.message_ts, item.message_ts, null, queueCliChain)
             .catch(err => {
                 this.logger.error(`Alert queue: failed to start investigation for id=${item.id}: ${err.message}`);
@@ -418,7 +449,20 @@ class SlackSocketHandler {
                 if (result.changes > 0) {
                     const attempt = item.retry_count + 2; // human-friendly: 2nd attempt, 3rd attempt...
                     const total = maxRetries + 1;
-                    this.logger.warn(`Alert queue: silent failure detected — requeue id=${item.id} attempt=${attempt}/${total}`);
+                    // FIX C — persist the chain still untried so the retry resumes
+                    // from where the failed run reached instead of the geo-blocked
+                    // first CLI. The failed run's session row records the CLI that
+                    // was actually running (cli_type); the configured chain from
+                    // that CLI onward is what's left to try.
+                    const fullChain = this.config.alertCliChain || ['claude'];
+                    let remainingChain = fullChain;
+                    const failedSession = this._stmts.get.get(`${channelId}-${messageTs}`);
+                    if (failedSession && failedSession.cli_type) {
+                        const idx = fullChain.indexOf(failedSession.cli_type);
+                        if (idx > 0) remainingChain = fullChain.slice(idx);
+                    }
+                    this._queueStmts.updateChain.run(JSON.stringify(remainingChain), Date.now(), item.id);
+                    this.logger.warn(`Alert queue: silent failure detected — requeue id=${item.id} attempt=${attempt}/${total} chain=[${remainingChain.join(' → ')}]`);
                     // Restore eyes on the alert message (cleanup paths swap to
                     // ✅ before calling us; flip it back since we're retrying).
                     this._removeReaction(channelId, messageTs, 'white_check_mark').catch(() => {});
@@ -1770,6 +1814,7 @@ ${formatted}`
         const originalCommand = command;
         let session = this._getSession(sessionKey);
         let threadContext = null; // Will hold formatted thread messages to prepend
+        let threadContextLabel = 'Here is the Slack thread discussion for context'; // overridden for a pane-snapshot replay
         // True when the user @mentions the bot with only a `start <cli> from <project>`
         // keyword and no actual task. Used downstream to (a) skip the
         // self-knowledge preamble — which an agentic CLI like Gemini reads as a
@@ -1820,6 +1865,7 @@ ${formatted}`
             }
             this._deleteSession(sessionKey);
             this._clearSessionTimeout(sessionKey);
+            this._clearPaneSnapshot(sessionKey); // intentional close — don't replay on a future thread reuse
             if (session.alertMessageTs) {
                 try {
                     await this._removeReaction(channelId, session.alertMessageTs, 'eyes');
@@ -1960,14 +2006,27 @@ ${formatted}`
                     this._stmts.updateClaudeSessionId.run(null, Date.now(), sessionKey);
                     isFreshCliBoot = true;
 
-                    // Fetch thread context — summarize with Gemini if long.
-                    const allMessages = await this._fetchThreadMessages(channelId, threadTs);
-                    if (allMessages.length > 10) {
-                        threadContext = await this._summarizeThreadContext(allMessages);
-                        this.logger.info(`Summarized thread context (recreated session): ${allMessages.length} messages`);
-                    } else if (allMessages.length > 0) {
-                        threadContext = await this._formatThreadContext(allMessages);
-                        this.logger.info(`Full thread context (recreated session): ${allMessages.length} messages`);
+                    // Prefer the actual tmux pane scrollback captured while the
+                    // previous process was alive — it holds the CLI's own
+                    // reasoning and tool work, which the Slack thread (only the
+                    // posted replies) can't. Fall back to the Slack-thread
+                    // replay when no snapshot exists (e.g. very first recreate
+                    // before any turn completed, or snapshot cleared on /exit).
+                    const paneSnapshot = this._readPaneSnapshot(sessionKey);
+                    if (paneSnapshot) {
+                        threadContext = paneSnapshot;
+                        threadContextLabel = 'Your previous terminal session ended; here is its recent transcript (your earlier work) for context';
+                        this.logger.info(`Pane snapshot replay (recreated session): ${paneSnapshot.length} chars`);
+                    } else {
+                        // Fetch thread context — summarize with Gemini if long.
+                        const allMessages = await this._fetchThreadMessages(channelId, threadTs);
+                        if (allMessages.length > 10) {
+                            threadContext = await this._summarizeThreadContext(allMessages);
+                            this.logger.info(`Summarized thread context (recreated session): ${allMessages.length} messages`);
+                        } else if (allMessages.length > 0) {
+                            threadContext = await this._formatThreadContext(allMessages);
+                            this.logger.info(`Full thread context (recreated session): ${allMessages.length} messages`);
+                        }
                     }
                 }
                 if (userId) this._updateLastUserId(sessionKey, userId);
@@ -2150,7 +2209,7 @@ ${formatted}`
             const BOT_SELF_KNOWLEDGE_PREAMBLE = `You are responding inside a Slack thread for the EnzoBot Slack bot.\nIf the user asks about the bot's own behavior (notifications, tagging, queue, alerts, etc.),\nthe bot's source lives at /var/go/src/github.com/Claude-Code-Remote — read files there to answer accurately.\n\n`;
             let fullCommand = command;
             if (threadContext && !isTrivialFirstMessage) {
-                fullCommand = `${BOT_SELF_KNOWLEDGE_PREAMBLE}Here is the Slack thread discussion for context:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
+                fullCommand = `${BOT_SELF_KNOWLEDGE_PREAMBLE}${threadContextLabel}:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
             }
 
             // Slack mrkdwn reminder — sent ONCE on the first turn of a fresh
@@ -2972,6 +3031,56 @@ ${formatted}`
         }
     }
 
+    _paneSnapshotPath(sessionKey) {
+        return path.join(this._paneSnapshotDir, `${String(sessionKey).replace(/[^A-Za-z0-9._-]/g, '_')}.txt`);
+    }
+
+    // Snapshot the live tmux pane's scrollback to disk so a later recreate —
+    // after an inactivity-timeout kill or an external crash — can replay the
+    // actual CLI conversation instead of a lossy Slack-thread summary. A dead
+    // pane can't be captured, so this MUST run while the session is alive
+    // (end of each turn + just before we kill on inactivity timeout).
+    // Uses execFileSync (no shell) — sessionName is internally generated, but
+    // array args keep it injection-proof regardless.
+    _snapshotPaneForResume(sessionName, sessionKey) {
+        if (!sessionName || !sessionKey) return;
+        try {
+            const text = execFileSync('tmux', ['capture-pane', '-t', sessionName, '-p', '-S', '-3000'], {
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'ignore'],
+                maxBuffer: 8 * 1024 * 1024
+            });
+            if (!text || !text.trim()) return;
+            if (!fs.existsSync(this._paneSnapshotDir)) {
+                fs.mkdirSync(this._paneSnapshotDir, { recursive: true });
+            }
+            fs.writeFileSync(this._paneSnapshotPath(sessionKey), text, 'utf8');
+        } catch (err) {
+            this.logger.warn(`Pane snapshot failed for ${sessionName}: ${err.message}`);
+        }
+    }
+
+    // Read back the most recent pane snapshot for replay into a recreated
+    // session. Returns the tail only — the recent turns matter most and older
+    // scrollback is the least useful, most token-costly part to re-inject.
+    _readPaneSnapshot(sessionKey) {
+        try {
+            const p = this._paneSnapshotPath(sessionKey);
+            if (!fs.existsSync(p)) return null;
+            let text = fs.readFileSync(p, 'utf8');
+            if (!text || !text.trim()) return null;
+            const MAX = 24000; // ~6k tokens of recent scrollback
+            if (text.length > MAX) text = text.slice(-MAX);
+            return text.trim();
+        } catch {
+            return null;
+        }
+    }
+
+    _clearPaneSnapshot(sessionKey) {
+        try { fs.unlinkSync(this._paneSnapshotPath(sessionKey)); } catch { /* nothing to clear */ }
+    }
+
     // Capture the pane and run the CLI adapter's working-indicator match —
     // the same filtering `_injectCommand` and the poller use. Lets the idle
     // timer distinguish "turn still running, nothing posted yet" from a
@@ -3024,8 +3133,24 @@ ${formatted}`
         // genuinely runaway sessions.
         const idleTimeoutMs = this.config.pollerTimeoutMs || 1800000; // default 30 min of silence
         const wallCeilingMs = this.config.pollerMaxWallMs || (idleTimeoutMs * 4); // hard cap, default 2h
+        // FIX A — no-progress-while-working detector. A CLI that busy-loops on a
+        // failing command (e.g. codex retrying an investigation that hits
+        // `aws: profile … could not be found`) keeps its spinner animating, so
+        // `isWorking` stays true → `lastActivityAt` resets every tick → the idle
+        // timeout never trips and escalation to the next CLI waits the full 2h
+        // wall ceiling. Track forward progress via a content fingerprint that
+        // ignores the volatile spinner/timer/context-% chrome; if the pane hasn't
+        // meaningfully changed for `noProgressMs` while the spinner runs, treat it
+        // as a stall and take the same LAYER 6 escalation path as an idle timeout.
+        // Alert-only: regular @mention tasks can legitimately run a single silent
+        // tool (build/test) for minutes, and LAYER 6 escalation is alert-only anyway.
+        const noProgressMs = this.config.pollerNoProgressMs || 360000; // default 6 min
         const pollerStartedAt = Date.now();
         let lastActivityAt = pollerStartedAt;
+        let lastProgressAt = pollerStartedAt; // last tick the pane content (sans spinner chrome) changed
+        let lastProgressKey = null;
+        let lastIsWorking = false; // working-state from the previous tick (timeout check runs before this tick computes it)
+        let runtimeFatalReason = null; // FIX B — set when a runtime-fatal pattern is seen in the pane
         const stableThreshold = 3;
 
         const interval = setInterval(async () => {
@@ -3093,16 +3218,30 @@ ${formatted}`
             const now = Date.now();
             const idleMs = now - lastActivityAt;
             const wallMs = now - pollerStartedAt;
+            const noProgressMsElapsed = now - lastProgressAt;
             const hitIdleTimeout = idleMs > idleTimeoutMs;
             const hitWallCeiling = wallMs > wallCeilingMs;
+            // FIX A — busy-loop stall: working spinner is up but the pane content
+            // (sans timer/context chrome) hasn't changed for noProgressMs. Alert
+            // sessions only; lastIsWorking gates out genuinely-idle panes (those
+            // belong to the idle timeout, which uses a longer window).
+            const hitNoProgress = isAlertSession && lastIsWorking && noProgressMsElapsed > noProgressMs;
+            // FIX B — a runtime-fatal pattern (e.g. missing AWS profile) was seen
+            // in the pane on a prior tick; the investigation cannot succeed, so
+            // escalate immediately instead of waiting out noProgressMs.
+            const hitRuntimeFatal = isAlertSession && !!runtimeFatalReason;
 
-            if (hitIdleTimeout || hitWallCeiling) {
+            if (hitIdleTimeout || hitWallCeiling || hitNoProgress || hitRuntimeFatal) {
                 clearInterval(interval);
                 this.pollers.delete(pollKey);
                 clearStatus();
-                const reason = hitWallCeiling
-                    ? `wall ceiling ${Math.round(wallMs / 60000)}min`
-                    : `idle ${Math.round(idleMs / 60000)}min`;
+                const reason = hitRuntimeFatal
+                    ? `fatal: ${runtimeFatalReason}`
+                    : hitWallCeiling
+                        ? `wall ceiling ${Math.round(wallMs / 60000)}min`
+                        : hitNoProgress
+                            ? `no progress for ${Math.round(noProgressMsElapsed / 60000)}min while working`
+                            : `idle ${Math.round(idleMs / 60000)}min`;
                 this.logger.warn(`Poller timeout (${reason}) for ${sessionName} (alert=${isAlertSession}, everSawWorking=${everSawWorking})`);
                 // LAYER 6 — runtime fallback (set inside the alert branch
                 // below). Populated when the CLI's TUI looked ready and the
@@ -3113,10 +3252,12 @@ ${formatted}`
                 // recursive _processCommand call gets a clean slate.
                 let runtimeFallbackContext = null;
                 try {
-                    if (!everSawWorking) {
+                    if (!everSawWorking && !hitRuntimeFatal) {
                         // LAYER 3 — silent-drop. Polled the full idle window and the
                         // CLI never entered working state. Input was almost certainly
                         // dropped; no Stop hook will fire. Notify the user.
+                        // (A runtime-fatal match escalates via the alert branch below
+                        // even if the spinner was never seen — the error is real.)
                         this.logger.warn(`Silent input drop detected for ${sessionName} (timeout, working never observed)`);
                         await say({
                             text: `:x: \`${session.cliType || 'cli'}\` never started a turn — your message was likely dropped (splash redraw or Enter swallowed). Please reply again to retry.`,
@@ -3276,6 +3417,36 @@ ${formatted}`
                 (adapter.workingRegexes || []).some(re => re.test(tailText));
             if (isWorking) everSawWorking = true;
 
+            // FIX A — forward-progress fingerprint. Strip digit runs (the
+            // spinner timer "Working (4m 04s)", "Context 20% used", "5h 91% le…",
+            // token counters) so a busy-loop reprinting the same error/screen
+            // produces a stable key, while a genuinely-progressing investigation
+            // changes words and resets the no-progress clock. Read by hitNoProgress
+            // on the NEXT tick (the timeout check runs before this block).
+            const progressKey = nonStatusLines.join('\n').replace(/\d+/g, '#');
+            if (progressKey !== lastProgressKey) {
+                lastProgressKey = progressKey;
+                lastProgressAt = Date.now();
+            }
+            lastIsWorking = isWorking;
+
+            // FIX B — runtime-fatal pattern scan. Distinct from startup
+            // `fatalErrorPatterns` (checked during readiness polling): these are
+            // errors that surface mid-turn and guarantee the investigation can't
+            // succeed (e.g. a missing AWS profile fails every query). On match,
+            // record the reason; the timeout gate escalates to the next CLI (or
+            // posts the manual-triage notice) on the next tick. Latched — once
+            // fatal, stay fatal even if the line scrolls off.
+            if (!runtimeFatalReason && Array.isArray(adapter.runtimeFatalPatterns)) {
+                for (const pat of adapter.runtimeFatalPatterns) {
+                    if (pat.regex.test(currentOutput)) {
+                        runtimeFatalReason = pat.reason;
+                        this.logger.warn(`Runtime-fatal pattern matched for ${sessionName} (cli=${session.cliType}): ${pat.reason}`);
+                        break;
+                    }
+                }
+            }
+
             // Activity tracking for the idle-based timeout. Output change OR
             // an active spinner both count — a CLI mid-inference may keep the
             // pane visually identical for many seconds (Gemini's "Thinking..."
@@ -3392,6 +3563,10 @@ ${formatted}`
                                 const nowTs = String(Date.now() / 1000);
                                 this._updateLastBotTs(sessionKey, nowTs);
                                 this._startSessionTimeout(sessionKey);
+                                // End of a completed turn — the pane now holds the
+                                // fullest context. Snapshot it so a later crash or
+                                // inactivity kill can replay it on recreate.
+                                this._snapshotPaneForResume(sessionName, sessionKey);
                             }
                         } catch (err) {
                             this.logger.error(`Failed to send response to Slack: ${err.message}`);
@@ -3485,6 +3660,11 @@ ${formatted}`
 
             const minutes = Math.round(timeoutMs / 60000);
             this.logger.info(`Session ${session.sessionName} timed out after ${minutes}min of inactivity`);
+
+            // Capture the pane while it's still alive — once we kill it the
+            // scrollback is gone, and the next @mention would otherwise
+            // recreate a blank session with no prior context.
+            this._snapshotPaneForResume(session.sessionName, sessionKey);
 
             // Kill tmux session
             try {
