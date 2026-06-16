@@ -3783,14 +3783,25 @@ ${formatted}`
         }, heartbeatMs);
 
         const giveup = setTimeout(async () => {
-            // Leave a spent tombstone (don't delete) so the hourly orphan sweep
-            // keeps treating this session as watchdog-managed and won't arm a
-            // SECOND idle-timeout notice for the same stuck task. The entry is
-            // cleared on the next user message / teardown via _clearSessionTimeout.
+            // The watchdog has done its job — hand the session's lifecycle to the
+            // idle timer (which tears it down on real inactivity, with a
+            // working-pane recheck) and drop the watchdog entry.
+            //
+            // Previously this left a permanent {spent:true} tombstone instead of
+            // deleting, the idea being the hourly sweep would then keep treating
+            // the session as watchdog-managed and not arm a second idle-timeout
+            // notice. But the sweep treats ANY _inflightWatchdogs entry as
+            // managed and never arms an idle timer for it — and this give-up runs
+            // for EVERY regular @mention session (answered or stuck) since the
+            // tombstone is written before the repliedSinceInject() check below.
+            // The result was that every regular session became immortal: no idle
+            // timeout was ever armed and the tmux session lived until the next
+            // restart. Arm the idle timer here instead.
             const wd = this._inflightWatchdogs.get(sessionKey);
             if (wd && wd.heartbeat) clearTimeout(wd.heartbeat);
-            this._inflightWatchdogs.set(sessionKey, { heartbeat: null, giveup: null, spent: true });
+            this._inflightWatchdogs.delete(sessionKey);
             const s = this._getSession(sessionKey);
+            if (s) this._startSessionTimeout(sessionKey);
             if (!s || repliedSinceInject()) return;
             const alive = this._isTmuxSessionAlive(s.sessionName);
             const mention = s.lastUserId ? `<@${s.lastUserId}> ` : '';
