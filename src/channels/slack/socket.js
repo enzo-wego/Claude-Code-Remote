@@ -2678,6 +2678,26 @@ ${formatted}`
             // Snapshot output before injection so we can detect silent paste loss later.
             const preInjectOutput = this._captureOutput(sessionName);
 
+            // Probe strings used to detect a landed paste in the visible pane.
+            // A long command (existing session: self-knowledge preamble +
+            // thread-context + "My request: …") pushes its FIRST line off the
+            // top of the captured pane, so checking only the first line yields a
+            // false "Paste failed after N attempts" even though the paste landed
+            // and is sitting in the input box (incident 2026-06-15). The input
+            // box always renders the TAIL of a long paste, so also probe the
+            // LAST non-empty line. Lines are trimmed (the pane indents pasted
+            // input) and 40-char-capped (avoids wrap breaks); probes shorter
+            // than 4 chars are dropped so a bare `}` can't false-match.
+            const probeLines = (() => {
+                const lines = command.split('\n').map(l => l.trim()).filter(Boolean);
+                if (lines.length === 0) return [];
+                const probes = [lines[0].substring(0, 40)];
+                const last = lines[lines.length - 1].substring(0, 40);
+                if (last && last !== probes[0]) probes.push(last);
+                return probes.filter(p => p.length >= 4);
+            })();
+            const probeVisible = (out) => probeLines.some(p => out.includes(p));
+
             // Paste with verification — Claude Code renders ❯ before its TUI input handler
             // finishes initializing. If we paste during that window, tcsetattr(TCSAFLUSH)
             // flushes the pty buffer and our paste is silently lost. Retry until it lands.
@@ -2706,13 +2726,12 @@ ${formatted}`
                 //    pastes behind a placeholder; harmless when it does).
                 // 3. The CLI already started working (paste + auto-submit succeeded).
                 const output = this._captureOutput(sessionName);
-                const firstLine = command.split('\n')[0].substring(0, 40);
                 const isAlreadyWorking = indicatorHit(output);
                 const pasteIndicators = adapter.pasteLandedIndicators || [/Pasted text/i];
                 const pasteIndicatorMatched = pasteIndicators.some(p =>
                     typeof p === 'string' ? output.includes(p) : p.test(output)
                 );
-                if (pasteIndicatorMatched || output.includes(firstLine) || isAlreadyWorking) {
+                if (pasteIndicatorMatched || probeVisible(output) || isAlreadyWorking) {
                     if (attempt > 0) {
                         this.logger.info(`Paste landed on attempt ${attempt + 1} for ${sessionName}${isAlreadyWorking ? ' (already working)' : ''}`);
                     }
@@ -2735,11 +2754,10 @@ ${formatted}`
             // start a turn, and the Stop hook would never fire. Re-check the
             // pane right before pressing Enter and re-paste if the content is gone.
             {
-                const firstLine = command.split('\n')[0].substring(0, 40);
                 const pasteIndicators = adapter.pasteLandedIndicators || [/Pasted text/i];
                 const stillVisible = (out) =>
                     pasteIndicators.some(p => typeof p === 'string' ? out.includes(p) : p.test(out))
-                    || (firstLine && out.includes(firstLine))
+                    || probeVisible(out)
                     || indicatorHit(out);
                 const preEnterOutput = this._captureOutput(sessionName);
                 if (!stillVisible(preEnterOutput)) {
