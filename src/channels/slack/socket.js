@@ -3754,7 +3754,14 @@ ${formatted}`
      * Never kills tmux or deletes the row; cleanup stays with the idle timer,
      * reconcile, and the orphan sweep. Both timers no-op once a reply has landed.
      */
-    _startInflightWatchdog(sessionKey) {
+    // `cycle` counts consecutive give-ups where the pane still looked busy and
+    // we re-armed instead of warning. Bounded so a *persistent* working-
+    // indicator false positive (e.g. a transcript line matching the adapter's
+    // workingIndicators that never clears) can't keep the session immortal —
+    // after MAX_WORKING_REARMS cycles we warn and hand off to the idle timer
+    // regardless.
+    _startInflightWatchdog(sessionKey, cycle = 0) {
+        const MAX_WORKING_REARMS = 3;
         this._clearInflightWatchdog(sessionKey);
         const injectedAt = Date.now();
         const heartbeatMs = this.config.inflightHeartbeatMs || 300000;
@@ -3771,6 +3778,10 @@ ${formatted}`
             const s = this._getSession(sessionKey);
             if (!s || repliedSinceInject()) return;
             if (!this._isTmuxSessionAlive(s.sessionName)) return; // give-up handles dead sessions
+            // Only reassure "still working" when the pane actually shows work.
+            // If the CLI isn't visibly working, claiming it is would be the
+            // inverse false positive — let the give-up timer assess instead.
+            if (!this._isPaneWorking(s.sessionName, s.cliType)) return;
             try {
                 await this.app.client.chat.postMessage({
                     channel: s.channelId,
@@ -3801,9 +3812,24 @@ ${formatted}`
             if (wd && wd.heartbeat) clearTimeout(wd.heartbeat);
             this._inflightWatchdogs.delete(sessionKey);
             const s = this._getSession(sessionKey);
-            if (s) this._startSessionTimeout(sessionKey);
-            if (!s || repliedSinceInject()) return;
+            if (!s || repliedSinceInject()) {
+                if (s) this._startSessionTimeout(sessionKey);
+                return;
+            }
             const alive = this._isTmuxSessionAlive(s.sessionName);
+            // If the turn is visibly still running (spinner/working indicators
+            // in the pane) it hasn't stalled — it just hasn't posted yet. Don't
+            // cry "stuck": re-arm another watchdog cycle and keep watching. A
+            // genuinely hung turn stops showing working indicators, so the next
+            // cycle (or the idle timer it arms) catches it. This avoids the
+            // false-positive warning when Claude is mid-run for >15min.
+            if (alive && cycle < MAX_WORKING_REARMS && this._isPaneWorking(s.sessionName, s.cliType)) {
+                this.logger.info(`Inflight watchdog: ${s.sessionName} still working, re-arming (cycle ${cycle + 1}/${MAX_WORKING_REARMS})`);
+                this._startInflightWatchdog(sessionKey, cycle + 1);
+                return;
+            }
+            // Not working (or dead): hand lifecycle to the idle timer and warn.
+            this._startSessionTimeout(sessionKey);
             const mention = s.lastUserId ? `<@${s.lastUserId}> ` : '';
             const minutes = Math.round(giveupMs / 60000);
             const text = alive
