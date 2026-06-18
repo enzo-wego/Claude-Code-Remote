@@ -2612,6 +2612,18 @@ ${formatted}`
                         this.logger.warn(`mcp installMcp failed for ${cliType}/${sessionName}: ${err.message}`);
                     }
                 }
+                // Per-CLI static launch env (e.g. Gemini's egress proxy to
+                // bypass Google's geo-block). Stubs/absent method = no-op.
+                if (typeof adapter.extraLaunchEnv === 'function') {
+                    try {
+                        const envOverrides = adapter.extraLaunchEnv();
+                        if (envOverrides && typeof envOverrides === 'object') {
+                            extraEnv = { ...extraEnv, ...envOverrides };
+                        }
+                    } catch (err) {
+                        this.logger.warn(`extraLaunchEnv failed for ${cliType}/${sessionName}: ${err.message}`);
+                    }
+                }
                 return this._createTmuxSessionDetailed(sessionName, repoPath, launchCmd, sessionKey, cliType, extraEnv);
             };
 

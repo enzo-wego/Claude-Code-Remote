@@ -133,6 +133,25 @@ module.exports = {
         return process.env.GEMINI_COMMAND || 'gemini --yolo --skip-trust';
     },
 
+    // Google geo-blocks the Gemini API from many datacenter IP ranges. This
+    // VPS's RackNerd/ColoCrossing IP resolves to CN in Google's own geo DB
+    // (even though MaxMind/ip-api report US), so every authenticated call
+    // returns `400 User location is not supported / FAILED_PRECONDITION`.
+    // When GEMINI_HTTPS_PROXY is set, route the CLI's HTTPS traffic through it
+    // — a tunnel to a US-clean egress (see gemini-proxy-tunnel.service). Only
+    // Gemini sessions get this env (merged into the tmux launch env in
+    // _createTmuxSession via socket.js); Claude/Codex are untouched.
+    // NODE_USE_ENV_PROXY makes Node 24's undici/fetch honor the proxy vars.
+    extraLaunchEnv() {
+        const proxy = process.env.GEMINI_HTTPS_PROXY;
+        if (!proxy) return {};
+        return {
+            HTTPS_PROXY: proxy,
+            HTTP_PROXY: proxy,
+            NODE_USE_ENV_PROXY: '1',
+        };
+    },
+
     // Resume CLI flag isn't yet documented for gemini-cli; falling back to a
     // fresh session keeps behavior safe (caller treats null as "no resume").
     buildResumeCommand(/* sessionId */) {
