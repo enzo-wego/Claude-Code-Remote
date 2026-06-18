@@ -2181,18 +2181,23 @@ ${formatted}`
             }
 
 
-            // Gemini under --yolo plus the project-local Serena MCP onboarding flow
-            // treats any non-trivial first prompt as a standing directive to
-            // auto-explore and act. When the user @mentions only the start
-            // keyword (no real task), we'd otherwise inject "hi" + the
-            // self-knowledge preamble, which Gemini reads as "go set up the
-            // workspace" and starts editing files. Skip the inject — the
-            // session is already saved, so the next @mention in this thread
-            // will land on the live session and inject the real task.
-            if (isTrivialFirstMessage && session.cliType === 'gemini') {
-                this.logger.info(`Gemini session ${session.sessionName} ready; skipping inject for trivial first message`);
+            // A bare "start <cli> from <project>" with no task body leaves an
+            // empty prompt that we'd otherwise inject as a synthetic "hi". That
+            // is pure downside for every CLI:
+            //   - Gemini (under --yolo + Serena onboarding) reads "hi" + the
+            //     self-knowledge preamble as "go set up the workspace" and
+            //     starts editing files.
+            //   - Claude/Codex paste a 2-char "hi" that carries no intent, and
+            //     when the host is busy the paste-verification race surfaces a
+            //     scary "Paste failed after 5 attempts" even though the session
+            //     is healthy (incident 1781679376, 2026-06-17).
+            // Skip the inject entirely — the session is already saved, so the
+            // next @mention in this thread lands on the live session and
+            // injects the real task.
+            if (isTrivialFirstMessage) {
+                this.logger.info(`Session ${session.sessionName} (cli=${session.cliType}) ready; skipping inject for trivial first message`);
                 await say({
-                    text: `Gemini session ready in \`${session.repoPath}\`. What would you like me to work on?`,
+                    text: `Session ready in \`${session.repoPath}\`. What would you like me to work on?`,
                     thread_ts: threadTs,
                 });
                 this._startSessionTimeout(sessionKey);
