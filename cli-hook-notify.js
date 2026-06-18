@@ -50,6 +50,19 @@ if (fs.existsSync(envPath)) {
     process.exit(1);
 }
 
+// Strip any HTTP(S) proxy inherited from the tmux session env. Gemini sessions
+// export HTTPS_PROXY/HTTP_PROXY (a US-egress tunnel to bypass the Gemini API
+// geo-block — see gemini-adapter.extraLaunchEnv); this hook is spawned as a
+// child of that shell and inherits it. But the hook only talks to internal
+// infra (PagerDuty REST API, Slack, local SQLite) — routing those through the
+// US tunnel made the PagerDuty on-call lookup return 404, so the L1 ping fell
+// back to the configured owner instead of the real on-call. Force direct.
+delete process.env.HTTPS_PROXY;
+delete process.env.HTTP_PROXY;
+delete process.env.https_proxy;
+delete process.env.http_proxy;
+delete process.env.NODE_USE_ENV_PROXY;
+
 // Gemini's AfterAgent hook contract reads stdout as JSON to decide whether
 // to retry or accept the turn (e.g. `{decision:"deny"}` triggers a retry).
 // An empty stdout is treated as a malformed hook and the warning
