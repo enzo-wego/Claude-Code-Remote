@@ -2109,6 +2109,16 @@ ${formatted}`
                     }
                 }
 
+                // Strip a leading `start <cli>` keyword so a bare "start gemini"
+                // (no `from <project>` clause, no task body) collapses to an
+                // empty command and is treated as a trivial first message —
+                // same as "start gemini from payments". Without this the keyword
+                // survives as the literal prompt and, with the ask-user preamble
+                // prepended, an agentic CLI reads it as a task and wanders off
+                // into its own TUI menu that never reaches Slack (incident
+                // 1781766824, 2026-06-18). The resume path already does this strip.
+                command = command.replace(CLI_KEYWORD_RE, '').trim();
+
                 // If command was fully consumed by project pattern, default to "hi"
                 if (!command) {
                     isTrivialFirstMessage = true;
