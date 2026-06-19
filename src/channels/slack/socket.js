@@ -2237,8 +2237,12 @@ ${formatted}`
             // approach: Gemini may drift back to GitHub `**bold**` later in a
             // long session since it doesn't get re-reminded — acceptable to
             // avoid the noise on Claude/Codex.
+            // A skill turn is either a slash form (`/xxxx …`) or a natural-language
+            // request to run one (`execute /xxxx skill for me`, `run the deploy
+            // skill with argument …`). The optional leading `/` and trailing tail
+            // ("for me", "with argument …", nothing) are all accepted.
             const isSkillInvocation = command.startsWith('/')
-                || /^execute\s+\S+\s+skill\s+with\s+argument\b/i.test(command);
+                || /^\s*(?:execute|run)\s+(?:the\s+)?\/?\S+\s+skill\b/i.test(command);
             if (!isSkillInvocation && !isTrivialFirstMessage && isFreshCliBoot) {
                 const chatAdapter = getCliAdapter(session.cliType);
                 const guidance = typeof chatAdapter.chatFormattingGuidance === 'function'
@@ -2395,17 +2399,15 @@ ${formatted}`
             ]);
 
             // Commands like /compact don't produce a standard response — just confirm
-            // Skip confirmation for alert sessions (eyes reaction is sufficient)
+            // Skip confirmation for alert sessions (eyes reaction is sufficient).
+            // Echo the command verbatim: not every `/word` is a skill — keywords
+            // (/ultrathink), built-ins (/compact, /clear) and unknown commands also
+            // start with `/`. The old "Execute skill X with argument Y" framing
+            // mislabeled all of them (that prose form is only how alert prompts
+            // invoke skills), which confused users; the raw command is what was
+            // actually injected, so show that.
             if (command.startsWith('/') && !session.alertMessageTs) {
-                // Parse skill name and argument for a cleaner confirmation
-                const slashMatch = command.match(/^\/(\S+)\s+(.*)/s);
-                if (slashMatch) {
-                    const skillName = slashMatch[1];
-                    const argument = slashMatch[2].trim();
-                    await say({ text: `Execute skill \`${skillName}\` with argument \`${argument}\``, thread_ts: threadTs });
-                } else {
-                    await say({ text: `Sent \`${command}\` to Claude session.`, thread_ts: threadTs });
-                }
+                await say({ text: `Sent \`${command}\` to the ${session.cliType || 'claude'} session.`, thread_ts: threadTs });
             }
 
             // Regular sessions: response posting is handled by cli-hook-notify.js (Stop / Codex notify)
