@@ -19,9 +19,44 @@ npm run setup
 
 # Start Slack Socket Mode bot
 npm run slack
+
+# Restart the running service (safe — preserves tmux/CLI sessions)
+npm run restart
+
+# Hard restart (nukes the tmux server + ALL CLI sessions, then starts)
+npm run restart:hard         # confirms first; add `-- -y` to skip the prompt
 ```
 
 There is no test runner configured.
+
+## Restarting the Service
+
+The systemd unit (`/etc/systemd/system/claude-remote.service`) runs with
+**`KillMode=process`**. On restart systemd SIGTERMs only the node process; the
+tmux server (a sibling process, not re-parented under node) and every live CLI
+session survive. On startup `_reconcileSessions()` (`src/channels/slack/socket.js`)
+re-adopts any DB session whose tmux is still alive and re-arms its timeout,
+deleting only rows whose tmux is gone. The SQLite DB is on disk, so rows persist.
+In-flight tasks survive too, because the Stop hook (`cli-hook-notify.js`) posts to
+Slack from its own process via the DB, independent of node.
+
+- **`npm run restart`** (`sudo systemctl restart claude-remote`) — the safe,
+  common path. Picks up code changes while keeping all live sessions. Use this
+  for normal deploys.
+- **`npm run restart:hard`** (`scripts/restart-hard.sh`) — stop → `tmux
+  kill-server` → start. The deliberate "nuke everything" reset. Needed only to
+  clear a stuck/busy-looping CLI session, or to force sessions to re-launch with
+  fresh env (a normal restart leaves long-lived sessions carrying their original
+  launch-time env: `CLI_SOURCE`, the Gemini `HTTPS_PROXY` tunnel, MCP vars,
+  node/PATH). It confirms before destroying, then health-checks the service.
+
+> **Caveat:** never run `restart:hard` from inside a tmux session — `tmux
+> kill-server` would kill its own shell. Run it from a plain SSH shell.
+
+Without `KillMode=process`, the default `KillMode=control-group` would kill the
+whole cgroup — including the tmux server spawned by the bot — on every restart,
+destroying all CLI sessions. If the unit is ever rewritten (e.g. by a deploy
+tool), re-check that `KillMode=process` is still present.
 
 ## Architecture
 
