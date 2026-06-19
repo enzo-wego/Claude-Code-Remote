@@ -11,6 +11,8 @@
     "mcp:status": "node mcp-manage.js status",
     "mcp:uninstall": "node mcp-manage.js uninstall",
     "slack": "node start-slack-socket.js",
+    "restart": "sudo systemctl restart claude-remote",
+    "restart:hard": "bash scripts/restart-hard.sh",
     "test": "jest --verbose"
   },
   "keywords": [
