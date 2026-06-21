@@ -257,6 +257,18 @@ module.exports = {
             regex: /Context limit reached/i,
             reason: 'context_limit',
             hint: 'Claude hit its context limit. Send `/compact` to compact the conversation, or `/clear` to start fresh.',
+        },
+        {
+            // Claude's API credentials expired/revoked mid-session. The CLI
+            // prints `● Please run /login · API Error: 401 Invalid authentication
+            // credentials` and freezes: no Stop hook fires, every injected
+            // command 401s, so the chain (claude ↔ tmux ↔ bot ↔ Slack) hangs
+            // silently. `/login` is an interactive OAuth flow the bot can't
+            // drive over tmux, so we can only surface it — the owner must
+            // re-auth on the host (attach to the tmux session and run /login).
+            regex: /Please run \/login|API Error: 401[^\n]*Invalid authentication credentials/i,
+            reason: 'auth_401',
+            hint: 'Claude needs re-authentication (API Error: 401 — credentials expired/revoked). The session is frozen and can\'t accept commands until you re-login. SSH to the host, `tmux attach` to this session, and run `/login`.',
         }
     ],
 
