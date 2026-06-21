@@ -3954,7 +3954,21 @@ ${formatted}`
                     if (patterns.length === 0) continue;
 
                     const output = this._captureOutput(s.sessionName);
-                    const match = patterns.find(p => p.regex.test(output));
+                    const allLines = output.split('\n');
+                    const match = patterns.find(p => {
+                        // liveTailLines: scan only the bottom N lines so an
+                        // already-resolved error sitting in scrollback can't
+                        // trigger a false stall (e.g. a 401 followed by a
+                        // successful /login further down the pane).
+                        const hay = p.liveTailLines
+                            ? allLines.slice(-p.liveTailLines).join('\n')
+                            : output;
+                        if (!p.regex.test(hay)) return false;
+                        // clearedRegex: the stall is resolved if its recovery
+                        // marker is present in the same region.
+                        if (p.clearedRegex && p.clearedRegex.test(hay)) return false;
+                        return true;
+                    });
                     const state = this._stallState.get(s.sessionKey) || { notified: false };
 
                     if (match && !state.notified) {

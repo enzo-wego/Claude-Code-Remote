@@ -266,7 +266,17 @@ module.exports = {
             // silently. `/login` is an interactive OAuth flow the bot can't
             // drive over tmux, so we can only surface it — the owner must
             // re-auth on the host (attach to the tmux session and run /login).
+            //
+            // liveTailLines: only match in the bottom N lines of the pane. A
+            // live freeze sits just above the input box; once the owner runs
+            // /login the recovery output pushes the error up into scrollback,
+            // where matching it would be a false positive on already-resolved
+            // history. clearedRegex: extra guard for the brief window right
+            // after /login where both the error and "Login successful" still
+            // share the tail — that's resolved, so don't fire.
             regex: /Please run \/login|API Error: 401[^\n]*Invalid authentication credentials/i,
+            liveTailLines: 25,
+            clearedRegex: /Login successful/i,
             reason: 'auth_401',
             hint: 'Claude needs re-authentication (API Error: 401 — credentials expired/revoked). The session is frozen and can\'t accept commands until you re-login. SSH to the host, `tmux attach` to this session, and run `/login`.',
         }
