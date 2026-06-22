@@ -23,6 +23,18 @@ const { getCliAdapter, adapterNames } = require('../../cli');
 const CLI_NAMES_ALT = adapterNames().join('|');
 const CLI_KEYWORD_RE = new RegExp(`\\bstart\\s+(${CLI_NAMES_ALT})\\b`, 'i');
 const INVESTIGATE_NOW_RE = /\binvestigate\s+(?:it\s+|this\s+)?now\b/i;
+// Working-state detection must inspect only the LIVE bottom of the pane, never
+// scrollback history. A finished tool-call frame (e.g. `Bash(...)` / `Running…`)
+// stays frozen in scrollback and matches `workingIndicators` forever, pinning
+// the idle timer open indefinitely (incident 2026-06-22,
+// CUV9EAYGY/p1782119465788869: a stale `Running…` 107 lines up kept a session
+// alive 13h). The live spinner/timer always renders within the last screenful.
+const WORKING_TAIL_LINES = 30;
+// Cap on consecutive mid-turn idle-timer rechecks where the pane LOOKS working
+// but never changes. A genuine turn mutates the pane every second (token timer,
+// spinner); an unchanging "working" tail across this many rechecks is a stale
+// indicator, so tear down instead of rescheduling forever.
+const MAX_MIDTURN_RECHECKS = 4;
 const CLI_PREFIX_GROUP = `(?:(?:${CLI_NAMES_ALT})\\s+)?`;
 // Anchored to the start of the message (^\s*): these are explicit commands a
 // user types as the whole message, not phrases that may appear mid-sentence.
@@ -51,6 +63,10 @@ class SlackSocketHandler {
         // Polling state per session (in-memory only, rebuilt on start)
         this.pollers = new Map();
         this.sessionTimers = new Map(); // sessionKey -> setTimeout handle
+        // sessionKey -> { sig, count }. Tracks consecutive idle-timer rechecks
+        // where the pane looked "working" but its live tail never changed, so a
+        // stale working indicator can't pin the idle timer open forever.
+        this._midTurnRechecks = new Map();
         // sessionKey -> { heartbeat, giveup } timers. Regular @mention replies
         // are delivered solely by cli-hook-notify.js when the CLI fires its Stop
         // hook. If the CLI never cleanly stops (stuck in a long sub-agent, or the
@@ -1440,6 +1456,22 @@ ${formatted}`
         if (mode !== 'local') {
             this.app.event('message', async ({ event, say }) => {
                 try {
+                    // Owner DM keyword: "reseed" → mint a fresh SSO device-code
+                    // URL on demand (same as tapping the button on an SSO DM).
+                    if (event.channel_type === 'im' && !event.subtype && !event.bot_id
+                        && event.user && event.user === this.config.ownerUserId
+                        && typeof event.text === 'string' && /(^|\s)reseed(\s|$)/i.test(event.text)) {
+                        if (this.ssoPrewarm) {
+                            try {
+                                await this.ssoPrewarm.reseedNow('keyword');
+                            } catch (err) {
+                                this.logger.error(`Keyword re-seed failed: ${err.message}`);
+                                await this.app.client.chat.postMessage({ channel: event.channel, text: `:x: Re-seed failed: ${err.message}` });
+                            }
+                        }
+                        return;
+                    }
+
                     // Handle @mentions that arrive as 'message' instead of 'app_mention'
                     // (happens when multiple Socket Mode connections exist, or with Assistants API)
                     if (!event.subtype && event.text && event.text.includes(`<@`) && !event.bot_id) {
@@ -1477,6 +1509,27 @@ ${formatted}`
         } else {
             this.logger.info('App mode=local: monitor channels and delay alerts disabled');
         }
+
+        // On-demand SSO re-seed button (rendered on the SSO DMs). Both local and
+        // cloud instances receive the click via Socket Mode, but only the one
+        // actually running the prewarm watcher (`this.ssoPrewarm`) acts on it.
+        this.app.action('sso_reseed_now', async ({ ack, body }) => {
+            await ack();
+            if (!this.ssoPrewarm) return; // wrong instance (e.g. APP_MODE=local)
+            const userId = body && body.user && body.user.id;
+            if (this.config.ownerUserId && userId && userId !== this.config.ownerUserId) return;
+            try {
+                await this.ssoPrewarm.reseedNow('button');
+            } catch (err) {
+                this.logger.error(`Re-seed button failed: ${err.message}`);
+                try {
+                    await this.app.client.chat.postMessage({
+                        channel: userId || this.config.ownerUserId,
+                        text: `:x: Re-seed failed: ${err.message}`,
+                    });
+                } catch { /* ignore */ }
+            }
+        });
     }
 
     async _handleMonitoredMessage(event) {
@@ -3114,10 +3167,20 @@ ${formatted}`
     // the same filtering `_injectCommand` and the poller use. Lets the idle
     // timer distinguish "turn still running, nothing posted yet" from a
     // genuinely idle session before killing tmux.
+    // The live tail of the pane (last WORKING_TAIL_LINES rows), used both for
+    // working-state detection and as a change signature. Deliberately excludes
+    // scrollback so stale frames can't be mistaken for live activity.
+    _paneWorkingTail(sessionName) {
+        return this._captureOutput(sessionName)
+            .split('\n')
+            .slice(-WORKING_TAIL_LINES)
+            .join('\n');
+    }
+
     _isPaneWorking(sessionName, cliType = 'claude') {
         const adapter = getCliAdapter(cliType || 'claude');
         const excludePatterns = adapter.workingExcludePatterns || [];
-        const filtered = this._captureOutput(sessionName)
+        const filtered = this._paneWorkingTail(sessionName)
             .split('\n')
             .filter(l => !excludePatterns.some(re => re.test(l)))
             .join('\n')
@@ -3669,6 +3732,7 @@ ${formatted}`
             const freshBotMs = this._parseBotTsMs(session.lastBotTs);
             if (freshBotMs && Date.now() - freshBotMs < timeoutMs) {
                 this.sessionTimers.delete(sessionKey);
+                this._midTurnRechecks.delete(sessionKey);
                 this._startSessionTimeout(sessionKey);
                 return;
             }
@@ -3681,11 +3745,32 @@ ${formatted}`
             // execute the session mid-turn; check the pane's live working
             // indicators and re-check soon instead.
             if (this._isPaneWorking(session.sessionName, session.cliType)) {
-                this.logger.info(`Session ${session.sessionName} idle timer fired mid-turn — pane still working, rechecking in 5min`);
-                this.sessionTimers.delete(sessionKey);
-                this._startSessionTimeout(sessionKey, Math.min(timeoutMs, 300000));
-                return;
+                // The working indicator might be a STALE frame, not a live turn.
+                // A genuine turn mutates the live tail every second (token timer,
+                // spinner); a stuck/finished one is byte-identical between
+                // rechecks. Track the tail signature: while it keeps changing we
+                // keep rescheduling (real work), but once it sits unchanged for
+                // MAX_MIDTURN_RECHECKS consecutive rechecks the indicator is
+                // stale — stop rescheduling forever and tear the session down.
+                const sig = this._paneWorkingTail(session.sessionName);
+                const prev = this._midTurnRechecks.get(sessionKey);
+                if (prev && prev.sig === sig) {
+                    prev.count += 1;
+                } else {
+                    this._midTurnRechecks.set(sessionKey, { sig, count: 1 });
+                }
+                const { count } = this._midTurnRechecks.get(sessionKey);
+                if (count < MAX_MIDTURN_RECHECKS) {
+                    this.logger.info(`Session ${session.sessionName} idle timer fired mid-turn — pane still working (recheck ${count}/${MAX_MIDTURN_RECHECKS}), rechecking in 5min`);
+                    this.sessionTimers.delete(sessionKey);
+                    this._startSessionTimeout(sessionKey, Math.min(timeoutMs, 300000));
+                    return;
+                }
+                this.logger.warn(`Session ${session.sessionName} 'working' indicator unchanged across ${count} rechecks — treating as stale, tearing down`);
+                this._midTurnRechecks.delete(sessionKey);
+                // fall through to teardown
             }
+            this._midTurnRechecks.delete(sessionKey);
 
             const minutes = Math.round(timeoutMs / 60000);
             this.logger.info(`Session ${session.sessionName} timed out after ${minutes}min of inactivity`);
@@ -3766,6 +3851,7 @@ ${formatted}`
         // The inflight watchdog and the idle timer share a lifecycle: both are
         // cancelled when the user re-engages, /exits, or the session dies.
         this._clearInflightWatchdog(sessionKey);
+        this._midTurnRechecks.delete(sessionKey);
         if (this.sessionTimers.has(sessionKey)) {
             clearTimeout(this.sessionTimers.get(sessionKey));
             this.sessionTimers.delete(sessionKey);

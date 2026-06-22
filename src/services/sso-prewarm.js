@@ -177,6 +177,69 @@ class SsoPrewarm {
         return this.getStatus();
     }
 
+    // Operator-triggered immediate re-seed (Slack button / DM keyword). Mints a
+    // fresh device-code URL on demand, DMs it, and starts the same approval
+    // poll the scheduled path uses — so a human tap and the timer flow through
+    // identical machinery. Returns the reseed object; throws on failure so the
+    // caller can surface it.
+    async reseedNow(trigger = 'manual') {
+        const reseed = await this._callAdminReseed();
+        if (!reseed || !reseed.verification_url) {
+            throw new Error(`/admin/reseed returned no URL (${JSON.stringify(reseed)})`);
+        }
+        const mins = Math.max(1, Math.round((reseed.expires_in || 600) / 60));
+        const text = [
+            ':arrows_counterclockwise: *On-demand SSO re-seed*',
+            `*Approve:* <${reseed.verification_url}|${reseed.verification_url}>`,
+            `*User code:* \`${reseed.user_code}\``,
+            `_Triggered from Slack (${trigger}). URL valid ~${mins}min._`,
+        ].join('\n');
+        if (this.slackClient && this.ownerUserId) {
+            try {
+                await this.slackClient.chat.postMessage({
+                    channel: this.ownerUserId,
+                    text,
+                    blocks: this._dmBlocks(text),
+                    unfurl_links: false,
+                });
+            } catch (err) {
+                this.logger.error(`Failed to DM on-demand re-seed URL: ${err.message}`);
+            }
+        }
+        // Watch for approval exactly like the scheduled path: the SSO token's
+        // expiresAt advances when `aws sso login` writes a fresh token.
+        const baseline = await this._callReseedStatus().catch(() => null);
+        if (baseline && baseline.sso_token_expires_at) {
+            this._savePending({
+                dmTs: Date.now(),
+                baselineExpiresAt: baseline.sso_token_expires_at,
+                verificationUrl: reseed.verification_url,
+                userCode: reseed.user_code,
+            });
+            this._pollScheduledApproval(baseline.sso_token_expires_at);
+        }
+        this.logger.info(`On-demand re-seed issued (trigger=${trigger}, reused=${!!reseed.reused})`);
+        return reseed;
+    }
+
+    // Render a DM body as Block Kit with a "Re-seed now" button appended, so the
+    // operator can mint a fresh URL with one tap. `text` stays as the
+    // notification fallback (and what shows in the push notification).
+    _dmBlocks(text) {
+        return [
+            { type: 'section', text: { type: 'mrkdwn', text } },
+            {
+                type: 'actions',
+                elements: [{
+                    type: 'button',
+                    action_id: 'sso_reseed_now',
+                    text: { type: 'plain_text', text: '🔁 Re-seed now', emoji: true },
+                    style: 'primary',
+                }],
+            },
+        ];
+    }
+
     async _tick() {
         if (this._inFlight) {
             this.logger.debug('SSO pre-warm: previous tick still in flight, skipping');
@@ -334,6 +397,7 @@ class SsoPrewarm {
             await this.slackClient.chat.postMessage({
                 channel: this.ownerUserId,
                 text,
+                blocks: this._dmBlocks(text),
                 unfurl_links: false,
             });
         } catch (err) {
@@ -498,6 +562,7 @@ class SsoPrewarm {
             await this.slackClient.chat.postMessage({
                 channel: this.ownerUserId,
                 text,
+                blocks: this._dmBlocks(text),
                 unfurl_links: false,
             });
             this.logger.info(`Scheduled re-seed DM sent (reused=${!!reseed.reused})`);
