@@ -292,7 +292,7 @@ async function handleAction({ body, action, client }) {
                     ...body.message.blocks.filter((b) => b.type !== 'actions'),
                     {
                         type: 'context',
-                        elements: [{ type: 'mrkdwn', text: `_You answered: *${value}*_` }],
+                        elements: [{ type: 'mrkdwn', text: `_${answeredBy(body)} answered: *${value}*_` }],
                     },
                 ],
             });
@@ -309,7 +309,7 @@ async function handleViewSubmission({ body, view, client }) {
 
     const callbackId = view.callback_id || '';
     if (callbackId.endsWith(':wizard')) {
-        return handleWizardStep({ requestId, currentStep: meta.step ?? 0, view, client });
+        return handleWizardStep({ requestId, currentStep: meta.step ?? 0, view, client, body });
     }
 
     // Capture the in-thread bootstrap/CTA message coordinates BEFORE we
@@ -325,7 +325,7 @@ async function handleViewSubmission({ body, view, client }) {
     askUserTool.resolvePending(requestId, { answers, status: 'ok' });
 
     if (client && channel && slackTs) {
-        await updateBootstrapWithAnswers(client, channel, slackTs, answers).catch((err) =>
+        await updateBootstrapWithAnswers(client, channel, slackTs, answers, body).catch((err) =>
             logger.warn(`failed to update bootstrap after modal submit: ${err.message}`),
         );
     }
@@ -339,7 +339,7 @@ async function handleViewSubmission({ body, view, client }) {
  *   - returns response_action=update with the next step's view so Slack
  *     swaps the modal contents in place.
  */
-function handleWizardStep({ requestId, currentStep, view, client }) {
+function handleWizardStep({ requestId, currentStep, view, client, body }) {
     const entry = askUserTool.getPending(requestId);
     if (!entry) return null;
 
@@ -365,7 +365,7 @@ function handleWizardStep({ requestId, currentStep, view, client }) {
             status: 'ok',
         });
         if (client && channel && slackTs) {
-            updateBootstrapWithAnswers(client, channel, slackTs, updated.answers).catch((err) =>
+            updateBootstrapWithAnswers(client, channel, slackTs, updated.answers, body).catch((err) =>
                 logger.warn(`failed to update wizard bootstrap: ${err.message}`),
             );
         }
@@ -475,8 +475,8 @@ function safeParseJson(s) {
  * button and (b) show the user a short summary of what they answered.
  * Matches the look the in-thread button path produces in handleAction.
  */
-async function updateBootstrapWithAnswers(client, channel, ts, answers) {
-    const summary = formatAnswersSummary(answers);
+async function updateBootstrapWithAnswers(client, channel, ts, answers, body) {
+    const summary = formatAnswersSummary(answers, body);
     return client.chat.update({
         channel,
         ts,
@@ -488,9 +488,21 @@ async function updateBootstrapWithAnswers(client, channel, ts, answers) {
     });
 }
 
-function formatAnswersSummary(answers) {
-    if (!answers || Object.keys(answers).length === 0) return 'You answered: (no values)';
-    return 'You answered: ' + Object.entries(answers)
+/**
+ * Render the answering Slack user as a `<@id>` mention so the confirmation
+ * shows WHO answered — a teammate can answer, not just the session owner, so a
+ * bare "You answered" hid the actual responder. Falls back to "Someone" when
+ * the interaction payload carries no user id.
+ */
+function answeredBy(body) {
+    const id = body?.user?.id;
+    return id ? `<@${id}>` : 'Someone';
+}
+
+function formatAnswersSummary(answers, body) {
+    const who = answeredBy(body);
+    if (!answers || Object.keys(answers).length === 0) return `${who} answered: (no values)`;
+    return `${who} answered: ` + Object.entries(answers)
         .map(([k, v]) => {
             const val = Array.isArray(v) ? v.join(', ') : (v == null ? '(none)' : String(v));
             const trimmed = val.length > 200 ? `${val.slice(0, 200)}…` : val;
