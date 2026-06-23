@@ -12,7 +12,7 @@ function formatSystemBlock(resolveResponse) {
   lines.push('Cite by node_id when referencing them in your reply.');
   lines.push('');
   for (const a of resolveResponse.artifacts) {
-    const author = a.author?.name ? ` — _${a.author.name}_` : '';
+    const author = a.author ? ` — _${a.author}_` : '';
     const score = a.score != null ? ` _(score ${a.score.toFixed(2)}, hop ${a.hop ?? 0})_` : '';
     lines.push(`### [${a.type}] ${a.title || a.node_id}${author}${score}`);
     lines.push(`URL: ${a.url}`);
