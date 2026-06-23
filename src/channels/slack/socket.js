@@ -3279,6 +3279,36 @@ ${formatted}`
             .join('\n');
     }
 
+    // Normalize a pane capture into a fingerprint that ignores everything which
+    // animates without representing forward progress: the CLI's own working
+    // status line (Claude's rotating "Burrowing…" verb, Codex's spinner,
+    // Gemini's "Thinking… (8h 54m)"), block/braille animation glyphs, digit
+    // runs (timers, token/percent counters, "… N hidden …"), and whitespace
+    // churn. A genuinely-busy-looping pane then yields a STABLE key while a
+    // progressing turn changes words and moves the key. Provider-agnostic: the
+    // working-status lines are dropped via each adapter's own indicators, so it
+    // neutralizes Claude/Codex/Gemini chrome uniformly rather than hard-coding
+    // one CLI's glyphs (incident 2026-06-23: Gemini's animated shimmer bar +
+    // elapsed timer defeated the old digit-only key and pinned the session open
+    // for 9h).
+    _stableFingerprint(text, adapter) {
+        const indicators = (adapter && adapter.workingIndicators) || [];
+        const regexes = (adapter && adapter.workingRegexes) || [];
+        return String(text)
+            .split('\n')
+            .filter(line => {
+                const l = line.toLowerCase();
+                if (indicators.some(ind => l.includes(ind))) return false;
+                if (regexes.some(re => re.test(l))) return false;
+                return true;
+            })
+            .join('\n')
+            .replace(/[▀-▟⠀-⣿]+/g, '') // block elements + braille spinners
+            .replace(/\d+/g, '#')                          // timers, counters, percentages
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
     _isPaneWorking(sessionName, cliType = 'claude') {
         const adapter = getCliAdapter(cliType || 'claude');
         const excludePatterns = adapter.workingExcludePatterns || [];
@@ -3617,7 +3647,7 @@ ${formatted}`
             // produces a stable key, while a genuinely-progressing investigation
             // changes words and resets the no-progress clock. Read by hitNoProgress
             // on the NEXT tick (the timeout check runs before this block).
-            const progressKey = nonStatusLines.join('\n').replace(/\d+/g, '#');
+            const progressKey = this._stableFingerprint(nonStatusLines.join('\n'), adapter);
             if (progressKey !== lastProgressKey) {
                 lastProgressKey = progressKey;
                 lastProgressAt = Date.now();
@@ -3847,30 +3877,55 @@ ${formatted}`
             // execute the session mid-turn; check the pane's live working
             // indicators and re-check soon instead.
             if (this._isPaneWorking(session.sessionName, session.cliType)) {
-                // The working indicator might be a STALE frame, not a live turn.
-                // A genuine turn mutates the live tail every second (token timer,
-                // spinner); a stuck/finished one is byte-identical between
-                // rechecks. Track the tail signature: while it keeps changing we
-                // keep rescheduling (real work), but once it sits unchanged for
-                // MAX_MIDTURN_RECHECKS consecutive rechecks the indicator is
-                // stale — stop rescheduling forever and tear the session down.
-                const sig = this._paneWorkingTail(session.sessionName);
-                const prev = this._midTurnRechecks.get(sessionKey);
-                if (prev && prev.sig === sig) {
-                    prev.count += 1;
+                // Absolute wall cap — independent of any working-indicator
+                // heuristic. A single turn cannot stay in flight forever; this
+                // survives service restarts (KillMode=process kills the
+                // in-memory poller, but this timer is re-armed by reconcile and
+                // anchored to DB timestamps). Without it, a pane whose chrome
+                // keeps mutating resets the recheck signature every cycle and
+                // never tears down (incident 2026-06-23: a Gemini alert turn
+                // looped on ExpiredTokenException for 9h). Anchored to the most
+                // recent of session creation / last bot post so an actively
+                // replying chat session never trips it.
+                const turnAnchorMs = Math.max(
+                    session.createdAt || 0,
+                    this._parseBotTsMs(session.lastBotTs) || 0
+                );
+                const maxTurnWallMs = this.config.maxTurnWallMs || 7200000; // 2h
+                if (turnAnchorMs && (Date.now() - turnAnchorMs) > maxTurnWallMs) {
+                    this.logger.warn(`Session ${session.sessionName} exceeded ${Math.round(maxTurnWallMs / 60000)}min turn wall cap while working — tearing down`);
+                    this._midTurnRechecks.delete(sessionKey);
+                    // fall through to teardown
                 } else {
-                    this._midTurnRechecks.set(sessionKey, { sig, count: 1 });
+                    // The working indicator might be a STALE frame, not a live turn.
+                    // A genuine turn mutates the live tail every second (token timer,
+                    // spinner); a stuck/finished one is byte-identical between
+                    // rechecks. Track a NORMALIZED tail signature (animated
+                    // spinner/timer/glyph chrome stripped) so a busy-loop reprinting
+                    // the same screen sits unchanged and counts down, instead of the
+                    // raw tail whose chrome churn reset the count forever. Once it
+                    // holds across MAX_MIDTURN_RECHECKS rechecks, tear down.
+                    const sig = this._stableFingerprint(
+                        this._paneWorkingTail(session.sessionName),
+                        getCliAdapter(session.cliType)
+                    );
+                    const prev = this._midTurnRechecks.get(sessionKey);
+                    if (prev && prev.sig === sig) {
+                        prev.count += 1;
+                    } else {
+                        this._midTurnRechecks.set(sessionKey, { sig, count: 1 });
+                    }
+                    const { count } = this._midTurnRechecks.get(sessionKey);
+                    if (count < MAX_MIDTURN_RECHECKS) {
+                        this.logger.info(`Session ${session.sessionName} idle timer fired mid-turn — pane still working (recheck ${count}/${MAX_MIDTURN_RECHECKS}), rechecking in 5min`);
+                        this.sessionTimers.delete(sessionKey);
+                        this._startSessionTimeout(sessionKey, Math.min(timeoutMs, 300000));
+                        return;
+                    }
+                    this.logger.warn(`Session ${session.sessionName} 'working' indicator unchanged across ${count} rechecks — treating as stale, tearing down`);
+                    this._midTurnRechecks.delete(sessionKey);
+                    // fall through to teardown
                 }
-                const { count } = this._midTurnRechecks.get(sessionKey);
-                if (count < MAX_MIDTURN_RECHECKS) {
-                    this.logger.info(`Session ${session.sessionName} idle timer fired mid-turn — pane still working (recheck ${count}/${MAX_MIDTURN_RECHECKS}), rechecking in 5min`);
-                    this.sessionTimers.delete(sessionKey);
-                    this._startSessionTimeout(sessionKey, Math.min(timeoutMs, 300000));
-                    return;
-                }
-                this.logger.warn(`Session ${session.sessionName} 'working' indicator unchanged across ${count} rechecks — treating as stale, tearing down`);
-                this._midTurnRechecks.delete(sessionKey);
-                // fall through to teardown
             }
             this._midTurnRechecks.delete(sessionKey);
 

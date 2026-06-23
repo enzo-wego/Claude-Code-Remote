@@ -35,4 +35,13 @@ module.exports = [
         regex: /Error loading SSO Token|The SSO session associated with this profile has expired|Token has expired and refresh failed/i,
         reason: 'AWS SSO token expired — re-authenticate',
     },
+    {
+        // Short-lived STS role credentials expired mid-investigation, e.g.
+        //   aws: [ERROR]: An error occurred (ExpiredTokenException) ...:
+        //   The security token included in the request is expired
+        // The CLI then retries the same query forever (incident
+        // C08S954G2LX/p1782197278, 2026-06-23: a Gemini turn looped for 9h).
+        regex: /ExpiredTokenException|The security token included in the request is expired/i,
+        reason: 'AWS STS credentials expired mid-investigation',
+    },
 ];
