@@ -1549,7 +1549,7 @@ ${formatted}`
 
                     // T11: Graph-ingest forwarder — fire-and-forget, never block Slack delivery
                     if (process.env.GRAPH_INGEST_ENABLED === 'true') {
-                        graphIngest.handle(event, client).catch(err =>
+                        graphIngest.handle(event, this.app.client).catch(err =>
                             this.logger.debug(`graph-ingest handle failed: ${err.message}`)
                         );
                     }
