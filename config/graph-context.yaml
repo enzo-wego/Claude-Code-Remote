@@ -1,0 +1,16 @@
+enabled: true
+default_budget_tokens: 4000
+default_depth: 2
+timeout_ms: 2000
+
+# Per-channel overrides. Channel id → settings.
+channels:
+  C08S954G2LX:                 # payments-incidents
+    budget_tokens: 6000
+    depth: 2
+  C05RNSE8TBR:                 # payments-cko
+    enabled: true
+
+# Channels in this list never trigger graph injection.
+denylist:
+  - C_GENERAL_NOISE_CHANNEL

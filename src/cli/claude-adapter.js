@@ -80,12 +80,30 @@ function removeOurHooks(list) {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Compose the final prompt text by optionally prepending a system block.
+ * Extracted for testability; also used by socket.js to prepend graph context.
+ *
+ * @param {Object} opts
+ * @param {string} opts.prompt      - The user-facing prompt.
+ * @param {string} [opts.systemBlock] - Optional system block to prepend (e.g. graph context).
+ * @returns {string}
+ */
+function buildPromptText({ prompt, systemBlock }) {
+    if (systemBlock) {
+        return `${systemBlock}\n\n---\n\n${prompt}`;
+    }
+    return prompt;
+}
+
 module.exports = {
     type: 'claude',
     // Mid-turn fatal errors (missing AWS profile, expired SSO) that the poller
     // escalates on instead of busy-looping until the wall ceiling. See
     // runtime-fatal-patterns.js.
     runtimeFatalPatterns: RUNTIME_FATAL_PATTERNS,
+
+    buildPromptText,
 
     // True when this adapter's installMcp() actually wires the agent to our
     // slack-ask MCP server. Socket.js gates the askUserGuidance prepend on
