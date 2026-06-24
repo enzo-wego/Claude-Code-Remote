@@ -186,7 +186,7 @@ function extractAlertReport(transcriptPath) {
 
             const MIN_REPORT_LEN = 500;
             if (text && text.length >= MIN_REPORT_LEN
-                && /(?:^|\n)(?:#{1,3}\s+)?(?:\*\*)?Recommended Action(?:\*\*)?:/im.test(text)) {
+                && /(?:^|\n)(?:#{1,3}\s+)?(?:\*\*)?Recommended Action(?:\*\*)?:?/im.test(text)) {
                 if (!bestReport || text.length > bestReport.length) {
                     bestReport = text;
                 }
@@ -808,6 +808,11 @@ async function sendHookNotification() {
                 const primaryFile = `/tmp/hook-primary-${slackSessionKey}`;
                 const warningFile = `/tmp/hook-warning-${slackSessionKey}`;
                 const retryFile = `/tmp/hook-retry-${slackSessionKey}`;
+                //   hook-firststop-<key>  ts (ms) of the first report-less Stop —
+                //   used to gate the "unresponsive" warning on real wall-clock, so a
+                //   legit long sub-agent run can't burn the nudge budget on a few
+                //   narration Stops and trip a false alarm in the first ~2 minutes.
+                const firstStopFile = `/tmp/hook-firststop-${slackSessionKey}`;
 
                 let primary = null;
                 try { primary = JSON.parse(fs.readFileSync(primaryFile, 'utf-8')); } catch { /* no prior primary */ }
@@ -885,7 +890,7 @@ async function sendHookNotification() {
                 }
 
                 if (!hasValidReport && assistantMessage && assistantMessage.length >= 500
-                    && /(?:^|\n)(?:#{1,3}\s+)?(?:\*\*)?Recommended Action(?:\*\*)?:/im.test(assistantMessage)) {
+                    && /(?:^|\n)(?:#{1,3}\s+)?(?:\*\*)?Recommended Action(?:\*\*)?:?/im.test(assistantMessage)) {
                     hasValidReport = true;
                 }
 
@@ -899,9 +904,14 @@ async function sendHookNotification() {
 
                 if (hasValidReport) {
                     try { fs.unlinkSync(retryFile); } catch { /* ignore */ }
-                    const match = assistantMessage.match(/Recommended Action:\s*([\s\S]*?)(?:\n\s*---|\n\n##|\n\n\*\*)/i);
+                    try { fs.unlinkSync(firstStopFile); } catch { /* ignore */ }
+                    // Colon is optional: the alert skill / nudge produces a
+                    // `## Recommended Action` heading (no colon), which renders
+                    // without a trailing `:`. Accept both heading and label forms.
+                    const headRe = /(?:#{1,3}\s+)?(?:\*\*)?Recommended Action(?:\*\*)?:?\s*/i;
+                    const match = assistantMessage.match(new RegExp(headRe.source + '([\\s\\S]*?)(?:\\n\\s*---|\\n\\n##|\\n\\n\\*\\*)', 'i'));
                     const summary = match ? match[1].trim() : (
-                        assistantMessage.match(/Recommended Action:\s*(.+(?:\n(?!\n).+)*)/i)?.[1]?.trim()
+                        assistantMessage.match(new RegExp(headRe.source + '(.+(?:\\n(?!\\n).+)*)', 'i'))?.[1]?.trim()
                         || assistantMessage.substring(0, 500).trim()
                     );
 
@@ -1049,6 +1059,11 @@ async function sendHookNotification() {
                     let retryCount = 0;
                     try { retryCount = parseInt(fs.readFileSync(retryFile, 'utf-8').trim(), 10) || 0; } catch { /* first attempt */ }
 
+                    // Stamp the first report-less Stop so the warning below can be
+                    // gated on real elapsed time, not on how many narration Stops the
+                    // agent happened to emit while a sub-agent was legitimately busy.
+                    try { fs.writeFileSync(firstStopFile, String(Date.now()), { flag: 'wx' }); } catch { /* already stamped */ }
+
                     let tmuxAlive = false;
                     if (sessionName) {
                         try {
@@ -1075,6 +1090,23 @@ async function sendHookNotification() {
                     }
 
                     if (tmuxAlive) {
+                        // Retries exhausted but the session is still alive. Before
+                        // declaring the agent "unresponsive", require a real wall-clock
+                        // floor since the first report-less Stop — a legit sub-agent run
+                        // (e.g. a 6-7 min DB investigation) emits several short narration
+                        // Stops that can burn all nudges in ~2 minutes while real work is
+                        // still in flight. Stay silent until the floor passes; the agent
+                        // may still produce a report, and if tmux dies the definitive
+                        // "incomplete" notice below still fires.
+                        const HOOK_MIN_WALL_MS = parseInt(process.env.HOOK_MIN_WALL_MS, 10) || 10 * 60 * 1000;
+                        let firstStopAt = 0;
+                        try { firstStopAt = parseInt(fs.readFileSync(firstStopFile, 'utf-8').trim(), 10) || 0; } catch { /* unstamped */ }
+                        const elapsed = firstStopAt ? Date.now() - firstStopAt : 0;
+                        if (firstStopAt && elapsed < HOOK_MIN_WALL_MS) {
+                            console.error(`Retries exhausted but only ${Math.round(elapsed / 1000)}s elapsed (floor ${Math.round(HOOK_MIN_WALL_MS / 1000)}s) — agent likely still working, staying silent`);
+                            return;
+                        }
+
                         // Retries exhausted but the session is still alive. The AI agent
                         // may be waiting on async tool callbacks (Monitor, background
                         // Bash) and could still produce a report. Post a single
@@ -1124,6 +1156,7 @@ async function sendHookNotification() {
                     // tmux is genuinely gone → definitive incomplete notice.
                     try { fs.unlinkSync(retryFile); } catch { /* ignore */ }
                     try { fs.unlinkSync(warningFile); } catch { /* ignore */ }
+                    try { fs.unlinkSync(firstStopFile); } catch { /* ignore */ }
                     console.error(`tmux session dead, no valid report (assistantMessage: ${(assistantMessage || '').length} chars) — posting final incomplete notice`);
                     await web.chat.postMessage({
                         channel: channelId,

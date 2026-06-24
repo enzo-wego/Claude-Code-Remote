@@ -3718,7 +3718,7 @@ ${formatted}`
                             // and are substantially longer than one-line status messages.
                             const MIN_ALERT_BUFFER_LEN = 500;
                             const hasCompletionMarker = alertBuffer.length >= MIN_ALERT_BUFFER_LEN
-                                && /(?:^|\n)(?:#{1,3}\s+)?(?:\*\*)?Recommended Action(?:\*\*)?:/im.test(alertBuffer);
+                                && /(?:^|\n)(?:#{1,3}\s+)?(?:\*\*)?Recommended Action(?:\*\*)?:?/im.test(alertBuffer);
 
                             if (hasCompletionMarker || alertAccumulationCount >= 5) {
                                 // Stop the accumulation loop. Posting is normally handled by
@@ -4685,13 +4685,16 @@ ${formatted}`
      * Looks for text between "Recommended Action:" and the next "---" or section boundary.
      */
     _extractRecommendedAction(response) {
-        // Match "Recommended Action:" followed by content, up to next "---" or "##" or "**"
-        const match = response.match(/Recommended Action:\s*([\s\S]*?)(?:\n\s*---|\n\n##|\n\n\*\*)/i);
+        // Colon is optional: the alert skill / nudge emits a `## Recommended Action`
+        // heading (no colon). Accept both heading and label forms.
+        const head = '(?:#{1,3}\\s+)?(?:\\*\\*)?Recommended Action(?:\\*\\*)?:?\\s*';
+        // Match the section content up to next "---" or "##" or "**"
+        const match = response.match(new RegExp(head + '([\\s\\S]*?)(?:\\n\\s*---|\\n\\n##|\\n\\n\\*\\*)', 'i'));
         if (match) {
             return match[1].trim();
         }
-        // Fallback: take first paragraph after "Recommended Action:", or first 500 chars
-        const paraMatch = response.match(/Recommended Action:\s*(.+(?:\n(?!\n).+)*)/i);
+        // Fallback: take first paragraph after the heading, or first 500 chars
+        const paraMatch = response.match(new RegExp(head + '(.+(?:\\n(?!\\n).+)*)', 'i'));
         if (paraMatch) {
             return paraMatch[1].trim();
         }
@@ -4706,7 +4709,7 @@ ${formatted}`
         // Real investigation reports are 500+ chars and contain a proper "Recommended Action" heading.
         const MIN_REPORT_LEN = 500;
         const isValidReport = response && response.length >= MIN_REPORT_LEN
-            && /(?:^|\n)(?:#{1,3}\s+)?(?:\*\*)?Recommended Action(?:\*\*)?:/im.test(response);
+            && /(?:^|\n)(?:#{1,3}\s+)?(?:\*\*)?Recommended Action(?:\*\*)?:?/im.test(response);
 
         if (!isValidReport) {
             this.logger.warn(`Alert summary rejected: content doesn't look like a real report (${(response || '').length} chars) — posting incomplete notice`);
