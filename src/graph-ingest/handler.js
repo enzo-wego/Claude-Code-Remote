@@ -35,7 +35,7 @@ function buildPayload(event, normalizedBody, mentions, links, filterMeta, cache)
     const realEvent = isChanged ? (event.message || event) : event;
 
     const channelId = event.channel;
-    const ts = realEvent.ts || event.ts;
+    const ts = isDeleted ? (event.deleted_ts || (event.previous_message && event.previous_message.ts) || event.ts) : (realEvent.ts || event.ts);
     const threadTs = realEvent.thread_ts || null;
     const canonicalUrl = buildCanonicalUrl(channelId, ts);
 
