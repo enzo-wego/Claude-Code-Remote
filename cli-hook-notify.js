@@ -13,6 +13,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const dotenv = require('dotenv');
 const { execSync } = require('child_process');
 const { postOncallDoubleCheck } = require('./src/services/oncall-mention');
@@ -939,6 +940,17 @@ async function sendHookNotification() {
                     let postedTs = null;
                     const isUpdate = !!(primary && primary.ts);
 
+                    // Dedup: extractAlertReport() re-scans the whole transcript on
+                    // every Stop and re-surfaces the SAME longest report, so an agent
+                    // that keeps running (e.g. OMC /loop) would re-trigger an update +
+                    // file delete + re-upload on every narration turn. Skip entirely
+                    // when the report content is byte-identical to what we last posted.
+                    const reportHash = crypto.createHash('sha1').update(assistantMessage).digest('hex');
+                    if (isUpdate && primary.hash && primary.hash === reportHash) {
+                        console.error(`Report unchanged (hash ${reportHash.slice(0, 8)}) — skipping redundant update/re-upload`);
+                        return;
+                    }
+
                     if (isUpdate) {
                         // Claude refined its answer on a later turn. Overwrite the
                         // existing post in-place so the thread shows one clean message
@@ -993,7 +1005,7 @@ async function sendHookNotification() {
 
                     if (postedTs) {
                         try {
-                            fs.writeFileSync(primaryFile, JSON.stringify({ ts: postedTs, fileId: uploadedFileId }));
+                            fs.writeFileSync(primaryFile, JSON.stringify({ ts: postedTs, fileId: uploadedFileId, hash: reportHash }));
                         } catch (err) {
                             console.error(`Failed to persist primary stash: ${err.message}`);
                         }
