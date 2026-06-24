@@ -25,8 +25,8 @@ function shouldIngest(event, { allowedChannels, skipSubtypes, enzoBotUserId } = 
     const skip = new Set([...DEFAULT_SKIP_SUBTYPES, ...(skipSubtypes || [])]);
     const selfId = enzoBotUserId || process.env.ENZOBOT_USER_ID;
 
-    // 1. Channel allowlist
-    if (!allowed.has(event.channel)) {
+    // 1. Channel allowlist ("*" = allow all channels the bot is in)
+    if (!allowed.has("*") && !allowed.has(event.channel)) {
         return { pass: false };
     }
 
