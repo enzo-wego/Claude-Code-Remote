@@ -3375,6 +3375,19 @@ ${formatted}`
         let lastProgressKey = null;
         let lastIsWorking = false; // working-state from the previous tick (timeout check runs before this tick computes it)
         let runtimeFatalReason = null; // FIX B — set when a runtime-fatal pattern is seen in the pane
+        // Confirmation auto-approve is checked on EVERY tick, independent of the
+        // full-pane `stableCount` gate below. A backgrounded sub-agent's animated
+        // spinner ("✻ Waiting for 1 background agent to finish") mutates the pane
+        // every tick, so `stableCount` never reaches `stableThreshold` and the
+        // old in-gate auto-approve could starve forever, leaving Claude frozen on
+        // a "Do you want to proceed?" dialog (which is never relayed to Slack) and
+        // never firing its Stop hook. We use a tiny private debounce (the dialog
+        // text present for `confirmThreshold` consecutive ticks) plus a cooldown
+        // so a single dialog isn't double-approved while the keystrokes land.
+        let confirmCount = 0;
+        let lastAutoApproveAt = 0;
+        const confirmThreshold = 2;   // ticks the dialog must persist before we click
+        const autoApproveCooldownMs = 4000;
         const stableThreshold = 3;
 
         const interval = setInterval(async () => {
@@ -3641,6 +3654,31 @@ ${formatted}`
                 (adapter.workingRegexes || []).some(re => re.test(tailText));
             if (isWorking) everSawWorking = true;
 
+            // Confirmation auto-approve — runs on EVERY tick, NOT gated by
+            // `stableCount >= stableThreshold`. A blocking CLI confirmation (e.g.
+            // Claude Code's bash-safety "Do you want to proceed?", which fires even
+            // under --dangerously-skip-permissions) is a terminal state the model
+            // can't escape on its own — it's suspended below the harness layer, so
+            // the Slack `ask_user` MCP can't reach it either. Animated chrome
+            // elsewhere on the pane (a backgrounded sub-agent's spinner) keeps
+            // resetting `stableCount`, so the old in-gate check could wait forever.
+            // The `confirmThreshold` debounce avoids firing on a transient frame;
+            // the cooldown avoids re-clicking while the keystrokes land.
+            if (adapter.handlesConfirmationPrompts &&
+                !isWorking &&
+                (adapter.confirmationPrompts || []).some(p => currentOutput.includes(p))) {
+                confirmCount++;
+                if (confirmCount >= confirmThreshold &&
+                    Date.now() - lastAutoApproveAt >= autoApproveCooldownMs) {
+                    this._autoApprove(sessionName, currentOutput);
+                    lastAutoApproveAt = Date.now();
+                    confirmCount = 0;
+                    stableCount = 0;
+                }
+            } else {
+                confirmCount = 0;
+            }
+
             // FIX A — forward-progress fingerprint. Strip digit runs (the
             // spinner timer "Working (4m 04s)", "Context 20% used", "5h 91% le…",
             // token counters) so a busy-loop reprinting the same error/screen
@@ -3807,11 +3845,8 @@ ${formatted}`
                     return;
                 }
 
-                if (adapter.handlesConfirmationPrompts &&
-                    (adapter.confirmationPrompts || []).some(p => currentOutput.includes(p))) {
-                    this._autoApprove(sessionName, currentOutput);
-                    stableCount = 0;
-                }
+                // (Confirmation auto-approve moved out of this stability gate —
+                // see the per-tick block above, after `isWorking` is computed.)
             }
             } catch (err) {
                 this.logger.error(`Poller error for ${sessionName}: ${err.message}`);
