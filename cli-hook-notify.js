@@ -529,6 +529,66 @@ function updateLastBotTs(slackSessionKey) {
     }
 }
 
+/**
+ * True if the session's thread-root message still exists. If the user deleted
+ * the message that spawned the session, posting into its thread_ts silently
+ * lands at the channel root (orphaned) — so we check first and skip the post.
+ *
+ * Uses conversations.history (Slack omits deleted messages from it) rather than
+ * conversations.replies, which returns thread_not_found for a perfectly valid
+ * message that simply has no replies yet — that would false-positive on the
+ * first post of every session. On any API error we assume it exists: better to
+ * post a possibly-orphaned message than to wrongly tear down a healthy session.
+ */
+async function threadRootExists(web, channelId, threadTs) {
+    try {
+        const res = await web.conversations.history({
+            channel: channelId,
+            latest: threadTs,
+            oldest: threadTs,
+            inclusive: true,
+            limit: 1,
+        });
+        return Array.isArray(res.messages) && res.messages.some(m => m.ts === threadTs);
+    } catch (err) {
+        console.error(`Thread-root existence check failed: ${err.message}`);
+        return true;
+    }
+}
+
+/**
+ * Tear down a session whose thread root was deleted: drop the DB row and kill
+ * its tmux session so it stops re-posting into the void on the next turn. The
+ * row delete happens first so state is clean even if killing our own tmux pane
+ * takes this hook process down with it. (MCP config cleanup is left to the
+ * bot's socket-side reaper — this is a best-effort backstop.)
+ */
+function reapDeadThreadSession(slackSessionKey, sessionName) {
+    if (slackSessionKey) {
+        try {
+            const Database = require('better-sqlite3');
+            const dbPath = path.join(projectDir, 'src/data/slack-sessions.db');
+            if (fs.existsSync(dbPath)) {
+                const db = new Database(dbPath);
+                db.pragma('journal_mode = WAL');
+                db.prepare('DELETE FROM sessions WHERE session_key = ?').run(slackSessionKey);
+                db.close();
+            }
+        } catch (err) {
+            console.error(`Failed to delete dead-thread session row ${slackSessionKey}: ${err.message}`);
+        }
+    }
+    if (sessionName) {
+        // execFileSync (no shell) — sessionName is bot-generated, but args-array
+        // form keeps this injection-free regardless. stdio:'ignore' swallows the
+        // "session not found" noise when the pane is already gone.
+        try {
+            const { execFileSync } = require('child_process');
+            execFileSync('tmux', ['kill-session', '-t', sessionName], { stdio: 'ignore' });
+        } catch { /* already gone, or our pane was torn down first */ }
+    }
+}
+
 function markAlertQueueComplete(channelId, alertMessageTs) {
     if (!channelId || !alertMessageTs) return;
     try {
@@ -783,6 +843,15 @@ async function sendHookNotification() {
 
     if (assistantMessage && threadTs) {
         try {
+            // If the user deleted the message that spawned this session, the
+            // thread root is gone and a post would silently orphan at the
+            // channel root. Don't post — tear the session down (DB row + tmux)
+            // so it stops generating turns and re-posting into the void.
+            if (!(await threadRootExists(web, channelId, threadTs))) {
+                console.error(`Thread root ${threadTs} gone in ${channelId} — skipping post and reaping ${slackSessionKey}`);
+                reapDeadThreadSession(slackSessionKey, sessionName);
+                return;
+            }
             if (isAlertSession) {
                 if (notificationType !== 'completed') {
                     console.error(`Alert session: skipping ${notificationType} (only post on completed)`);

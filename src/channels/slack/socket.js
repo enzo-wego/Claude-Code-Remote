@@ -378,6 +378,44 @@ class SlackSocketHandler {
         this._stmts.delete.run(sessionKey);
     }
 
+    /**
+     * Reap the session whose thread-root message was just deleted. The session
+     * key is `${channel}-${threadTs}` and a top-level spawning message uses its
+     * own ts as the thread root, so a deleted message's ts maps straight to the
+     * session key. (Deleting a follow-up thread reply won't match — those keys
+     * carry the thread root ts, not the reply's — so we only reap when the user
+     * actually removes the message that started the session.) No-op when no
+     * session matches. Mirrors the `/exit` teardown minus the inject, since the
+     * tmux pane is killed outright rather than asked to exit cleanly.
+     */
+    _reapOrphanedSession(channelId, deletedTs) {
+        if (!channelId || !deletedTs) return;
+        const sessionKey = `${channelId}-${deletedTs}`;
+        const session = this._getSession(sessionKey);
+        if (!session) return;
+        this.logger.info(`Message ${deletedTs} deleted in ${channelId} — reaping orphaned session ${session.sessionName}`);
+
+        const pollKey = session.sessionName;
+        if (this.pollers.has(pollKey)) {
+            clearInterval(this.pollers.get(pollKey).interval);
+            this.pollers.delete(pollKey);
+        }
+        // sessionName is bot-generated ("slack-AYGY-<digits>"), never user
+        // input — same kill idiom as the alert-retry teardown.
+        const killCmd = 'tmux kill-session -t ' + session.sessionName + ' 2>/dev/null';
+        try { execSync(killCmd); } catch { /* already gone */ }
+        this._clearSessionTimeout(sessionKey);
+        this._clearPaneSnapshot(sessionKey);
+
+        // If it was an alert investigation, free the queue slot so the next
+        // pending incident can start. Skip the 👀→✅ reaction swap — the alert
+        // message is gone, so reacting to it would just error.
+        if (session.alertMessageTs) {
+            this._completeQueueItem(channelId, session.alertMessageTs);
+        }
+        this._deleteSession(sessionKey);
+    }
+
     _touchSession(sessionKey) {
         this._stmts.touch.run(Date.now(), sessionKey);
     }
@@ -1491,6 +1529,18 @@ ${formatted}`
         if (mode !== 'local') {
             this.app.event('message', async ({ event, say }) => {
                 try {
+                    // A deleted message that spawned a session leaves an orphan:
+                    // its thread root is gone, so the session's Stop-hook /
+                    // ask_user posts target a dead thread_ts and Slack silently
+                    // reroutes them to the channel root, where they read as
+                    // stray, unanswered messages. Reap the session so it stops
+                    // computing and posting into the void.
+                    if (event.subtype === 'message_deleted') {
+                        const deletedTs = event.deleted_ts || event.previous_message?.ts;
+                        this._reapOrphanedSession(event.channel, deletedTs);
+                        return;
+                    }
+
                     // Owner DM keyword: "reseed" → mint a fresh SSO device-code
                     // URL on demand (same as tapping the button on an SSO DM).
                     if (event.channel_type === 'im' && !event.subtype && !event.bot_id
@@ -1986,7 +2036,13 @@ ${formatted}`
         // Guard: slash commands on dead/missing sessions (user @mentions only;
         // alert flows auto-generate `/<skill>` as the first prompt of a new session).
         const isLiveSession = session && this._isTmuxSessionAlive(session.sessionName);
-        if (command.startsWith('/') && !isLiveSession && !(command === '/exit' && session) && !cliChainHint) {
+        // Match the exit slash-commands on the FIRST token so natural-chat
+        // trailers ("/exit for now", "/quit thanks") still close cleanly instead
+        // of being injected as a raw command into a (often already-dead) tmux
+        // pane. `/exit`, `/quit`, `/stop` are treated as synonyms.
+        const EXIT_COMMANDS = new Set(['/exit', '/quit', '/stop']);
+        const isExitCommand = EXIT_COMMANDS.has(command.split(/\s/)[0]);
+        if (command.startsWith('/') && !isLiveSession && !(isExitCommand && session) && !cliChainHint) {
             const cmd = command.split(/\s/)[0];
             await say({ text: `Session expired. \`${cmd}\` requires an active session — send a message first to start a new one, then use \`${cmd}\`.`, thread_ts: threadTs });
             return;
@@ -1997,7 +2053,7 @@ ${formatted}`
         // a fresh tmux spin-up just to immediately kill it (which also leaves
         // the alert queue slot stuck if the recreate path posts a "Restarting…"
         // message and the user can't tell whether the incident actually closed).
-        if (command === '/exit' && session) {
+        if (isExitCommand && session) {
             const pollKey = session.sessionName;
             if (this.pollers.has(pollKey)) {
                 clearInterval(this.pollers.get(pollKey).interval);
@@ -2005,7 +2061,10 @@ ${formatted}`
             }
             if (this._isTmuxSessionAlive(session.sessionName)) {
                 try {
-                    await this._injectCommand(session.sessionName, command, session.cliType);
+                    // Inject the canonical `/exit` regardless of which synonym
+                    // the user typed (or any trailing words) so the CLI sees the
+                    // command it understands, not "/quit thanks".
+                    await this._injectCommand(session.sessionName, '/exit', session.cliType);
                 } catch {
                     // Expected — /exit kills the session before Enter-retry finishes.
                 }
