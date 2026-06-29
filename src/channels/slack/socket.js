@@ -2033,8 +2033,18 @@ ${formatted}`
         // mid-conversation CLI swap would lose context).
         let injectChain = null;
 
-        // Guard: slash commands on dead/missing sessions (user @mentions only;
-        // alert flows auto-generate `/<skill>` as the first prompt of a new session).
+        // Guard: slash commands on a session that EXISTED but whose tmux died.
+        // A `/<skill>` typed into a thread whose session has expired can't be
+        // injected anywhere meaningful, so we tell the user to send a plain
+        // message (which recreates the session) and re-issue the command.
+        //
+        // A brand-new thread (no session row at all) is NOT rejected: a
+        // `/<skill>` there boots a fresh session and is injected as its first
+        // prompt — the same thing the alert flow already does with its
+        // auto-generated `/<ALERT_SKILL>` (those carry a cliChainHint). The
+        // brand-new-conversation branch below handles the boot + inject; the
+        // command-assembly step keeps the slash command at the very start of
+        // the injected text so the CLI parses it as a command.
         const isLiveSession = session && this._isTmuxSessionAlive(session.sessionName);
         // Match the exit slash-commands on the FIRST token so natural-chat
         // trailers ("/exit for now", "/quit thanks") still close cleanly instead
@@ -2042,9 +2052,16 @@ ${formatted}`
         // pane. `/exit`, `/quit`, `/stop` are treated as synonyms.
         const EXIT_COMMANDS = new Set(['/exit', '/quit', '/stop']);
         const isExitCommand = EXIT_COMMANDS.has(command.split(/\s/)[0]);
-        if (command.startsWith('/') && !isLiveSession && !(isExitCommand && session) && !cliChainHint) {
+        if (command.startsWith('/') && session && !isLiveSession && !isExitCommand && !cliChainHint) {
             const cmd = command.split(/\s/)[0];
             await say({ text: `Session expired. \`${cmd}\` requires an active session — send a message first to start a new one, then use \`${cmd}\`.`, thread_ts: threadTs });
+            return;
+        }
+        // /exit on a thread that has no session at all — nothing to close.
+        // Without this, the brand-new-conversation branch would spin up a fresh
+        // tmux session just to inject `/exit` and tear it straight back down.
+        if (isExitCommand && !session) {
+            await say({ text: 'No active session in this thread.', thread_ts: threadTs });
             return;
         }
 
@@ -2428,9 +2445,29 @@ ${formatted}`
             // "read files at <path>" instruction otherwise reads as a task by
             // itself when no real user request follows.
             const BOT_SELF_KNOWLEDGE_PREAMBLE = `You are responding inside a Slack thread for the EnzoBot Slack bot.\nIf the user asks about the bot's own behavior (notifications, tagging, queue, alerts, etc.),\nthe bot's source lives at /var/go/src/github.com/Claude-Code-Remote — read files there to answer accurately.\n\n`;
+            // A skill turn is either a slash form (`/xxxx …`) or a natural-language
+            // request to run one (`execute /xxxx skill for me`, `run the deploy
+            // skill with argument …`). The optional leading `/` and trailing tail
+            // ("for me", "with argument …", nothing) are all accepted. Computed
+            // here (ahead of the context-wrapping block) because a slash command
+            // must stay at the very FIRST character of the injected text or the
+            // CLI won't recognise it as a command — so context is attached
+            // differently for skill turns vs plain chat.
+            const isSkillInvocation = command.startsWith('/')
+                || /^\s*(?:execute|run)\s+(?:the\s+)?\/?\S+\s+skill\b/i.test(command);
             let fullCommand = command;
             if (threadContext && !isTrivialFirstMessage) {
-                fullCommand = `${BOT_SELF_KNOWLEDGE_PREAMBLE}${threadContextLabel}:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
+                if (command.startsWith('/')) {
+                    // Slash command: keep `/cmd …` first so the CLI parses it,
+                    // then append the thread context below — it lands in the
+                    // skill's argument string ($ARGUMENTS) instead of shoving a
+                    // preamble in front of the command (which would stop it being
+                    // a command at all). No self-knowledge preamble here: a skill
+                    // turn follows SKILL.md, not the meta-question preamble.
+                    fullCommand = `${command}\n\n${threadContextLabel}:\n\n---\n${threadContext}\n---`;
+                } else {
+                    fullCommand = `${BOT_SELF_KNOWLEDGE_PREAMBLE}${threadContextLabel}:\n\n---\n${threadContext}\n---\n\nMy request: ${command}`;
+                }
             }
 
             // Slack mrkdwn reminder — sent ONCE on the first turn of a fresh
@@ -2443,12 +2480,6 @@ ${formatted}`
             // approach: Gemini may drift back to GitHub `**bold**` later in a
             // long session since it doesn't get re-reminded — acceptable to
             // avoid the noise on Claude/Codex.
-            // A skill turn is either a slash form (`/xxxx …`) or a natural-language
-            // request to run one (`execute /xxxx skill for me`, `run the deploy
-            // skill with argument …`). The optional leading `/` and trailing tail
-            // ("for me", "with argument …", nothing) are all accepted.
-            const isSkillInvocation = command.startsWith('/')
-                || /^\s*(?:execute|run)\s+(?:the\s+)?\/?\S+\s+skill\b/i.test(command);
             if (!isSkillInvocation && !isTrivialFirstMessage && isFreshCliBoot) {
                 const chatAdapter = getCliAdapter(session.cliType);
                 const guidance = typeof chatAdapter.chatFormattingGuidance === 'function'
