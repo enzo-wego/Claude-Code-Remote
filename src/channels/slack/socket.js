@@ -3428,11 +3428,24 @@ ${formatted}`
         // Alert-only: regular @mention tasks can legitimately run a single silent
         // tool (build/test) for minutes, and LAYER 6 escalation is alert-only anyway.
         const noProgressMs = this.config.pollerNoProgressMs || 360000; // default 6 min
+        // FIX C — idle-after-work fast escalation. A CLI that worked, then went
+        // idle at its empty input prompt without producing a report is stuck and
+        // won't resume on its own — e.g. Gemini's auto-Escape on a `Shell
+        // awaiting input` confirmation cancels the turn, so AfterAgent never
+        // fires and no report posts; the session then sat at the empty prompt and
+        // ran out the full 30-min idle ceiling (incident Q2PE51CTP1TPPT,
+        // 2026-06-29). Distinct from FIX A (busy-loop WHILE working) and the idle
+        // timeout (no work seen / much longer window). Escalate after a short
+        // silence instead. Alert-only, and only once the empty prompt has
+        // actually been observed (lastHasPrompt) so a session between silent tool
+        // calls isn't fast-killed.
+        const idleAfterWorkMs = this.config.pollerIdleAfterWorkMs || 180000; // default 3 min
         const pollerStartedAt = Date.now();
         let lastActivityAt = pollerStartedAt;
         let lastProgressAt = pollerStartedAt; // last tick the pane content (sans spinner chrome) changed
         let lastProgressKey = null;
         let lastIsWorking = false; // working-state from the previous tick (timeout check runs before this tick computes it)
+        let lastHasPrompt = false; // FIX C — idle-prompt state from the previous tick (same reason: gate runs first)
         let runtimeFatalReason = null; // FIX B — set when a runtime-fatal pattern is seen in the pane
         // Confirmation auto-approve is checked on EVERY tick, independent of the
         // full-pane `stableCount` gate below. A backgrounded sub-agent's animated
@@ -3526,8 +3539,11 @@ ${formatted}`
             // in the pane on a prior tick; the investigation cannot succeed, so
             // escalate immediately instead of waiting out noProgressMs.
             const hitRuntimeFatal = isAlertSession && !!runtimeFatalReason;
+            // FIX C — worked, then parked idle at the empty prompt (not working)
+            // for longer than idleAfterWorkMs without finishing. See note above.
+            const hitIdleAfterWork = isAlertSession && everSawWorking && !lastIsWorking && lastHasPrompt && idleMs > idleAfterWorkMs;
 
-            if (hitIdleTimeout || hitWallCeiling || hitNoProgress || hitRuntimeFatal) {
+            if (hitIdleTimeout || hitWallCeiling || hitNoProgress || hitRuntimeFatal || hitIdleAfterWork) {
                 clearInterval(interval);
                 this.pollers.delete(pollKey);
                 clearStatus();
@@ -3537,7 +3553,9 @@ ${formatted}`
                         ? `wall ceiling ${Math.round(wallMs / 60000)}min`
                         : hitNoProgress
                             ? `no progress for ${Math.round(noProgressMsElapsed / 60000)}min while working`
-                            : `idle ${Math.round(idleMs / 60000)}min`;
+                            : hitIdleAfterWork
+                                ? `idle at prompt ${Math.round(idleMs / 60000)}min after working (no report)`
+                                : `idle ${Math.round(idleMs / 60000)}min`;
                 this.logger.warn(`Poller timeout (${reason}) for ${sessionName} (alert=${isAlertSession}, everSawWorking=${everSawWorking})`);
                 // LAYER 6 — runtime fallback (set inside the alert branch
                 // below). Populated when the CLI's TUI looked ready and the
@@ -3750,6 +3768,7 @@ ${formatted}`
                 lastProgressAt = Date.now();
             }
             lastIsWorking = isWorking;
+            lastHasPrompt = hasPrompt; // FIX C — read by the idle-after-work gate on the next tick
 
             // FIX B — runtime-fatal pattern scan. Distinct from startup
             // `fatalErrorPatterns` (checked during readiness polling): these are
