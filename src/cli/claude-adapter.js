@@ -354,7 +354,13 @@ module.exports = {
         if (JSON.stringify(settings.hooks.PreToolUse) !== preToolBefore) changed = true;
 
         if (changed) saveSettings(settings);
-        return { path: SETTINGS_PATH, changed, commands };
+        // Surface PreToolUse in the install summary too (it's installed outside
+        // the matcher='*' loop above, so merge it in for display).
+        return {
+            path: SETTINGS_PATH,
+            changed,
+            commands: { ...commands, 'PreToolUse[AskUserQuestion]': `${nodeQuoted} ${quoted} ask-question` },
+        };
     },
 
     uninstallHooks() {
@@ -439,6 +445,7 @@ module.exports = {
                 Stop: listHasOurHook(hooks.Stop),
                 SubagentStop: listHasOurHook(hooks.SubagentStop),
                 UserPromptSubmit: listHasOurHook(hooks.UserPromptSubmit),
+                PreToolUse: listHasOurHook(hooks.PreToolUse),
             },
         };
     },
