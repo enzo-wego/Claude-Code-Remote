@@ -3492,6 +3492,10 @@ ${formatted}`
         const confirmThreshold = 2;   // ticks the dialog must persist before we click
         const autoApproveCooldownMs = 4000;
         const stableThreshold = 3;
+        // Fingerprint of the last interactive selection menu relayed to Slack,
+        // so a menu that stays on screen across many ticks is posted once, not
+        // re-posted every stability window.
+        let lastSelectionFingerprint = null;
 
         const interval = setInterval(async () => {
             try {
@@ -3787,6 +3791,20 @@ ${formatted}`
                 confirmCount = 0;
             }
 
+            // Interactive selection menu (plan-mode "How do you want to
+            // proceed", /writing-plans choice lists, AskUserQuestion). Unlike a
+            // confirmation prompt this needs a HUMAN pick, so it's relayed to
+            // Slack rather than auto-clicked. Guard against the confirmation
+            // case so a yes/no rendered as a menu still auto-approves instead of
+            // being relayed. `hasPrompt` is false for these (the ❯ cursor is on
+            // a numbered option, not a bare input row) so they slip past the
+            // normal idle-flush — the relay below in the stability gate is the
+            // only path that surfaces them. (incident 2026-06-29, PAY-2216.)
+            const isSelectionMenu =
+                !isWorking &&
+                !(adapter.confirmationPrompts || []).some(p => currentOutput.includes(p)) &&
+                (adapter.selectionPromptRegexes || []).some(re => re.test(currentOutput));
+
             // FIX A — forward-progress fingerprint. Strip digit runs (the
             // spinner timer "Working (4m 04s)", "Context 20% used", "5h 91% le…",
             // token counters) so a busy-loop reprinting the same error/screen
@@ -3839,6 +3857,41 @@ ${formatted}`
             }
 
             if (stableCount >= (isAlertSession && isFirstResponse ? alertStableThreshold : stableThreshold)) {
+
+                // Relay an interactive selection menu so the owner can answer
+                // from Slack. Gated on the same stability window as the normal
+                // flush so a half-rendered menu isn't posted. Deduped by
+                // fingerprint — the menu sits on screen until the owner picks,
+                // and we must not re-post it every window.
+                if (isSelectionMenu) {
+                    const menu = this._extractSelectionMenu(currentOutput);
+                    const fingerprint = menu ? menu.replace(/\s+/g, ' ').trim() : null;
+                    if (menu && fingerprint && fingerprint !== lastSelectionFingerprint) {
+                        lastSelectionFingerprint = fingerprint;
+                        processing = true;
+                        try {
+                            const body = `Claude is waiting for your input — reply with the option number (or text):\n\n${menu}`;
+                            await this._sendResponse(say, threadTs, body, null);
+                            this.logger.info(`Relayed selection menu to Slack thread ${threadTs} (${menu.length} chars)`);
+                            clearStatus();
+                            if (sessionKey) {
+                                this._updateLastBotTs(sessionKey, String(Date.now() / 1000));
+                                this._startSessionTimeout(sessionKey);
+                            }
+                        } catch (err) {
+                            this.logger.error(`Failed to relay selection menu: ${err.message}`);
+                        } finally {
+                            processing = false;
+                        }
+                        // Re-baseline so the owner's eventual pick diffs cleanly
+                        // and the menu lines don't leak into the next response.
+                        baselineOutput = currentOutput;
+                        lastOutput = currentOutput;
+                        stableCount = 0;
+                        attempts = 0;
+                    }
+                    return;
+                }
 
                 if (hasPrompt && !isWorking) {
                     // Skip extraction if output hasn't changed since last baseline reset
@@ -4557,6 +4610,68 @@ ${formatted}`
         });
 
         return responseLines.join('\n').trim();
+    }
+
+    /**
+     * Extract a Claude Code interactive selection menu from a tmux pane capture
+     * so it can be relayed to Slack. These menus (plan-mode "How do you want to
+     * proceed", /writing-plans choice lists) block the turn waiting for a human
+     * pick but fire no Stop hook and don't look like a bare input prompt, so the
+     * poller would otherwise never surface them. Returns the question + numbered
+     * options as plain text (the ❯ selection cursor stripped), or null when no
+     * selection-menu footer is present.
+     */
+    _extractSelectionMenu(output) {
+        const lines = output.replace(/\r/g, '').split('\n');
+
+        // Anchor on the footer Claude renders below every select menu.
+        let footerIdx = -1;
+        for (let i = lines.length - 1; i >= 0; i--) {
+            if (/Enter to select\b[^\n]*(?:↑\/↓|to navigate|Esc to cancel)/i.test(lines[i])) {
+                footerIdx = i;
+                break;
+            }
+        }
+        if (footerIdx < 0) return null;
+
+        // Walk upward from the footer. First gather the option block (separators
+        // between options are dropped; once option "1." is captured the rule
+        // above it ends the block). Then capture the contiguous question text
+        // sitting just above option 1, stopping at the blank/rule above it so
+        // surrounding chrome (e.g. a "☐ Next step" todo line) is excluded.
+        const collected = [];
+        let sawFirstOption = false;
+        let inQuestion = false;
+        for (let i = footerIdx - 1; i >= 0 && collected.length < 40; i--) {
+            const line = lines[i];
+            const trimmed = line.trim();
+            const isRule = /^[─━═]+$/.test(trimmed);
+
+            if (!sawFirstOption) {
+                if (isRule) continue;
+                if (!trimmed) { collected.unshift(''); continue; }
+                const opt = trimmed.match(/^❯?\s*(\d+)\.\s/);
+                if (opt && opt[1] === '1') sawFirstOption = true;
+                collected.unshift(line.replace(/^(\s*)❯\s?/, '$1'));
+                continue;
+            }
+
+            if (!inQuestion) {
+                if (isRule) break;          // rule above the question — no question text
+                if (!trimmed) continue;     // skip blank(s) between option 1 and question
+                inQuestion = true;
+                collected.unshift(line);
+            } else {
+                if (isRule || !trimmed) break; // question block ended
+                collected.unshift(line);
+            }
+        }
+
+        while (collected.length && !collected[0].trim()) collected.shift();
+        while (collected.length && !collected[collected.length - 1].trim()) collected.pop();
+
+        const text = collected.join('\n').trim();
+        return text || null;
     }
 
     /**

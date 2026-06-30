@@ -267,6 +267,23 @@ module.exports = {
         '1. Yes'
     ],
 
+    // Patterns that indicate the CLI is blocked on an INTERACTIVE SELECTION MENU
+    // that needs a human decision — plan-mode "How do you want to proceed",
+    // skill choice lists (e.g. /writing-plans), AskUserQuestion-style pickers.
+    // These are NOT confirmationPrompts: the first option is rarely "1. Yes", so
+    // auto-approve must not fire — the menu has to be RELAYED to Slack so the
+    // owner can pick. And they're invisible to every other gate: the `❯` cursor
+    // sits on a numbered option rather than a bare input row, so `hasPrompt` is
+    // false, and no Stop hook fires while the turn is suspended on the prompt.
+    // Without this the question is silently swallowed and the session wedges
+    // (incident 2026-06-29, PAY-2216 /writing-plans menu). The footer
+    // "Enter to select · ↑/↓ to navigate · Esc to cancel" is the reliable
+    // signature of Claude Code's select UI; the navigation hint guards against
+    // matching the bare phrase inside an answer body.
+    selectionPromptRegexes: [
+        /Enter to select\b[^\n]*(?:↑\/↓|to navigate|Esc to cancel)/i,
+    ],
+
     // Patterns that indicate the CLI is stalled and can't continue without
     // user intervention. When matched, the poller pings the owner in the
     // Slack thread so they can unblock (e.g. by sending /compact).
