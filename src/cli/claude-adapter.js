@@ -54,13 +54,13 @@ function listHasOurHook(list) {
     );
 }
 
-function upsertHook(list, command) {
+function upsertHook(list, command, matcher = '*') {
     if (!Array.isArray(list)) list = [];
     if (list.some(e => Array.isArray(e.hooks) && e.hooks.some(h => h.command === command))) {
         return list;
     }
     list.push({
-        matcher: '*',
+        matcher,
         hooks: [{ type: 'command', command, timeout: HOOK_TIMEOUT }]
     });
     return list;
@@ -310,6 +310,14 @@ module.exports = {
         settings.hooks.Stop = settings.hooks.Stop || [];
         settings.hooks.SubagentStop = settings.hooks.SubagentStop || [];
         settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit || [];
+        // PreToolUse scoped to the built-in AskUserQuestion picker. That tool
+        // suspends the turn waiting for a human pick and fires NO Stop hook, so
+        // the question never reaches Slack via the completed/waiting path. The
+        // PreToolUse event fires the instant the picker is presented and carries
+        // the full structured question + options in `tool_input` — the only
+        // reliable way to relay it (a TUI pane scrape is fragile and needs a
+        // live poller). See cli-hook-notify.js `ask-question` handler.
+        settings.hooks.PreToolUse = settings.hooks.PreToolUse || [];
 
         const script = hookScriptPath();
         const quoted = script.includes(' ') ? `"${script}"` : script;
@@ -335,6 +343,16 @@ module.exports = {
             if (JSON.stringify(settings.hooks[event]) !== before) changed = true;
         }
 
+        // PreToolUse is matcher-scoped to AskUserQuestion (not '*') so it only
+        // fires for the interactive picker, never on every tool call.
+        const preToolBefore = JSON.stringify(settings.hooks.PreToolUse || []);
+        settings.hooks.PreToolUse = upsertHook(
+            settings.hooks.PreToolUse,
+            `${nodeQuoted} ${quoted} ask-question`,
+            'AskUserQuestion'
+        );
+        if (JSON.stringify(settings.hooks.PreToolUse) !== preToolBefore) changed = true;
+
         if (changed) saveSettings(settings);
         return { path: SETTINGS_PATH, changed, commands };
     },
@@ -343,7 +361,7 @@ module.exports = {
         const settings = loadSettings();
         if (!settings.hooks) return { path: SETTINGS_PATH, changed: false };
         let changed = false;
-        for (const event of ['SessionStart', 'Stop', 'SubagentStop', 'UserPromptSubmit']) {
+        for (const event of ['SessionStart', 'Stop', 'SubagentStop', 'UserPromptSubmit', 'PreToolUse']) {
             if (listHasOurHook(settings.hooks[event])) {
                 settings.hooks[event] = removeOurHooks(settings.hooks[event]);
                 if (!settings.hooks[event]) delete settings.hooks[event];

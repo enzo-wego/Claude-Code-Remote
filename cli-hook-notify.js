@@ -626,6 +626,92 @@ function kickQueue() {
     } catch {}
 }
 
+/**
+ * Relay a built-in AskUserQuestion picker to Slack. Fired from the
+ * PreToolUse:AskUserQuestion hook (see claude-adapter installHooks). The picker
+ * renders only in the local TUI, fires no Stop hook, and blocks the turn — so
+ * this is the one chance to surface the question to the remote owner. The
+ * caller exits 0 with no stdout, so this never blocks or alters the tool.
+ */
+async function relayAskUserQuestion(hookInput, rawInput, slackSessionKey) {
+    const toolInput = (hookInput && hookInput.tool_input) || (rawInput && rawInput.tool_input) || {};
+    const questions = Array.isArray(toolInput.questions) ? toolInput.questions : [];
+    if (!questions.length) {
+        console.error('ask-question: no questions in tool_input — skipping');
+        return;
+    }
+
+    let channelId = null;
+    let threadTs = null;
+    let lastUserId = null;
+    try {
+        const Database = require('better-sqlite3');
+        const dbPath = path.join(projectDir, 'src/data/slack-sessions.db');
+        if (!fs.existsSync(dbPath)) return;
+        const db = new Database(dbPath, { readonly: true });
+        const row = db.prepare('SELECT * FROM sessions WHERE session_key = ?').get(slackSessionKey);
+        db.close();
+        if (!row) {
+            console.error(`ask-question: no session row for key=${slackSessionKey}`);
+            return;
+        }
+        channelId = row.channel_id;
+        threadTs = row.thread_ts;
+        lastUserId = row.last_user_id || null;
+    } catch (err) {
+        console.error(`ask-question: DB lookup failed: ${err.message}`);
+        return;
+    }
+
+    if (!channelId || !threadTs) {
+        console.error('ask-question: session row missing channel/thread');
+        return;
+    }
+    if (!process.env.SLACK_BOT_TOKEN) {
+        console.error('ask-question: SLACK_BOT_TOKEN not configured');
+        return;
+    }
+
+    const { WebClient } = require('@slack/web-api');
+    const web = new WebClient(process.env.SLACK_BOT_TOKEN);
+
+    // Don't post into a thread whose root was deleted — it would orphan at the
+    // channel root. If the check itself errors, fall through and try the post.
+    try {
+        if (!(await threadRootExists(web, channelId, threadTs))) {
+            console.error(`ask-question: thread root ${threadTs} gone in ${channelId} — skipping`);
+            return;
+        }
+    } catch { /* best-effort */ }
+
+    // The assistant prose printed just above the picker (e.g. a plan summary).
+    // At PreToolUse time the picker's tool_use entry carries no text block, so
+    // extractFromTranscript returns this preceding narration — the turn's text.
+    let prose = null;
+    try { prose = extractFromTranscript(hookInput.transcript_path); } catch { /* best-effort */ }
+
+    const parts = [];
+    parts.push(':raising_hand: *Claude needs your input* — reply in this thread with the option number(s) or your own text.');
+    if (prose) parts.push(prose);
+    for (const q of questions) {
+        const lines = [];
+        if (q && q.question) lines.push(`*${q.question}*`);
+        const opts = Array.isArray(q && q.options) ? q.options : [];
+        opts.forEach((opt, i) => {
+            const label = opt && opt.label ? opt.label : `Option ${i + 1}`;
+            const desc = opt && opt.description ? ` — ${opt.description}` : '';
+            lines.push(`   ${i + 1}. *${label}*${desc}`);
+        });
+        if (q && q.multiSelect) lines.push('_(you can choose more than one)_');
+        if (lines.length) parts.push(lines.join('\n'));
+    }
+    const message = parts.join('\n\n');
+
+    await sendResponse(web, channelId, threadTs, message, null, lastUserId);
+    updateLastBotTs(slackSessionKey);
+    console.error(`ask-question: relayed ${questions.length} question(s) to ${channelId}/${threadTs}`);
+}
+
 async function sendHookNotification() {
     const notificationType = process.argv[2] || 'completed';
     const currentDir = process.cwd();
@@ -720,6 +806,22 @@ async function sendHookNotification() {
             console.error('SessionStart DB update failed:', error.message);
         }
 
+        process.exit(0);
+    }
+
+    // ─── PreToolUse:AskUserQuestion: relay the interactive picker ────
+    // The built-in AskUserQuestion picker renders only in the local TUI,
+    // suspends the turn waiting for a pick, and fires NO Stop hook — so the
+    // question never reaches Slack via the completed path. This event carries
+    // the full structured question + options in `tool_input`; relay it so the
+    // remote owner can answer from the thread. Side-effect only: we exit 0 with
+    // no stdout so the tool proceeds and still shows its picker locally.
+    if (notificationType === 'ask-question') {
+        try {
+            await relayAskUserQuestion(hookInput, rawInput, slackSessionKey);
+        } catch (err) {
+            console.error(`ask-question relay failed: ${err.message}`);
+        }
         process.exit(0);
     }
 
