@@ -15,6 +15,7 @@ const axios = require('axios');
 const Logger = require('../../core/logger');
 const AlertMonitor = require('./alert-monitor');
 const DelayAlertMonitor = require('./delay-alert-monitor');
+const { AccessControl } = require('./access-control');
 const { runDailySummary, parseChannelsConfig } = require('../../services/daily-summary');
 const { getCliAdapter, adapterNames } = require('../../cli');
 const graphIngest = require('../../graph-ingest');
@@ -158,6 +159,15 @@ class SlackSocketHandler {
 
         // Delay alert monitoring
         this.delayAlertMonitor = new DelayAlertMonitor(this.app, this.db, config);
+
+        // @mention access control: owner + allowed subteams only (when set).
+        this.accessControl = new AccessControl({
+            client: this.app.client,
+            ownerUserId: config.ownerUserId,
+            allowedSubteams: config.allowedSubteams || [],
+            whitelist: config.whitelist || [],
+            logger: this.logger,
+        });
 
         this._setupListeners();
         this._setupHttpServer();
@@ -1583,6 +1593,10 @@ ${formatted}`
                     }
                     // DM slash commands (/whygraph, /search) in message events
                     if (event.channel_type === 'im' && event.text?.startsWith('/') && !event.bot_id) {
+                        if (!(await this.accessControl.isAllowed(event.user))) {
+                            this.logger.info(`Access denied (DM graph command) | user=${event.user}`);
+                            return;
+                        }
                         try {
                             const reply = await graphHandleCommand({
                                 text: event.text, channel: event.channel, user: event.user,
@@ -1847,6 +1861,19 @@ ${formatted}`
 
         this.logger.info(`Mention received | user=${userId} channel=${channelId} thread=${threadTs} text="${rawText.substring(0, 100)}"`);
 
+        // Access gate: when locked down (SLACK_ALLOWED_SUBTEAMS / SLACK_WHITELIST
+        // set), only the owner and allowed team members may talk to the bot.
+        // Fails closed (owner-only) if subteam membership can't be resolved.
+        if (!(await this.accessControl.isAllowed(userId))) {
+            this.logger.info(`Access denied | user=${userId} channel=${channelId} — not owner or allowed subteam member`);
+            const owner = this.config.ownerUserId ? ` Ping <@${this.config.ownerUserId}> if you need access.` : '';
+            await say({ text: `:no_entry: Sorry, EnzoBot is limited to Enzo's team.${owner}`, thread_ts: threadTs });
+            return;
+        }
+        // Restricted = allowed but not the owner. Their session gets a boundary
+        // block that forbids disclosing personal / server info.
+        const restricted = this.accessControl.isRestricted(userId);
+
         let text = rawText.replace(/<@[A-Z0-9]+>/g, '').trim();
 
         // DM slash commands: route /whygraph and /search before any other handling
@@ -1909,7 +1936,7 @@ ${formatted}`
             }
         }
 
-        await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId, null, graphSystemBlock);
+        await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId, null, graphSystemBlock, restricted);
     }
 
     /**
@@ -1979,7 +2006,7 @@ ${formatted}`
 
     // ─── Command Processing ──────────────────────────────────────────
 
-    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliHint = null, graphSystemBlock = '') {
+    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliHint = null, graphSystemBlock = '', restricted = false) {
         // Create a say function if one wasn't provided (e.g. alert triggers)
         if (!say) {
             say = async (msg) => {
@@ -2524,6 +2551,19 @@ ${formatted}`
             if (graphSystemBlock && isFreshCliBoot) {
                 fullCommand = `${graphSystemBlock}\n\n---\n\n${fullCommand}`;
                 this.logger.info(`Graph system block prepended (${graphSystemBlock.length} chars) for session ${session.sessionName}`);
+            }
+
+            // Restricted (team, non-owner) users: prepend the access boundary
+            // that forbids disclosing personal / server info. Re-asserted EVERY
+            // turn (not just fresh boot) so it holds across a live session and
+            // even if a different, non-owner user replies later in the thread.
+            // Slash commands must stay first-char, so append there instead.
+            if (restricted) {
+                const boundary = this.accessControl.restrictionPreamble();
+                fullCommand = command.startsWith('/')
+                    ? `${fullCommand}\n\n${boundary}`
+                    : `${boundary}\n\n---\n\n${fullCommand}`;
+                this.logger.info(`Access boundary injected (restricted user) for session ${session.sessionName}`);
             }
 
             // Inject the command into the tmux session.

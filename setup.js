@@ -65,7 +65,7 @@ function writeEnvFile(values, existingEnv) {
         'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_CHANNEL_ID',
         'SLACK_REPO_PATH', 'SLACK_REPO_ROOT', 'SLACK_CLAUDE_COMMAND',
         'SLACK_CLAUDE_MODEL',
-        'SLACK_WHITELIST', 'SLACK_HTTP_PORT',
+        'SLACK_WHITELIST', 'SLACK_ALLOWED_SUBTEAMS', 'SLACK_HTTP_PORT',
         'ALERT_CLI', 'DELAY_ALERT_CLI',
         'MCP_ENABLED', 'MCP_BIND_HOST', 'MCP_PORT', 'MCP_DEFAULT_TIMEOUT_MS',
         'LOG_LEVEL'
@@ -131,6 +131,7 @@ async function main() {
     const repoRoot = await ask('Repo root for project discovery (optional)', existingEnv.SLACK_REPO_ROOT || '');
     const claudeCommand = await ask('Claude command', existingEnv.SLACK_CLAUDE_COMMAND || 'claude --dangerously-skip-permissions');
     const whitelist = await ask('Whitelist user IDs (comma-separated, empty=all)', existingEnv.SLACK_WHITELIST || '');
+    const allowedSubteams = await ask('Allowed subteam IDs (comma-separated Sxxxx, empty=all)', existingEnv.SLACK_ALLOWED_SUBTEAMS || '');
     const httpPort = await ask('HTTP API port', existingEnv.SLACK_HTTP_PORT || '9999');
 
     console.log('\n  CLI Selection (per feature)\n');
@@ -175,6 +176,7 @@ async function main() {
         SLACK_REPO_ROOT: repoRoot,
         SLACK_CLAUDE_COMMAND: claudeCommand,
         SLACK_WHITELIST: whitelist,
+        SLACK_ALLOWED_SUBTEAMS: allowedSubteams,
         SLACK_HTTP_PORT: httpPort,
         ALERT_CLI: alertCli,
         DELAY_ALERT_CLI: delayAlertCli,

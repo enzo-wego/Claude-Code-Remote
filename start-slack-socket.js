@@ -54,7 +54,12 @@ const config = {
     repoRoot: process.env.SLACK_REPO_ROOT || '',
     claudeCommand: process.env.SLACK_CLAUDE_COMMAND || 'claude --dangerously-skip-permissions',
     ownerUserId: process.env.SLACK_OWNER_USER_ID || '',
-    whitelist: process.env.SLACK_WHITELIST ? process.env.SLACK_WHITELIST.split(',').map(id => id.trim()) : [],
+    whitelist: process.env.SLACK_WHITELIST ? process.env.SLACK_WHITELIST.split(',').map(id => id.trim()).filter(Boolean) : [],
+    // Subteam (usergroup) IDs whose members may talk to the bot. When set (or
+    // SLACK_WHITELIST is set), @mention access is locked down: only the owner
+    // and these members get through. Members get RESTRICTED sessions (no
+    // personal/server info); only the owner gets full access. Empty → open.
+    allowedSubteams: process.env.SLACK_ALLOWED_SUBTEAMS ? process.env.SLACK_ALLOWED_SUBTEAMS.split(',').map(id => id.trim()).filter(Boolean) : [],
     httpPort: parseInt(process.env.SLACK_HTTP_PORT) || 9999,
     // Alert monitoring
     monitorChannels: process.env.MONITOR_CHANNELS || '',
@@ -210,7 +215,9 @@ async function start() {
     logger.info(`- Repo Root: ${config.repoRoot || 'Not set'}`);
     logger.info(`- Claude Command: ${config.claudeCommand}`);
     logger.info(`- Channel ID: ${config.channelId || 'Any'}`);
-    logger.info(`- Whitelist: ${config.whitelist.length > 0 ? config.whitelist.join(', ') : 'None (all authorized)'}`);
+    logger.info(`- Whitelist: ${config.whitelist.length > 0 ? config.whitelist.join(', ') : 'None'}`);
+    logger.info(`- Allowed Subteams: ${config.allowedSubteams.length > 0 ? config.allowedSubteams.join(', ') : 'None'}`);
+    logger.info(`- Access control: ${(config.allowedSubteams.length > 0 || config.whitelist.length > 0) ? 'ENFORCED (owner + team only)' : 'OFF (all authorized)'}`);
     logger.info(`- HTTP Port: ${config.httpPort}`);
     logger.info(`- Monitor Channels: ${config.monitorChannels || 'None'}`);
     logger.info(`- Alert Skill: ${config.alertSkill || 'None'}`);
@@ -239,6 +246,29 @@ async function start() {
 
     await handler.start();
     logger.info('Slack Socket Mode is running. Listening for messages...');
+
+    // Pre-warm @mention access control so the first mention isn't slowed by a
+    // cold subteam lookup, and so a missing `usergroups:read` scope surfaces at
+    // boot (fail-closed = owner-only) instead of silently locking out the team.
+    if (handler.accessControl && handler.accessControl.enforced) {
+        try {
+            await handler.accessControl.refresh();
+            const count = (await handler.accessControl._getMembers()).size;
+            if (count === 0) {
+                logger.warn('Access control ENFORCED but resolved 0 subteam members — likely missing `usergroups:read` scope on the bot token. Only the owner can talk until fixed.');
+                if (config.ownerUserId) {
+                    await handler.app.client.chat.postMessage({
+                        channel: config.ownerUserId,
+                        text: ':warning: EnzoBot access control is ON but I resolved *0* team members from the allowed subteams. The bot token probably lacks the `usergroups:read` scope, so right now *only you* can talk to me. Add the scope + reinstall the app, then restart.',
+                    }).catch(() => {});
+                }
+            } else {
+                logger.info(`Access control pre-warmed: ${count} team member(s) allowed (plus owner).`);
+            }
+        } catch (err) {
+            logger.warn(`Access control pre-warm failed: ${err.message}`);
+        }
+    }
 
     // MCP slack-ask: bring up the HTTP server now that handler.app + handler.db
     // are live. Same env gate — silent no-op when disabled.
