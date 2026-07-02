@@ -113,26 +113,28 @@ The Codex adapter marks these safe local commands as bot-side:
 
 | Command | Bot behavior |
 |---|---|
-| `/help`, `/status`, `/usage`, `/mcp`, `/diff` | Inject once, scrape visible output, post it to Slack |
+| `/status`, `/usage`, `/mcp`, `/diff`, `/debug-config`, `/ps` | Inject once, scrape visible output, post it to Slack |
 | `/compact` | Inject once, wait for working indicators to clear, scrape visible output |
 | `/clear` | Inject once; if no visible output appears, post a local confirmation |
+| `/fast`, `/goal`, `/stop` | Inject once, scrape visible output, post it to Slack (`/stop` keeps its Codex meaning: stop background terminals) |
 | `/model` | Open the Codex picker once, scrape visible options, post numbered choices to Slack, then close with Esc |
 | `/model <number>` or `/model <text>` | Reopen the picker, select the matching visible option with arrow keys + Enter, then post confirmation |
 
 These Codex commands are blocked from Slack because they need host-side auth,
 session-pickers, or saved-session mutation outside the current thread:
-`/login`, `/logout`, `/resume`, `/fork`, `/archive`, `/delete`,
-`/unarchive`, `/new`.
+`/permissions`, `/ide`, `/keymap`, `/vim`, `/sandbox-add-read-dir`, `/agent`,
+`/apps`, `/plugins`, `/hooks`, `/archive`, `/delete`, `/copy`,
+`/experimental`, `/approve`, `/memories`, `/skills`, `/import`, `/feedback`,
+`/login`, `/logout`, `/mention`, `/personality`, `/resume`, `/fork`, `/raw`,
+`/unarchive`, `/new`, `/statusline`, `/title`, `/theme`.
 
 ### Pass-through (turn-starting — completion hook posts the reply)
 
-`/init`, `/review`, `/security-review`, `/pr-comments`, `/btw`, and every
-custom skill / plugin command (`/pay-ops-production`, …). For Codex this also
-includes turn-starting commands such as `/review` and every installed skill or
-plugin command. Unknown commands print `Unknown command: /x` locally — the CLI
-starts no turn, so the thread stays silent until the inflight watchdog reports;
-acceptable, since the command echo message ("Sent `/x` to the session") is
-still posted.
+`/init`, `/review`, `/plan`, `/side`, `/btw`, and every custom skill / plugin
+command (`/pay-ops-production`, …). Unknown commands print `Unknown command:
+/x` locally — the CLI starts no turn, so the thread stays silent until the
+inflight watchdog reports; acceptable, since the command echo message ("Sent
+`/x` to the session") is still posted.
 
 ## Where the code lives
 

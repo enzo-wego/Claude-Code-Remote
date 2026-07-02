@@ -2149,12 +2149,15 @@ ${formatted}`
         // command-assembly step keeps the slash command at the very start of
         // the injected text so the CLI parses it as a command.
         const isLiveSession = session && this._isTmuxSessionAlive(session.sessionName);
-        // Match the exit slash-commands on the FIRST token so natural-chat
-        // trailers ("/exit for now", "/quit thanks") still close cleanly instead
-        // of being injected as a raw command into a (often already-dead) tmux
-        // pane. `/exit`, `/quit`, `/stop` are treated as synonyms.
-        const EXIT_COMMANDS = new Set(['/exit', '/quit', '/stop']);
-        const isExitCommand = EXIT_COMMANDS.has(command.split(/\s/)[0]);
+        // Match exit slash-commands on the FIRST token so natural-chat
+        // trailers ("/exit for now", "/quit thanks") still close cleanly.
+        // Codex owns `/stop` as "stop background terminals", so only legacy
+        // Claude/Gemini sessions treat `/stop` as a bot-level close synonym.
+        const firstTokenForExit = command.split(/\s/)[0];
+        const sessionCliTypeForExit = session ? (session.cliType || 'claude') : 'claude';
+        const EXIT_COMMANDS = new Set(['/exit', '/quit']);
+        if (sessionCliTypeForExit !== 'codex') EXIT_COMMANDS.add('/stop');
+        const isExitCommand = EXIT_COMMANDS.has(firstTokenForExit);
         if (command.startsWith('/') && session && !isLiveSession && !isExitCommand && !cliChainHint) {
             const cmd = command.split(/\s/)[0];
             await say({ text: `Session expired. \`${cmd}\` requires an active session — send a message first to start a new one, then use \`${cmd}\`.`, thread_ts: threadTs });

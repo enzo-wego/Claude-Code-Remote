@@ -10,6 +10,7 @@ jest.mock('child_process', () => ({
 }));
 
 const SlackSocketHandler = require('../../../src/channels/slack/socket');
+const codexAdapter = require('../../../src/cli/codex-adapter');
 const { execSync } = require('child_process');
 
 describe('SlackSocketHandler adapter local slash commands', () => {
@@ -125,5 +126,52 @@ describe('SlackSocketHandler adapter local slash commands', () => {
             thread_ts: '123.456',
             text: expect.stringContaining('model: gpt-5.4'),
         }));
+    });
+
+    test('codex /stop is a Codex local command, not a Slack session close alias', async () => {
+        const { h } = harness({
+            cliType: 'codex',
+            output: [
+                '› /stop',
+                'No background terminals are running',
+                '›',
+            ].join('\n'),
+        });
+        h._deleteSession = jest.fn();
+
+        await h._processCommand('CTEST', '123.456', '/stop', null, '123.456');
+
+        expect(h._deleteSession).not.toHaveBeenCalled();
+        expect(h._injectLocalCommand).toHaveBeenCalledWith('slack-TEST-123', '/stop', 4000);
+        expect(h.app.client.chat.postMessage).toHaveBeenCalledWith(expect.objectContaining({
+            text: expect.stringContaining('No background terminals are running'),
+        }));
+    });
+
+    test('codex blocked local commands get an explicit Slack reply', async () => {
+        const { h } = harness({ cliType: 'codex' });
+
+        await h._processCommand('CTEST', '123.456', '/logout', null, '123.456');
+
+        expect(h._injectCommand).not.toHaveBeenCalled();
+        expect(h._injectLocalCommand).not.toHaveBeenCalled();
+        expect(h.app.client.chat.postMessage).toHaveBeenCalledWith(expect.objectContaining({
+            text: expect.stringContaining("`/logout` isn't available from Slack"),
+        }));
+    });
+
+    test('every documented Codex slash command has an intentional Slack route', () => {
+        const local = codexAdapter.localSlashCommands;
+        const covered = new Set([
+            ...(local.panel || []),
+            ...(local.print || []),
+            ...Object.keys(local.blocked || {}),
+            ...(codexAdapter.passThroughSlashCommands || []),
+            '/exit',
+            '/quit',
+        ]);
+
+        const missing = codexAdapter.documentedSlashCommands.filter(cmd => !covered.has(cmd));
+        expect(missing).toEqual([]);
     });
 });
