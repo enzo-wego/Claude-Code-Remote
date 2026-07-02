@@ -3408,10 +3408,10 @@ ${formatted}`
                 }
 
                 this._codexModelOptions = this._codexModelOptions || new Map();
-                this._codexModelOptions.set(sessionKey, options.map(o => o.label));
+                this._codexModelOptions.set(sessionKey, options.map(o => ({ number: o.number, label: o.label })));
 
                 const body = options
-                    .map((o, i) => `${i + 1}. ${o.label}${o.selected ? ' (current)' : ''}`)
+                    .map((o) => `${o.number || '?'}. ${o.label}${o.selected ? ' (current)' : ''}`)
                     .join('\n');
                 await post(`Codex model picker:\n\`\`\`\n${body}\n\`\`\`\nReply with \`/model <number>\` or \`/model <model text>\` to choose.`);
                 return;
@@ -3425,7 +3425,8 @@ ${formatted}`
 
             let targetIndex = -1;
             if (/^\d+$/.test(arg)) {
-                targetIndex = Number(arg) - 1;
+                const requestedNumber = Number(arg);
+                targetIndex = options.findIndex(o => o.number === requestedNumber);
             } else {
                 const needle = arg.toLowerCase();
                 targetIndex = options.findIndex(o => o.label.toLowerCase() === needle);
@@ -3441,8 +3442,12 @@ ${formatted}`
             }
 
             const selectedIndex = options.findIndex(o => o.selected);
-            const fromIndex = selectedIndex >= 0 ? selectedIndex : 0;
-            const delta = targetIndex - fromIndex;
+            if (selectedIndex < 0) {
+                await closePicker();
+                await post('I could read the model list, but not the currently highlighted option. I did not select anything; run `/model` again and choose from the fully visible list.');
+                return;
+            }
+            const delta = targetIndex - selectedIndex;
             const key = delta >= 0 ? 'Down' : 'Up';
             for (let i = 0; i < Math.abs(delta); i++) {
                 execSync(`tmux send-keys -t ${session.sessionName} ${key}`);
@@ -3454,7 +3459,7 @@ ${formatted}`
             output = this._captureOutput(session.sessionName) || '';
             const stats = this._extractSessionStats(output);
             const current = stats && stats.model ? ` Current pane model: *${stats.model}*.` : '';
-            await post(`:white_check_mark: Selected Codex model option ${targetIndex + 1}: *${options[targetIndex].label}*.${current}`);
+            await post(`:white_check_mark: Selected Codex model option ${options[targetIndex].number || targetIndex + 1}: *${options[targetIndex].label}*.${current}`);
         } catch (err) {
             try {
                 execSync(`tmux send-keys -t ${session.sessionName} Escape`);
@@ -3476,6 +3481,7 @@ ${formatted}`
                 if (current) numbered.push(current);
                 const selected = /\bcurrent\b/i.test(numberedMatch[2]);
                 current = {
+                    number: Number(numberedMatch[1]),
                     label: numberedMatch[2].replace(/\s+\bcurrent\b/i, '').replace(/\s{2,}/g, ' ').trim(),
                     selected,
                 };
@@ -3500,7 +3506,7 @@ ${formatted}`
                 .replace(/\s{2,}/g, ' ')
                 .trim();
             if (!label || options.some(o => o.label === label)) continue;
-            options.push({ label, selected });
+            options.push({ number: options.length + 1, label, selected });
         }
 
         return options;
