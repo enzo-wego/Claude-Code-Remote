@@ -23,6 +23,47 @@ const { buildContext, handleCommand: graphHandleCommand } = require('../../graph
 const { GraphContextConfig } = require('../../graph-context/config');
 const { AskerLookup } = require('../../graph-context/asker');
 
+// ─── Claude Code built-in LOCAL slash commands ─────────────────────────────
+//
+// Classification from an empirical survey of Claude Code 2.1.198 driven over
+// tmux exactly the way the bot injects (scratch session, paste-buffer + one
+// Enter, pane captures — 2026-07-02). These commands run inside the TUI
+// without starting an assistant turn, so NO Stop hook fires: the generic
+// inject path would post nothing back to Slack and its blind Enter retries
+// can "select" entries in any dialog the command opens (a bare /model
+// injected that way silently rewrote the owner's default model).
+//
+// PANEL — opens a read-only interactive panel (Esc closes it). The bot
+// injects, scrapes the panel from the pane, posts it, and closes with Esc.
+const CLAUDE_PANEL_COMMANDS = new Set([
+    '/cost', '/usage', '/status', '/help', '/mcp', '/permissions',
+    '/hooks', '/config', '/doctor', '/bashes',
+]);
+// PRINT — prints its result inline into the transcript, no dialog. The bot
+// injects, waits, scrapes everything below the command echo, posts it.
+const CLAUDE_PRINT_COMMANDS = new Set([
+    '/context', '/agents', '/compact', '/clear',
+]);
+// BLOCKED — stateful/interactive dialogs that cannot be driven headlessly,
+// or host-side actions that make no sense from Slack. Never injected; the
+// user gets the reason back. (/model is handled by _handleModelCommand.)
+const CLAUDE_BLOCKED_COMMANDS = new Map([
+    ['/resume', 'it opens an interactive session picker (the bot resumes sessions automatically when tmux dies)'],
+    ['/rewind', 'it opens an interactive picker that can restore older conversation/code state'],
+    ['/memory', 'it opens an interactive memory editor — ask the session to edit CLAUDE.md instead'],
+    ['/export', 'it opens an interactive export dialog — ask the session to write a file and attach it instead'],
+    ['/theme', 'it opens an interactive theme picker, and themes are meaningless over Slack'],
+    ['/add-dir', 'it opens an interactive directory prompt — ask the session to read the path instead'],
+    ['/login', 'it starts an OAuth flow that needs a browser on the host'],
+    ['/logout', 'it would de-authenticate Claude for every session on this host'],
+    ['/ide', 'it installs/connects an IDE extension on the host'],
+    ['/vim', 'it toggles the TUI input mode, which would break command injection'],
+    ['/terminal-setup', 'it reconfigures the host terminal'],
+    ['/install-github-app', 'it runs an interactive GitHub app installer'],
+    ['/statusline', 'it rewrites the host statusline settings'],
+    ['/keybindings', 'it edits host keybindings'],
+]);
+
 // Load graph-context config once at startup (non-fatal if file missing)
 let _graphCfg = null;
 function _getGraphCfg() {
@@ -346,6 +387,7 @@ class SlackSocketHandler {
             threadTs: row.thread_ts,
             repoPath: row.repo_path,
             createdAt: row.created_at,
+            updatedAt: row.updated_at || null,
             lastBotTs: row.last_bot_ts || null,
             alertMessageTs: row.alert_message_ts || null,
             lastUserId: row.last_user_id || null,
@@ -2138,6 +2180,43 @@ ${formatted}`
             return;
         }
 
+        // ─── Built-in local TUI commands (Claude sessions only) ────────────
+        // These never reach the generic inject path — no assistant turn
+        // starts and no Stop hook fires for them, so the bot must drive and
+        // answer them itself (see CLAUDE_*_COMMANDS at module top for the
+        // full classification and the /model incident that motivated it).
+        // Matched on the first token; codex/gemini sessions keep the old
+        // passthrough since these command names are Claude's.
+        const firstToken = command.split(/\s/)[0];
+        const interceptCli = session ? (session.cliType || 'claude') : 'claude';
+        if (interceptCli === 'claude' && firstToken.startsWith('/')) {
+            // /model — mid-session model switch. With no argument it opens
+            // the interactive model picker, whose highlighted entry
+            // _injectCommand's blind Enter retries would "select" — that
+            // silently rewrote the owner's default model (thread
+            // 1782958060.862869, 2026-07-02).
+            if (firstToken === '/model') {
+                await this._handleModelCommand({
+                    sessionKey, channelId, threadTs, messageTs, command,
+                    session, isLiveSession, restricted,
+                });
+                return;
+            }
+            const blockedReason = CLAUDE_BLOCKED_COMMANDS.get(firstToken);
+            if (blockedReason) {
+                await say({ text: `\`${firstToken}\` isn't available from Slack — ${blockedReason}.`, thread_ts: threadTs });
+                return;
+            }
+            if (CLAUDE_PANEL_COMMANDS.has(firstToken) || CLAUDE_PRINT_COMMANDS.has(firstToken)) {
+                await this._handleClaudeLocalCommand({
+                    sessionKey, channelId, threadTs, command, firstToken,
+                    session, isLiveSession, restricted,
+                    kind: CLAUDE_PANEL_COMMANDS.has(firstToken) ? 'panel' : 'print',
+                });
+                return;
+            }
+        }
+
         try {
             if (session && this._isTmuxSessionAlive(session.sessionName)) {
                 // Tmux alive — Claude already has full context, just inject the raw command
@@ -3024,6 +3103,292 @@ ${formatted}`
         }, delayMs);
         this.logger.warn(`Alert inject-retry: scheduled attempt ${attemptLabel}/${total} for ${sessionKey} in ${delayMs}ms (${reason})`);
         return true;
+    }
+
+    // ─── Local TUI commands (/model & friends) ───────────────────────────────
+    //
+    // Inject a LOCAL command — one that runs inside the CLI's TUI without
+    // starting an assistant turn — and return the pane content after it
+    // settles. Deliberately NOT _injectCommand: that path presses Enter up to
+    // 7 times until a working indicator appears, which is correct for real
+    // prompts but catastrophic for local commands that open a selection
+    // dialog — each retry Enter "picks" the highlighted entry (a bare /model
+    // injected that way rewrote the owner's default model, 2026-07-02).
+    // Here: paste with landing verification, exactly ONE Enter, capture.
+    // sessionName is bot-generated (`slack-<chan>-<ts>`), never user input;
+    // the pasted text goes through a temp file + tmux load-buffer, so no part
+    // of it is ever interpolated into a shell string.
+    async _injectLocalCommand(sessionName, text, settleMs = 3000) {
+        const os = require('os');
+        const tmpFile = path.join(os.tmpdir(), `cli-local-inject-${sessionName}-${Date.now()}.txt`);
+        try {
+            fs.writeFileSync(tmpFile, text);
+            const probe = text.split('\n')[0].trim().substring(0, 40);
+            let pasteLanded = false;
+            for (let attempt = 0; attempt < 4; attempt++) {
+                execSync(`tmux send-keys -t ${sessionName} C-u`);
+                await new Promise(r => setTimeout(r, 200));
+                execSync(`tmux load-buffer ${tmpFile}`);
+                execSync(`tmux paste-buffer -t ${sessionName}`);
+                await new Promise(r => setTimeout(r, 1000 + attempt * 500));
+                if (probe.length >= 2 && this._captureOutput(sessionName).includes(probe)) {
+                    pasteLanded = true;
+                    break;
+                }
+            }
+            if (!pasteLanded) {
+                throw new Error('paste did not land — the CLI may be busy or still initializing');
+            }
+            execSync(`tmux send-keys -t ${sessionName} Enter`);
+            await new Promise(r => setTimeout(r, settleMs));
+            return this._captureOutput(sessionName);
+        } finally {
+            try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+        }
+    }
+
+    // /model — handled entirely bot-side (see the intercept in _processCommand
+    // for why it must never reach the generic inject path). Three shapes:
+    //   /model            → report the current model parsed from the pane
+    //                       footer; never inject (the no-arg form opens the
+    //                       interactive picker).
+    //   /model <name>     → inject the CLI's inline form via
+    //                       _injectLocalCommand, scrape the "Set model to …"
+    //                       confirmation, and post it — no Stop hook fires
+    //                       for local commands, so the bot must post itself.
+    //   unsupported CLI   → Codex/Gemini have picker-only /model; tell the
+    //                       user to /exit and relaunch instead.
+    async _handleModelCommand({ sessionKey, channelId, threadTs, messageTs, command, session, isLiveSession, restricted }) {
+        const post = async (text) => {
+            try {
+                const res = await this.app.client.chat.postMessage({ channel: channelId, thread_ts: threadTs, text });
+                // This path bypasses cli-hook-notify.js, which normally keeps
+                // last_bot_ts fresh — update it here so the silent-alert
+                // requeue and inactivity sweeps don't misread the session as
+                // never-answered (same class of bug as the ask_user posts).
+                if (session && res?.ts) this._updateLastBotTs(sessionKey, res.ts);
+            } catch (err) {
+                this.logger.error(`Failed to post /model reply (channel=${channelId}): ${err.message}`);
+            }
+        };
+
+        // Switching the model persists as the owner's CLI default ("saved as
+        // your default for new sessions"), so restricted (non-owner) users
+        // may not touch it.
+        if (restricted) {
+            await post('`/model` is limited to the bot owner.');
+            return;
+        }
+        if (!session || !isLiveSession) {
+            await post('No active session in this thread — `/model` needs a live session. Send a message first to start one.');
+            return;
+        }
+
+        const cliType = session.cliType || 'claude';
+        const adapter = getCliAdapter(cliType);
+        const arg = command.split(/\s+/).slice(1).join(' ').trim();
+
+        if (!adapter.supportsModelSwitch) {
+            await post(`Mid-session model switch isn't supported for \`${cliType}\` (its /model is an interactive picker only). \`/exit\` and start a new session — the model is chosen at launch.`);
+            return;
+        }
+
+        this._touchSession(sessionKey);
+
+        if (!arg) {
+            const stats = this._extractSessionStats(this._captureOutput(session.sessionName) || '');
+            const current = stats && stats.model
+                ? `Current model: *${stats.model}*.`
+                : 'Couldn\'t read the current model from the session pane.';
+            await post(`${current} To switch: \`/model opus\`, \`/model sonnet\`, \`/model haiku\`, \`/model fable\`, or a full id like \`/model claude-opus-4-8\`.`);
+            return;
+        }
+
+        // Whitelist charset (same rationale as SLACK_CLAUDE_MODEL in the
+        // claude adapter): the arg ends up in a tmux paste, keep it inert.
+        if (!/^[A-Za-z0-9._:/-]{1,60}$/.test(arg)) {
+            await post(`\`${arg}\` doesn't look like a model name. Try \`/model opus\`, \`/model sonnet\`, or a full model id.`);
+            return;
+        }
+
+        try {
+            let output = await this._injectLocalCommand(session.sessionName, `/model ${arg}`);
+            const confirmRe = adapter.modelSwitchConfirmRegex || /Set model to/i;
+            const outcomeVisible = (out) =>
+                confirmRe.test(out) || /Switch model\?/i.test(out) || /not found/i.test(out);
+            // A loaded host can render the outcome (confirm line, cache
+            // dialog, or error) later than the inject settle — re-capture a
+            // few beats before concluding anything.
+            for (let i = 0; i < 3 && !outcomeVisible(output); i++) {
+                await new Promise(r => setTimeout(r, 2000));
+                output = this._captureOutput(session.sessionName);
+            }
+            // Switching away from the current model mid-conversation pops a
+            // "Switch model?" cache-invalidation confirm (1. Yes / 2. No —
+            // verified on 2.1.198). The user explicitly asked, so approve it
+            // the same way _autoApprove does: digit, then Enter.
+            if (/Switch model\?/i.test(output) && output.includes('1. Yes')) {
+                execSync(`tmux send-keys -t ${session.sessionName} 1`);
+                await new Promise(r => setTimeout(r, 300));
+                execSync(`tmux send-keys -t ${session.sessionName} Enter`);
+                for (let i = 0; i < 4; i++) {
+                    await new Promise(r => setTimeout(r, 1500));
+                    output = this._captureOutput(session.sessionName);
+                    if (confirmRe.test(output)) break;
+                }
+            }
+            const lines = output.split('\n').map(l => l.trim()).filter(Boolean);
+            const stripChrome = (l) => l.replace(/^[⎿⏺●➤\s]+/, '');
+            const confirmLine = [...lines].reverse().find(l => confirmRe.test(l));
+            if (confirmLine) {
+                await post(`:white_check_mark: ${stripChrome(confirmLine)}`);
+                return;
+            }
+            // Unknown name: the CLI prints `Model '<arg>' not found` inline.
+            const notFound = [...lines].reverse().find(l => /Model '.*' not found/i.test(l));
+            if (notFound) {
+                await post(`:x: ${stripChrome(notFound)}. Try \`/model opus\`, \`/model sonnet\`, \`/model haiku\`, \`/model fable\`, or a full model id.`);
+                return;
+            }
+            // Neither confirmation nor a recognizable error — if some dialog
+            // is open, close it (Escape) so a modal doesn't eat the next
+            // inject's paste, then report what the pane showed.
+            execSync(`tmux send-keys -t ${session.sessionName} Escape`);
+            await new Promise(r => setTimeout(r, 300));
+            execSync(`tmux send-keys -t ${session.sessionName} C-u`);
+            const tail = lines.slice(-5).join('\n');
+            await post(`Model switch to \`${arg}\` wasn't confirmed by the CLI. Pane tail:\n\`\`\`\n${tail}\n\`\`\``);
+        } catch (err) {
+            await post(`Failed to send \`/model ${arg}\` to the session: ${err.message}`);
+        }
+    }
+
+    // Generic driver for Claude's read-only local commands (see
+    // CLAUDE_PANEL_COMMANDS / CLAUDE_PRINT_COMMANDS at module top).
+    // kind='panel': the command opens a read-only dialog — scrape it from the
+    // pane, post it, close it with Esc so the modal can't eat the next
+    // inject's paste. kind='print': the result lands inline in the
+    // transcript — scrape everything below the command echo.
+    async _handleClaudeLocalCommand({ sessionKey, channelId, threadTs, command, firstToken, session, isLiveSession, restricted, kind }) {
+        const post = async (text) => {
+            try {
+                const res = await this.app.client.chat.postMessage({ channel: channelId, thread_ts: threadTs, text });
+                // Bypasses cli-hook-notify.js (which normally maintains
+                // last_bot_ts) — keep it fresh for the requeue/inactivity sweeps.
+                if (session && res?.ts) this._updateLastBotTs(sessionKey, res.ts);
+            } catch (err) {
+                this.logger.error(`Failed to post ${firstToken} reply (channel=${channelId}): ${err.message}`);
+            }
+        };
+
+        // Panels expose host/account details (email, permission rules, MCP
+        // servers) and /clear//compact mutate the owner's session — all of it
+        // is owner-only under the restricted-access model.
+        if (restricted) {
+            await post(`\`${firstToken}\` is limited to the bot owner.`);
+            return;
+        }
+        if (!session || !isLiveSession) {
+            await post(`No active session in this thread — \`${firstToken}\` needs a live session. Send a message first to start one.`);
+            return;
+        }
+
+        this._touchSession(sessionKey);
+
+        try {
+            let output = await this._injectLocalCommand(session.sessionName, command, 4000);
+
+            // /compact re-summarizes the whole conversation — it can spin for
+            // minutes on a fat context. Poll until the working indicators
+            // clear (or 3 min) before scraping.
+            if (firstToken === '/compact') {
+                const adapter = getCliAdapter(session.cliType || 'claude');
+                const deadline = Date.now() + 180000;
+                const busy = (text) => {
+                    const lower = (text || '').toLowerCase();
+                    return (adapter.workingIndicators || []).some(i => lower.includes(i))
+                        || (adapter.workingRegexes || []).some(re => re.test(lower));
+                };
+                while (busy(output) && Date.now() < deadline) {
+                    await new Promise(r => setTimeout(r, 3000));
+                    output = this._captureOutput(session.sessionName);
+                }
+            }
+
+            let result = this._scrapeLocalCommandResult(output, firstToken);
+
+            if (kind === 'panel') {
+                execSync(`tmux send-keys -t ${session.sessionName} Escape`);
+                await new Promise(r => setTimeout(r, 500));
+                execSync(`tmux send-keys -t ${session.sessionName} Escape`);
+                await new Promise(r => setTimeout(r, 300));
+                execSync(`tmux send-keys -t ${session.sessionName} C-u`);
+            }
+
+            if (!result && firstToken === '/clear') {
+                await post(':white_check_mark: Conversation cleared — the session starts fresh from the next message.');
+                return;
+            }
+            if (!result) {
+                await post(`\`${command}\` ran but produced no visible output.`);
+                return;
+            }
+            // Slack chat.postMessage caps text at 4000 chars — leave headroom
+            // for the header and code fences.
+            const MAX = 3500;
+            if (result.length > MAX) {
+                result = `${result.slice(0, MAX)}\n… (truncated)`;
+            }
+            await post(`Output of \`${command}\`:\n\`\`\`\n${result}\n\`\`\``);
+        } catch (err) {
+            await post(`Failed to run \`${command}\` in the session: ${err.message}`);
+        }
+    }
+
+    // Extract the interesting region of a pane capture after a local command
+    // ran. Panels render below a long ▔▔▔ top border; inline prints land
+    // directly under the `❯ /cmd` echo line and stop at the input-box
+    // divider. Falls back to the pane tail when neither shape is found.
+    // Footer chrome (OMC HUD, cwd/branch line, bypass-permissions hint) is
+    // filtered wherever it appears — the stop divider doesn't always render
+    // by capture time, and leaked chrome confused the first live test.
+    _scrapeLocalCommandResult(output, firstToken) {
+        const lines = (output || '').split('\n');
+        const CHROME = [
+            /^\[OMC#/,                    // OMC HUD statusline
+            /bypass permissions/i,        // ⏵⏵ bypass permissions on …
+            /^⏵/,
+            /^\/.*\|\s*repo:/,            // cwd | repo:… footer line
+            /^branch:/,                   // branch:… | !4 ?1 footer line
+            /^\d+h:\d+%/,                 // 5h:58%(1h40m) wk:… usage HUD
+            /Esc to (cancel|close)/i,
+        ];
+        const isChrome = (l) => CHROME.some(re => re.test(l.trim()));
+        const clean = (arr) => arr
+            .filter(l => !isChrome(l))
+            .join('\n')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+        const lastIndex = (pred) => {
+            for (let i = lines.length - 1; i >= 0; i--) {
+                if (pred(lines[i])) return i;
+            }
+            return -1;
+        };
+
+        const panelTop = lastIndex(l => /^▔{10,}/.test(l.trim()));
+        if (panelTop >= 0) {
+            return clean(lines.slice(panelTop + 1));
+        }
+
+        const echo = lastIndex(l => l.trim().startsWith(`❯ ${firstToken}`));
+        if (echo >= 0) {
+            const after = lines.slice(echo + 1);
+            const stop = after.findIndex(l => /^─{10,}/.test(l.trim()) || /^❯\s*$/.test(l.trim()));
+            return clean(stop >= 0 ? after.slice(0, stop) : after);
+        }
+
+        return clean(lines.slice(-25));
     }
 
     async _injectCommand(sessionName, command, cliType = 'claude') {
@@ -4498,12 +4863,28 @@ ${formatted}`
                         );
                         if (botRepliedAfter) continue;
 
+                        // A mention that arrived DURING the boot window is
+                        // usually already being handled by the live listener
+                        // — its session row lands in the DB before the replay
+                        // sweep runs. Replaying it would double-process the
+                        // same message (second tmux boot on the same thread).
+                        const replaySessionKey = `${channelId}-${threadTs}`;
+                        const inFlight = this._getSession(replaySessionKey);
+                        if (inFlight && inFlight.updatedAt && parseFloat(lastMention.ts) * 1000 <= inFlight.updatedAt) {
+                            continue;
+                        }
+
                         // Missed mention — replay it
                         this.logger.info(`Replaying missed mention: user=${lastMention.user} channel=${channelId} thread=${threadTs} ts=${lastMention.ts}`);
                         const say = async (msgObj) => {
                             await this.app.client.chat.postMessage({ channel: channelId, thread_ts: threadTs, ...msgObj });
                         };
-                        await this._handleMention(lastMention, say);
+                        // conversations.replies messages carry no `channel`
+                        // field (unlike live app_mention events) — without
+                        // this, session-name derivation downstream does
+                        // `undefined.slice(-4)` and the replay crashes with
+                        // "Cannot read properties of undefined" in the thread.
+                        await this._handleMention({ ...lastMention, channel: channelId }, say);
                         replayed++;
                     } catch (err) {
                         this.logger.warn(`Failed to check thread ${threadTs} in ${channelId}: ${err.message}`);

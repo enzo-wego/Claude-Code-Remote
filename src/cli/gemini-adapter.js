@@ -100,6 +100,12 @@ module.exports = {
     runtimeFatalPatterns: RUNTIME_FATAL_PATTERNS,
 
     supportsAskUser: true,
+
+    // Gemini's /model opens an interactive dialog — no reliable inline-arg
+    // form for a headless mid-session switch. socket.js tells the user to
+    // /exit and relaunch instead.
+    supportsModelSwitch: false,
+
     askUserToolName() {
         return `mcp__${MCP_SERVER_NAME}__ask_user`;
     },

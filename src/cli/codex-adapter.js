@@ -178,6 +178,12 @@ module.exports = {
     serializeLaunches: true,
 
     supportsAskUser: true,
+
+    // Codex's /model is picker-only — no inline-arg form exists, so a
+    // headless mid-session switch isn't scriptable. socket.js tells the
+    // user to /exit and relaunch instead (model is set via CODEX_COMMAND).
+    supportsModelSwitch: false,
+
     askUserToolName() {
         // Codex prefixes MCP tools as `mcp__<server>__.<tool>` with a literal
         // dot before the tool name (verified empirically via `/mcp list`);

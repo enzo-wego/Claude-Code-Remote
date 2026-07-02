@@ -110,6 +110,18 @@ module.exports = {
     // this flag so we don't nudge the agent to call a tool that isn't there.
     supportsAskUser: true,
 
+    // Mid-session model switching. `/model <name>` applies inline and prints
+    // a "Set model to …" confirmation WITHOUT starting a turn — no Stop hook
+    // fires — so socket.js handles it locally (inject, scrape confirmation,
+    // post it back to Slack itself). The no-arg `/model` must NEVER be
+    // injected: it opens an interactive picker, and blind Enter retries
+    // "select" the highlighted entry — that silently rewrote the owner's
+    // default model on 2026-07-02. socket.js answers the no-arg form from
+    // the pane footer instead.
+    supportsModelSwitch: true,
+    // Line the TUI prints when an inline `/model <name>` is accepted.
+    modelSwitchConfirmRegex: /Set model to/i,
+
     buildLaunchCommand(/* sessionName, repoPath, sessionKey */) {
         const base = process.env.SLACK_CLAUDE_COMMAND || 'claude --dangerously-skip-permissions';
         // Optional model override appended composably so SLACK_CLAUDE_COMMAND
