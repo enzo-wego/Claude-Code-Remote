@@ -1944,8 +1944,13 @@ ${formatted}`
 
         let text = rawText.replace(/<@[A-Z0-9]+>/g, '').trim();
 
-        // DM slash commands: route /whygraph and /search before any other handling
-        if (event.channel_type === 'im' && text.startsWith('/')) {
+        // DM slash commands: route /whygraph and /search before any other handling.
+        // Match only the graph commands — a bare `text.startsWith('/')` here
+        // swallowed every other slash (/exit, /quit, /status, /model, …) and
+        // replied "Unknown command", stopping them from reaching their real
+        // handlers (session teardown, local TUI commands) further down.
+        const GRAPH_DM_COMMANDS = /^\/(whygraph|search)(\s|$)/;
+        if (event.channel_type === 'im' && GRAPH_DM_COMMANDS.test(text)) {
             try {
                 const reply = await graphHandleCommand({ text, channel: channelId, user: userId });
                 await this.app.client.chat.postMessage({ channel: channelId, text: reply, thread_ts: threadTs });
