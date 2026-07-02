@@ -3,7 +3,14 @@ jest.mock('../../../src/services/daily-summary', () => ({
     parseChannelsConfig: jest.fn(() => []),
 }));
 
+jest.mock('child_process', () => ({
+    exec: jest.fn(),
+    execSync: jest.fn(),
+    execFileSync: jest.fn(),
+}));
+
 const SlackSocketHandler = require('../../../src/channels/slack/socket');
+const { execSync } = require('child_process');
 
 describe('SlackSocketHandler adapter local slash commands', () => {
     function harness({ cliType = 'codex', output = '' } = {}) {
@@ -34,17 +41,33 @@ describe('SlackSocketHandler adapter local slash commands', () => {
         return { h, session };
     }
 
-    test('codex /model is answered bot-side instead of generic injection', async () => {
-        const { h } = harness({ cliType: 'codex' });
+    beforeEach(() => {
+        execSync.mockClear();
+    });
+
+    test('codex /model is scraped as a local panel instead of being blocked', async () => {
+        const { h } = harness({
+            cliType: 'codex',
+            output: [
+                '› /model',
+                '▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔',
+                'Select model',
+                '● gpt-5.5 high',
+                '  gpt-5.4 high',
+                'Esc to close',
+            ].join('\n'),
+        });
 
         await h._processCommand('CTEST', '123.456', '/model', null, '123.456');
 
         expect(h._injectCommand).not.toHaveBeenCalled();
+        expect(h._injectLocalCommand).toHaveBeenCalledWith('slack-TEST-123', '/model', 4000);
         expect(h.app.client.chat.postMessage).toHaveBeenCalledWith(expect.objectContaining({
             channel: 'CTEST',
             thread_ts: '123.456',
-            text: expect.stringContaining("Mid-session model switch isn't supported for `codex`"),
+            text: expect.stringContaining('Select model'),
         }));
+        expect(execSync).toHaveBeenCalledWith('tmux send-keys -t slack-TEST-123 Escape');
         expect(h._updateLastBotTs).toHaveBeenCalledWith('CTEST-123.456', '999.000');
     });
 

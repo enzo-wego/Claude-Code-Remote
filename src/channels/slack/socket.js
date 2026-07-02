@@ -67,9 +67,9 @@ const CLAUDE_BLOCKED_COMMANDS = new Map([
 function _adapterLocalSlashCommand(cliType, firstToken) {
     const token = String(firstToken || '').toLowerCase();
     if (!token.startsWith('/')) return null;
-    if (token === '/model') return { type: 'model' };
 
     if ((cliType || 'claude') === 'claude') {
+        if (token === '/model') return { type: 'model' };
         const blockedReason = CLAUDE_BLOCKED_COMMANDS.get(token);
         if (blockedReason) return { type: 'blocked', reason: blockedReason };
         if (CLAUDE_PANEL_COMMANDS.has(token)) return { type: 'panel' };
@@ -2216,11 +2216,9 @@ ${formatted}`
         const interceptCli = session ? (session.cliType || 'claude') : 'claude';
         const localCommand = _adapterLocalSlashCommand(interceptCli, firstToken);
         if (localCommand) {
-            // /model — mid-session model switch. With no argument it opens
-            // the interactive model picker, whose highlighted entry
-            // _injectCommand's blind Enter retries would "select" — that
-            // silently rewrote the owner's default model (thread
-            // 1782958060.862869, 2026-07-02).
+            // Claude /model needs its dedicated owner-gated switch handler.
+            // Other CLIs classify /model through adapter.localSlashCommands;
+            // Codex treats it as a panel so we can scrape and close the picker.
             if (localCommand.type === 'model') {
                 await this._handleModelCommand({
                     sessionKey, channelId, threadTs, messageTs, command,

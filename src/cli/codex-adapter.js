@@ -180,8 +180,8 @@ module.exports = {
     supportsAskUser: true,
 
     // Codex's /model is picker-only — no inline-arg form exists, so a
-    // headless mid-session switch isn't scriptable. socket.js tells the
-    // user to /exit and relaunch instead (model is set via CODEX_COMMAND).
+    // headless mid-session switch isn't scriptable. socket.js opens it once,
+    // scrapes the picker, posts it to Slack, and closes it with Esc.
     supportsModelSwitch: false,
 
     // Codex TUI local slash commands that do not start an assistant turn, so
@@ -189,6 +189,7 @@ module.exports = {
     // posts the visible result to Slack. Turn-starting commands such as
     // /review and custom skill/plugin commands intentionally stay pass-through.
     localSlashCommands: {
+        panel: ['/model'],
         print: ['/help', '/status', '/usage', '/mcp', '/diff', '/compact', '/clear'],
         blocked: {
             '/login': 'it starts an OAuth flow that needs a browser on the host',
