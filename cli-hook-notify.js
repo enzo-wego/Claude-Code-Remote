@@ -1170,8 +1170,29 @@ async function sendHookNotification() {
                             || uploadResult?.files?.[0]?.files?.[0]?.id
                             || uploadResult?.file?.id
                             || null;
+                        // filesUploadV2 can return ok + a file id while the async
+                        // share-to-thread step fails silently (file exists but never
+                        // appears in the channel — seen 2026-07-01 on Q2OJQ9USBDKR6O).
+                        // Record the id + share state so that case is diagnosable.
+                        const uploadedFile = uploadResult?.files?.[0]?.files?.[0] || uploadResult?.files?.[0] || uploadResult?.file || null;
+                        traceLog('upload_result', {
+                            upload: 'alert-investigation',
+                            file_id: uploadedFileId,
+                            shares: uploadedFile?.shares ? Object.keys(uploadedFile.shares).length : 0,
+                            content_bytes: Buffer.byteLength(attachmentZone || ''),
+                            channel_id: channelId,
+                            thread_ts: threadTs,
+                        });
                     } catch (err) {
                         console.error(`filesUploadV2 failed: ${err.message}`);
+                        traceLog('upload_error', {
+                            upload: 'alert-investigation',
+                            error: err.message,
+                            slack_error: err.data?.error || null,
+                            content_bytes: Buffer.byteLength(attachmentZone || ''),
+                            channel_id: channelId,
+                            thread_ts: threadTs,
+                        });
                     }
 
                     if (postedTs) {
@@ -1329,6 +1350,14 @@ async function sendHookNotification() {
                                 });
                             } catch (err) {
                                 console.error(`Failed to upload raw debug output: ${err.message}`);
+                                traceLog('upload_error', {
+                                    upload: 'raw-debug-output-warning',
+                                    error: err.message,
+                                    slack_error: err.data?.error || null,
+                                    content_bytes: Buffer.byteLength(assistantMessage || ''),
+                                    channel_id: channelId,
+                                    thread_ts: threadTs,
+                                });
                             }
                         }
 
@@ -1359,6 +1388,14 @@ async function sendHookNotification() {
                             });
                         } catch (err) {
                             console.error(`Failed to upload raw debug output: ${err.message}`);
+                            traceLog('upload_error', {
+                                upload: 'raw-debug-output-final',
+                                error: err.message,
+                                slack_error: err.data?.error || null,
+                                content_bytes: Buffer.byteLength(assistantMessage || ''),
+                                channel_id: channelId,
+                                thread_ts: threadTs,
+                            });
                         }
                     }
 
