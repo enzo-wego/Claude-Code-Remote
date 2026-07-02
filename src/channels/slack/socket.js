@@ -3467,11 +3467,32 @@ ${formatted}`
     _parseCodexModelOptions(output) {
         const result = this._scrapeLocalCommandResult(output, '/model');
         const lines = (result || '').split('\n').map(l => l.trim()).filter(Boolean);
-        const options = [];
+        const numbered = [];
+        let current = null;
 
         for (const line of lines) {
+            const numberedMatch = line.match(/^\s*(\d+)\.\s+(.+)$/);
+            if (numberedMatch) {
+                if (current) numbered.push(current);
+                const selected = /\bcurrent\b/i.test(numberedMatch[2]);
+                current = {
+                    label: numberedMatch[2].replace(/\s+\bcurrent\b/i, '').replace(/\s{2,}/g, ' ').trim(),
+                    selected,
+                };
+                continue;
+            }
+            if (current) {
+                if (/^(press enter|esc|select model|access legacy|model:|directory:|permissions:)/i.test(line)) continue;
+                current.label = `${current.label} ${line}`.replace(/\s{2,}/g, ' ').trim();
+            }
+        }
+        if (current) numbered.push(current);
+        if (numbered.length) return numbered;
+
+        const options = [];
+        for (const line of lines) {
             if (!/(^|[^a-z])(gpt-|o[0-9]|auto\b)/i.test(line)) continue;
-            if (/openai codex|directory:|permissions:|context|usage|run \/status/i.test(line)) continue;
+            if (/openai codex|^model:|directory:|permissions:|context|usage|run \/status/i.test(line)) continue;
 
             const selected = /^[^\w]*(?:[●>›❯*]|=>)/.test(line);
             const label = line
