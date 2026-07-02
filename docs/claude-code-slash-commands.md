@@ -116,7 +116,8 @@ The Codex adapter marks these safe local commands as bot-side:
 | `/help`, `/status`, `/usage`, `/mcp`, `/diff` | Inject once, scrape visible output, post it to Slack |
 | `/compact` | Inject once, wait for working indicators to clear, scrape visible output |
 | `/clear` | Inject once; if no visible output appears, post a local confirmation |
-| `/model` | Open the Codex picker once, scrape visible options, post them to Slack, then close with Esc |
+| `/model` | Open the Codex picker once, scrape visible options, post numbered choices to Slack, then close with Esc |
+| `/model <number>` or `/model <text>` | Reopen the picker, select the matching visible option with arrow keys + Enter, then post confirmation |
 
 These Codex commands are blocked from Slack because they need host-side auth,
 session-pickers, or saved-session mutation outside the current thread:

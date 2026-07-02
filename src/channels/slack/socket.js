@@ -1977,9 +1977,17 @@ ${formatted}`
             if (promoted) return;
         }
 
-        // Graph context injection — only when GRAPH_CONTEXT_ENABLED and channel not denied
+        const sessionKey = `${channelId}-${threadTs}`;
+        const activeSession = this._getSession(sessionKey);
+        const firstToken = text.split(/\s/)[0];
+        const localCommand = _adapterLocalSlashCommand(activeSession ? (activeSession.cliType || 'claude') : 'claude', firstToken);
+
+        // Graph context injection — only when GRAPH_CONTEXT_ENABLED and channel not denied.
+        // Local TUI commands (/status, Codex /model, etc.) never start an
+        // assistant turn, so retrieval context is wasted and can block a
+        // command that should be answered immediately from the pane.
         let graphSystemBlock = '';
-        if (process.env.GRAPH_CONTEXT_ENABLED === 'true') {
+        if (!localCommand && process.env.GRAPH_CONTEXT_ENABLED === 'true') {
             try {
                 const channelCfg = _getGraphCfg().forChannel(channelId);
                 if (channelCfg.enabled) {
@@ -3316,6 +3324,11 @@ ${formatted}`
 
         this._touchSession(sessionKey);
 
+        if ((session.cliType || 'claude') === 'codex' && firstToken === '/model') {
+            await this._handleCodexModelCommand({ sessionKey, session, command, post });
+            return;
+        }
+
         try {
             let output = await this._injectLocalCommand(session.sessionName, command, 4000);
 
@@ -3368,6 +3381,108 @@ ${formatted}`
 
     async _handleClaudeLocalCommand(args) {
         return this._handleCliLocalCommand(args);
+    }
+
+    async _handleCodexModelCommand({ sessionKey, session, command, post }) {
+        const arg = command.split(/\s+/).slice(1).join(' ').trim();
+        const closePicker = async () => {
+            execSync(`tmux send-keys -t ${session.sessionName} Escape`);
+            await new Promise(r => setTimeout(r, 500));
+            execSync(`tmux send-keys -t ${session.sessionName} Escape`);
+            await new Promise(r => setTimeout(r, 300));
+            execSync(`tmux send-keys -t ${session.sessionName} C-u`);
+        };
+
+        try {
+            let output = await this._injectLocalCommand(session.sessionName, '/model', 4000);
+            let options = this._parseCodexModelOptions(output);
+
+            if (!arg) {
+                await closePicker();
+                if (!options.length) {
+                    const result = this._scrapeLocalCommandResult(output, '/model');
+                    await post(result
+                        ? `Output of \`/model\`:\n\`\`\`\n${result}\n\`\`\``
+                        : '`/model` opened, but I could not read any model options from the pane.');
+                    return;
+                }
+
+                this._codexModelOptions = this._codexModelOptions || new Map();
+                this._codexModelOptions.set(sessionKey, options.map(o => o.label));
+
+                const body = options
+                    .map((o, i) => `${i + 1}. ${o.label}${o.selected ? ' (current)' : ''}`)
+                    .join('\n');
+                await post(`Codex model picker:\n\`\`\`\n${body}\n\`\`\`\nReply with \`/model <number>\` or \`/model <model text>\` to choose.`);
+                return;
+            }
+
+            if (!options.length) {
+                await closePicker();
+                await post('`/model` opened, but I could not read the model list well enough to select safely.');
+                return;
+            }
+
+            let targetIndex = -1;
+            if (/^\d+$/.test(arg)) {
+                targetIndex = Number(arg) - 1;
+            } else {
+                const needle = arg.toLowerCase();
+                targetIndex = options.findIndex(o => o.label.toLowerCase() === needle);
+                if (targetIndex < 0) {
+                    targetIndex = options.findIndex(o => o.label.toLowerCase().includes(needle));
+                }
+            }
+
+            if (targetIndex < 0 || targetIndex >= options.length) {
+                await closePicker();
+                await post(`I couldn't match \`${arg}\` to a visible Codex model option. Run \`/model\` again and choose one of the numbered entries.`);
+                return;
+            }
+
+            const selectedIndex = options.findIndex(o => o.selected);
+            const fromIndex = selectedIndex >= 0 ? selectedIndex : 0;
+            const delta = targetIndex - fromIndex;
+            const key = delta >= 0 ? 'Down' : 'Up';
+            for (let i = 0; i < Math.abs(delta); i++) {
+                execSync(`tmux send-keys -t ${session.sessionName} ${key}`);
+                await new Promise(r => setTimeout(r, 120));
+            }
+            execSync(`tmux send-keys -t ${session.sessionName} Enter`);
+            await new Promise(r => setTimeout(r, 2500));
+
+            output = this._captureOutput(session.sessionName) || '';
+            const stats = this._extractSessionStats(output);
+            const current = stats && stats.model ? ` Current pane model: *${stats.model}*.` : '';
+            await post(`:white_check_mark: Selected Codex model option ${targetIndex + 1}: *${options[targetIndex].label}*.${current}`);
+        } catch (err) {
+            try {
+                execSync(`tmux send-keys -t ${session.sessionName} Escape`);
+                execSync(`tmux send-keys -t ${session.sessionName} C-u`);
+            } catch { /* ignore cleanup failure */ }
+            await post(`Failed to handle Codex \`/model\`: ${err.message}`);
+        }
+    }
+
+    _parseCodexModelOptions(output) {
+        const result = this._scrapeLocalCommandResult(output, '/model');
+        const lines = (result || '').split('\n').map(l => l.trim()).filter(Boolean);
+        const options = [];
+
+        for (const line of lines) {
+            if (!/(^|[^a-z])(gpt-|o[0-9]|auto\b)/i.test(line)) continue;
+            if (/openai codex|directory:|permissions:|context|usage|run \/status/i.test(line)) continue;
+
+            const selected = /^[^\w]*(?:[●>›❯*]|=>)/.test(line);
+            const label = line
+                .replace(/^[^\w]*(?:[●○>›❯*]|=>)?\s*/, '')
+                .replace(/\s{2,}/g, ' ')
+                .trim();
+            if (!label || options.some(o => o.label === label)) continue;
+            options.push({ label, selected });
+        }
+
+        return options;
     }
 
     // Extract the interesting region of a pane capture after a local command

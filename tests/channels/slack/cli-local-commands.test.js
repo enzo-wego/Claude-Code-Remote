@@ -34,7 +34,10 @@ describe('SlackSocketHandler adapter local slash commands', () => {
             _injectLocalCommand: jest.fn(async () => output),
             _captureOutput: jest.fn(() => output),
             _scrapeLocalCommandResult: SlackSocketHandler.prototype._scrapeLocalCommandResult,
+            _parseCodexModelOptions: SlackSocketHandler.prototype._parseCodexModelOptions,
+            _extractSessionStats: SlackSocketHandler.prototype._extractSessionStats,
             _handleModelCommand: SlackSocketHandler.prototype._handleModelCommand,
+            _handleCodexModelCommand: SlackSocketHandler.prototype._handleCodexModelCommand,
             _handleCliLocalCommand: SlackSocketHandler.prototype._handleCliLocalCommand,
             _processCommand: SlackSocketHandler.prototype._processCommand,
         };
@@ -65,10 +68,35 @@ describe('SlackSocketHandler adapter local slash commands', () => {
         expect(h.app.client.chat.postMessage).toHaveBeenCalledWith(expect.objectContaining({
             channel: 'CTEST',
             thread_ts: '123.456',
-            text: expect.stringContaining('Select model'),
+            text: expect.stringContaining('Reply with `/model <number>`'),
         }));
         expect(execSync).toHaveBeenCalledWith('tmux send-keys -t slack-TEST-123 Escape');
         expect(h._updateLastBotTs).toHaveBeenCalledWith('CTEST-123.456', '999.000');
+    });
+
+    test('codex /model number selects a visible picker option', async () => {
+        const { h } = harness({
+            cliType: 'codex',
+            output: [
+                '› /model',
+                '▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔',
+                'Select model',
+                '● gpt-5.5 high',
+                '  gpt-5.4 high',
+                'Esc to close',
+                'model: gpt-5.4 high',
+            ].join('\n'),
+        });
+
+        await h._processCommand('CTEST', '123.456', '/model 2', null, '123.456');
+
+        expect(h._injectCommand).not.toHaveBeenCalled();
+        expect(h._injectLocalCommand).toHaveBeenCalledWith('slack-TEST-123', '/model', 4000);
+        expect(execSync).toHaveBeenCalledWith('tmux send-keys -t slack-TEST-123 Down');
+        expect(execSync).toHaveBeenCalledWith('tmux send-keys -t slack-TEST-123 Enter');
+        expect(h.app.client.chat.postMessage).toHaveBeenCalledWith(expect.objectContaining({
+            text: expect.stringContaining('Selected Codex model option 2'),
+        }));
     });
 
     test('codex safe local commands are injected once and their pane output is posted', async () => {
