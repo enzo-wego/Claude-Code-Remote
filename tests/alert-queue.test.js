@@ -154,7 +154,7 @@ describe('Alert Queue', () => {
 
             h._processNextInQueue();
 
-            expect(h._processCommand).toHaveBeenCalledWith('C123', '111.111', 'Investigate', null, '111.111', '111.111');
+            expect(h._processCommand).toHaveBeenCalledWith('C123', '111.111', 'Investigate', null, '111.111', '111.111', null, ['claude']);
             expect(h._queueStmts.countProcessing.get().count).toBe(1);
             expect(h._queueStmts.countPending.get().count).toBe(0);
         });

@@ -184,6 +184,24 @@ module.exports = {
     // user to /exit and relaunch instead (model is set via CODEX_COMMAND).
     supportsModelSwitch: false,
 
+    // Codex TUI local slash commands that do not start an assistant turn, so
+    // no Stop hook fires. socket.js injects these once, scrapes the pane, and
+    // posts the visible result to Slack. Turn-starting commands such as
+    // /review and custom skill/plugin commands intentionally stay pass-through.
+    localSlashCommands: {
+        print: ['/help', '/status', '/usage', '/mcp', '/diff', '/compact', '/clear'],
+        blocked: {
+            '/login': 'it starts an OAuth flow that needs a browser on the host',
+            '/logout': 'it would de-authenticate Codex for every session on this host',
+            '/resume': 'it opens an interactive session picker (the bot resumes sessions automatically when tmux dies)',
+            '/fork': 'it opens an interactive fork picker that can switch conversation state',
+            '/archive': 'it changes saved-session state outside this Slack thread',
+            '/delete': 'it permanently deletes saved Codex sessions',
+            '/unarchive': 'it changes saved-session state outside this Slack thread',
+            '/new': 'it starts a new local conversation and would detach this Slack thread from its saved session',
+        },
+    },
+
     askUserToolName() {
         // Codex prefixes MCP tools as `mcp__<server>__.<tool>` with a literal
         // dot before the tool name (verified empirically via `/mcp list`);

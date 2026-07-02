@@ -17,6 +17,7 @@ describe('SlackSocketHandler session timeout working-pane guard', () => {
             logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
             sessionTimers: new Map(),
             pollers: new Map(),
+            _midTurnRechecks: new Map(),
             killedSessions: [],
             _getSession: jest.fn(() => ({
                 sessionName: 'slack-TEST-123',
@@ -28,7 +29,10 @@ describe('SlackSocketHandler session timeout working-pane guard', () => {
             })),
             _parseBotTsMs: SlackSocketHandler.prototype._parseBotTsMs,
             _isPaneWorking: jest.fn(() => paneWorking),
+            _paneWorkingTail: jest.fn(() => paneWorking ? 'working' : ''),
+            _stableFingerprint: SlackSocketHandler.prototype._stableFingerprint,
             _setThreadStatus: jest.fn(),
+            _snapshotPaneForResume: jest.fn(),
             _addReaction: jest.fn(async () => {}),
             _removeReaction: jest.fn(async () => {}),
             _completeQueueItem: jest.fn(),

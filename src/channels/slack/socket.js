@@ -64,6 +64,32 @@ const CLAUDE_BLOCKED_COMMANDS = new Map([
     ['/keybindings', 'it edits host keybindings'],
 ]);
 
+function _adapterLocalSlashCommand(cliType, firstToken) {
+    const token = String(firstToken || '').toLowerCase();
+    if (!token.startsWith('/')) return null;
+    if (token === '/model') return { type: 'model' };
+
+    if ((cliType || 'claude') === 'claude') {
+        const blockedReason = CLAUDE_BLOCKED_COMMANDS.get(token);
+        if (blockedReason) return { type: 'blocked', reason: blockedReason };
+        if (CLAUDE_PANEL_COMMANDS.has(token)) return { type: 'panel' };
+        if (CLAUDE_PRINT_COMMANDS.has(token)) return { type: 'print' };
+        return null;
+    }
+
+    const adapter = getCliAdapter(cliType);
+    const local = adapter.localSlashCommands || {};
+    const has = (items) => Array.isArray(items)
+        ? items.includes(token)
+        : items instanceof Set && items.has(token);
+    const blocked = local.blocked || {};
+    const blockedReason = blocked instanceof Map ? blocked.get(token) : blocked[token];
+    if (blockedReason) return { type: 'blocked', reason: blockedReason };
+    if (has(local.panel)) return { type: 'panel' };
+    if (has(local.print)) return { type: 'print' };
+    return null;
+}
+
 // Load graph-context config once at startup (non-fatal if file missing)
 let _graphCfg = null;
 function _getGraphCfg() {
@@ -2180,41 +2206,38 @@ ${formatted}`
             return;
         }
 
-        // ─── Built-in local TUI commands (Claude sessions only) ────────────
+        // ─── Built-in local TUI commands ───────────────────────────────────
         // These never reach the generic inject path — no assistant turn
         // starts and no Stop hook fires for them, so the bot must drive and
-        // answer them itself (see CLAUDE_*_COMMANDS at module top for the
-        // full classification and the /model incident that motivated it).
-        // Matched on the first token; codex/gemini sessions keep the old
-        // passthrough since these command names are Claude's.
+        // answer them itself. Matched on the first token; turn-starting slash
+        // commands and skills stay on the generic path so CLI hooks post the
+        // real assistant reply.
         const firstToken = command.split(/\s/)[0];
         const interceptCli = session ? (session.cliType || 'claude') : 'claude';
-        if (interceptCli === 'claude' && firstToken.startsWith('/')) {
+        const localCommand = _adapterLocalSlashCommand(interceptCli, firstToken);
+        if (localCommand) {
             // /model — mid-session model switch. With no argument it opens
             // the interactive model picker, whose highlighted entry
             // _injectCommand's blind Enter retries would "select" — that
             // silently rewrote the owner's default model (thread
             // 1782958060.862869, 2026-07-02).
-            if (firstToken === '/model') {
+            if (localCommand.type === 'model') {
                 await this._handleModelCommand({
                     sessionKey, channelId, threadTs, messageTs, command,
                     session, isLiveSession, restricted,
                 });
                 return;
             }
-            const blockedReason = CLAUDE_BLOCKED_COMMANDS.get(firstToken);
-            if (blockedReason) {
-                await say({ text: `\`${firstToken}\` isn't available from Slack — ${blockedReason}.`, thread_ts: threadTs });
+            if (localCommand.type === 'blocked') {
+                await say({ text: `\`${firstToken}\` isn't available from Slack — ${localCommand.reason}.`, thread_ts: threadTs });
                 return;
             }
-            if (CLAUDE_PANEL_COMMANDS.has(firstToken) || CLAUDE_PRINT_COMMANDS.has(firstToken)) {
-                await this._handleClaudeLocalCommand({
-                    sessionKey, channelId, threadTs, command, firstToken,
-                    session, isLiveSession, restricted,
-                    kind: CLAUDE_PANEL_COMMANDS.has(firstToken) ? 'panel' : 'print',
-                });
-                return;
-            }
+            await this._handleCliLocalCommand({
+                sessionKey, channelId, threadTs, command, firstToken,
+                session, isLiveSession, restricted,
+                kind: localCommand.type,
+            });
+            return;
         }
 
         try {
@@ -3263,13 +3286,13 @@ ${formatted}`
         }
     }
 
-    // Generic driver for Claude's read-only local commands (see
-    // CLAUDE_PANEL_COMMANDS / CLAUDE_PRINT_COMMANDS at module top).
+    // Generic driver for read-only local commands (see CLAUDE_* constants and
+    // adapter.localSlashCommands).
     // kind='panel': the command opens a read-only dialog — scrape it from the
     // pane, post it, close it with Esc so the modal can't eat the next
     // inject's paste. kind='print': the result lands inline in the
     // transcript — scrape everything below the command echo.
-    async _handleClaudeLocalCommand({ sessionKey, channelId, threadTs, command, firstToken, session, isLiveSession, restricted, kind }) {
+    async _handleCliLocalCommand({ sessionKey, channelId, threadTs, command, firstToken, session, isLiveSession, restricted, kind }) {
         const post = async (text) => {
             try {
                 const res = await this.app.client.chat.postMessage({ channel: channelId, thread_ts: threadTs, text });
@@ -3345,6 +3368,10 @@ ${formatted}`
         }
     }
 
+    async _handleClaudeLocalCommand(args) {
+        return this._handleCliLocalCommand(args);
+    }
+
     // Extract the interesting region of a pane capture after a local command
     // ran. Panels render below a long ▔▔▔ top border; inline prints land
     // directly under the `❯ /cmd` echo line and stop at the input-box
@@ -3381,7 +3408,9 @@ ${formatted}`
             return clean(lines.slice(panelTop + 1));
         }
 
-        const echo = lastIndex(l => l.trim().startsWith(`❯ ${firstToken}`));
+        const tokenRe = firstToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const echoRe = new RegExp(`^[❯›>]\\s+${tokenRe}(?:\\s|$)`);
+        const echo = lastIndex(l => echoRe.test(l.trim()));
         if (echo >= 0) {
             const after = lines.slice(echo + 1);
             const stop = after.findIndex(l => /^─{10,}/.test(l.trim()) || /^❯\s*$/.test(l.trim()));
@@ -4872,6 +4901,20 @@ ${formatted}`
                         const inFlight = this._getSession(replaySessionKey);
                         if (inFlight && inFlight.updatedAt && parseFloat(lastMention.ts) * 1000 <= inFlight.updatedAt) {
                             continue;
+                        }
+
+                        // Live Socket Mode handlers mark timestamps before
+                        // doing slow work like booting a Codex tmux session.
+                        // During startup, replay can run before that slow path
+                        // has saved a session row, so the DB in-flight check
+                        // above is not enough. Reuse the same in-memory guard
+                        // to avoid replaying a mention already being handled.
+                        if (!this._handledMentionTs) this._handledMentionTs = new Set();
+                        if (this._handledMentionTs.has(lastMention.ts)) continue;
+                        this._handledMentionTs.add(lastMention.ts);
+                        if (this._handledMentionTs.size > 200) {
+                            const arr = [...this._handledMentionTs];
+                            this._handledMentionTs = new Set(arr.slice(-100));
                         }
 
                         // Missed mention — replay it
