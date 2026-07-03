@@ -466,6 +466,17 @@ async function sendResponse(web, channelId, threadTs, response, stats, mentionUs
     const prefix = `:black_circle_for_record: ${mention}`;
     const statsLine = formatStatsLine(stats);
 
+    // Turn plainly-named teammates in the body into real mentions so everyone the
+    // reply addresses gets pinged — not just the single mentionUserId prefix.
+    // Best-effort: leaves the text unchanged on any failure.
+    try {
+        const { linkThreadMentions } = require('./src/services/mention-linker');
+        const linked = await linkThreadMentions(web, channelId, threadTs, response, mentionUserId);
+        response = linked.text;
+    } catch (err) {
+        console.error(`mention-linking skipped: ${err.message}`);
+    }
+
     const firstChunkMax = maxLen - prefix.length;
 
     if (response.length <= firstChunkMax) {
@@ -1029,9 +1040,18 @@ async function sendHookNotification() {
                         // the conversational answer is usually well under that.
                         const MAX_TEXT = 39000;
                         const mention = lastUserId ? `<@${lastUserId}> ` : '';
-                        const body = assistantMessage.length > MAX_TEXT
+                        let body = assistantMessage.length > MAX_TEXT
                             ? assistantMessage.slice(0, MAX_TEXT) + '\n\n…(truncated)'
                             : assistantMessage;
+                        // Link other teammates named in the reply so they get pinged
+                        // too, not just the lastUserId prefix. Best-effort.
+                        try {
+                            const { linkThreadMentions } = require('./src/services/mention-linker');
+                            const linked = await linkThreadMentions(web, channelId, threadTs, body, lastUserId);
+                            body = linked.text;
+                        } catch (err) {
+                            console.error(`mention-linking skipped: ${err.message}`);
+                        }
                         const text = mention + body;
                         try {
                             const post = await web.chat.postMessage({
