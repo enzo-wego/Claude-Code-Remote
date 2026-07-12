@@ -112,8 +112,27 @@ class AlertMonitor {
     }
 
     /**
+     * Collect every string a Slack message might carry a PD link in:
+     * top-level `text`, attachment fields, and Block Kit `blocks`. Modern
+     * PagerDuty posts render their incident URL inside blocks (a section
+     * `mrkdwn` or a rich-text `url` field), leaving `event.text` empty — so
+     * scanning only text/attachments silently misses the incident ID.
+     * Stringifying `blocks` surfaces those URLs regardless of nesting.
+     */
+    _harvestText(event) {
+        const parts = [event.text || ''];
+        for (const att of (event.attachments || [])) {
+            parts.push(att.fallback || '', att.text || '', att.title || '', att.title_link || '', att.pretext || '');
+        }
+        if (event.blocks && event.blocks.length) {
+            try { parts.push(JSON.stringify(event.blocks)); } catch { /* circular/unserializable — skip */ }
+        }
+        return parts.join(' ');
+    }
+
+    /**
      * Detect if a Slack message is from PagerDuty.
-     * Checks bot_profile name, username, and PD links in text/attachments.
+     * Checks bot_profile name, username, and PD links in text/attachments/blocks.
      */
     isPagerDutyMessage(event) {
         // Check bot profile name
@@ -122,24 +141,8 @@ class AlertMonitor {
         // Check username
         if (event.username?.toLowerCase().includes('pagerduty')) return true;
 
-        // Check text for PagerDuty links
-        const text = event.text || '';
-        if (text.includes('pagerduty.com')) return true;
-
-        // Check attachments for PD links
-        const attachments = event.attachments || [];
-        for (const att of attachments) {
-            const fallback = att.fallback || '';
-            const attText = att.text || '';
-            const title = att.title || '';
-            const titleLink = att.title_link || '';
-            if (fallback.includes('pagerduty.com') ||
-                attText.includes('pagerduty.com') ||
-                title.includes('pagerduty.com') ||
-                titleLink.includes('pagerduty.com')) {
-                return true;
-            }
-        }
+        // Check text, attachments, and blocks for PagerDuty links
+        if (this._harvestText(event).includes('pagerduty.com')) return true;
 
         return false;
     }
@@ -157,22 +160,12 @@ class AlertMonitor {
     }
 
     /**
-     * Extract PagerDuty incident ID from message text/attachments.
+     * Extract PagerDuty incident ID from message text/attachments/blocks.
      */
     extractIncidentId(event) {
-        const text = event.text || '';
         // Match PD incident URLs like https://xxx.pagerduty.com/incidents/PXXXXXX
-        const urlMatch = text.match(/pagerduty\.com\/incidents\/([A-Z0-9]+)/i);
-        if (urlMatch) return urlMatch[1];
-
-        // Check attachments
-        for (const att of (event.attachments || [])) {
-            const link = att.title_link || att.fallback || att.text || '';
-            const attMatch = link.match(/pagerduty\.com\/incidents\/([A-Z0-9]+)/i);
-            if (attMatch) return attMatch[1];
-        }
-
-        return null;
+        const match = this._harvestText(event).match(/pagerduty\.com\/incidents\/([A-Z0-9]+)/i);
+        return match ? match[1] : null;
     }
 }
 
