@@ -16,7 +16,16 @@ const axios = require('axios');
 const Database = require('better-sqlite3');
 
 const PD_BASE = 'https://api.pagerduty.com';
-const DOUBLE_CHECK_TEXT = '(L1 PagerDuty on-call for this service) — final report above. AI can make mistakes, please double-check.';
+const REPORT_TAIL = 'final report above. AI can make mistakes, please double-check.';
+// Role label depends on who we actually ping: the resolved L1 on-call, or the
+// owner as a fallback when the L1 lookup fails. Claiming "L1" on the fallback
+// path is misleading (see incident Q3TP536NRB7DE9, 2026-07-12).
+const buildDoubleCheckText = (isRealL1) =>
+    isRealL1
+        ? `(L1 PagerDuty on-call for this service) — ${REPORT_TAIL}`
+        : `(owner — L1 on-call lookup unavailable) — ${REPORT_TAIL}`;
+// Back-compat export: the L1-path text.
+const DOUBLE_CHECK_TEXT = buildDoubleCheckText(true);
 
 function parsePdEmailMap(envVal) {
     const map = {};
@@ -93,6 +102,7 @@ async function postOncallDoubleCheck({
     if (!channelId || !threadTs) return;
 
     let mention = ownerUserId ? `<@${ownerUserId}>` : null;
+    let pingedRealL1 = false;
     let db = null;
 
     try {
@@ -112,6 +122,7 @@ async function postOncallDoubleCheck({
         const slackUserId = resolveSlackUserId(email);
         if (slackUserId) {
             mention = `<@${slackUserId}>`;
+            pingedRealL1 = true;
         } else {
             (logger.warn || logger.error || console.error)(`Oncall: ${email} not in PD_EMAIL_TO_SLACK_USER_ID map; falling back to owner`);
         }
@@ -130,7 +141,7 @@ async function postOncallDoubleCheck({
         await web.chat.postMessage({
             channel: channelId,
             thread_ts: threadTs,
-            text: `${mention} ${DOUBLE_CHECK_TEXT}`,
+            text: `${mention} ${buildDoubleCheckText(pingedRealL1)}`,
         });
     } catch (err) {
         (logger.error || console.error)(`Failed to post double-check ping: ${err.message}`);
@@ -141,5 +152,6 @@ module.exports = {
     postOncallDoubleCheck,
     resolveSlackUserId,
     parsePdEmailMap,
+    buildDoubleCheckText,
     DOUBLE_CHECK_TEXT,
 };
