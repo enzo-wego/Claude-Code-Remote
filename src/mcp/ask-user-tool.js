@@ -202,14 +202,41 @@ async function handleAskUser(input, ctx) {
         throw new Error(`ask_user: no Slack session found for ${sessionId}`);
     }
 
+    // Replay guard. The MCP transport reconnects routinely (SSE drops, a
+    // reconnect every few minutes); when one lands while an ask_user call is
+    // still in flight, the client re-sends the SAME tools/call over the new
+    // transport. Without this, that replay would post a SECOND identical
+    // question and orphan the first (its HTTP response died with the old
+    // connection) — the 2026-07-15 double-post incident. Re-attach to the
+    // existing pending question instead: re-point its resolver at THIS live
+    // call so the user's answer (clicked on the one visible CTA) lands here.
+    const replay = findReplayTarget(sessionId, normalized.questions);
+    if (replay) {
+        logger.info(
+            `ask_user: reconnect replay for session ${sessionId}; re-attaching to pending ` +
+            `${replay.requestId} instead of re-posting`,
+        );
+        const result = await new Promise((resolve) => {
+            // Both the timeout and the Slack interaction handler resolve
+            // through entry.resolve, so re-pointing it is sufficient.
+            replay.entry.resolve = resolve;
+        });
+        return formatToolResult(result);
+    }
+
     const requestId = randomUUID();
 
     // Build promise BEFORE posting so the resolver is in the registry
     // before any user could possibly reply.
     const answerPromise = new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
+            const entry = pending.get(requestId);
             pending.delete(requestId);
-            resolve({ status: 'timeout' });
+            // Resolve through the current entry.resolve (a replay may have
+            // re-pointed it at a newer live call) rather than the resolver
+            // captured here, so the timeout fires on the connection actually
+            // waiting on the answer.
+            (entry ? entry.resolve : resolve)({ status: 'timeout' });
         }, normalized.timeoutMs);
 
         pending.set(requestId, {
@@ -260,15 +287,47 @@ async function handleAskUser(input, ctx) {
     logger.info(`ask_user: posted question ${requestId} for session ${sessionId}`);
 
     const result = await answerPromise;
+    return formatToolResult(result);
+}
 
-    // Always return uniform `{answers, status}` keyed by question.id. The
-    // single-question caller just reads `answers[questions[0].id]`.
+// Always return uniform `{answers, status}` keyed by question.id. The
+// single-question caller just reads `answers[questions[0].id]`.
+function formatToolResult(result) {
     return {
         content: [{ type: 'text', text: JSON.stringify({
             answers: result.answers || {},
             status: result.status || 'ok',
         }) }],
     };
+}
+
+/**
+ * A stable fingerprint of a question set, used to recognise a replayed
+ * tools/call after a transport reconnect. Deliberately ignores generated
+ * `id`s (normalizeInput mints a fresh randomUUID when the caller omits one,
+ * so ids differ across otherwise-identical replays) and keys on the fields
+ * the caller actually sent: type + question text.
+ */
+function questionSignature(questions) {
+    return (questions || [])
+        .map((q) => `${q.type || ''}|${q.question || ''}`)
+        .join('\n');
+}
+
+/**
+ * Find an in-flight pending question for this session whose content matches
+ * `questions` — i.e. the same tools/call re-sent after a reconnect. Returns
+ * { requestId, entry } or null. Only IN-FLIGHT questions are in `pending`
+ * (resolvePending deletes on answer), so a legitimately-repeated question
+ * asked after the first was answered won't match.
+ */
+function findReplayTarget(sessionId, questions) {
+    const sig = questionSignature(questions);
+    for (const [requestId, entry] of pending) {
+        if (entry.sessionId !== sessionId) continue;
+        if (questionSignature(entry.questions) === sig) return { requestId, entry };
+    }
+    return null;
 }
 
 // ─── External entry points (called by Slack interaction handler) ──────────
