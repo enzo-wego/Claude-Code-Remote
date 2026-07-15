@@ -135,8 +135,24 @@ async function startMcpServer({ config, db, slackApp, getDb, port, host, force }
             // transport closed, killing any in-flight ask_user call). If
             // the stream is down the SDK drops the message and the ping
             // times out — harmless, hence the swallow.
+            let pingFails = 0;
             const keepalive = setInterval(() => {
-                mcpServer.ping().catch(() => {});
+                mcpServer.ping().then(() => {
+                    if (pingFails > 0) {
+                        logger.info(`mcp: keepalive ping recovered for ${sessionId} after ${pingFails} failure(s)`);
+                        pingFails = 0;
+                    }
+                }).catch((err) => {
+                    // A rejected ping means there's no standalone SSE stream to
+                    // keep warm — the client isn't holding one open, so the
+                    // keepalive can't prevent its reconnect. Log sparsely (first
+                    // failure, then every 10th) so keepalive health is visible
+                    // without flooding a healthy session's logs.
+                    pingFails += 1;
+                    if (pingFails === 1 || pingFails % 10 === 0) {
+                        logger.warn(`mcp: keepalive ping failed for ${sessionId} (${pingFails}x): ${err.message}`);
+                    }
+                });
             }, keepaliveIntervalMs());
             if (keepalive.unref) keepalive.unref();
 
