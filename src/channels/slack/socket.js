@@ -23,6 +23,28 @@ const { buildContext, handleCommand: graphHandleCommand } = require('../../graph
 const { GraphContextConfig } = require('../../graph-context/config');
 const { AskerLookup } = require('../../graph-context/asker');
 
+// ─── Credential-honesty directive ──────────────────────────────────────────
+//
+// Investigations have asserted a token/profile was "expired" without ever
+// testing it — on 2026-07-21 (payment p9y0yhtbd5) a session claimed the AWS
+// SSO profile was expired when it was actually live, conflating it with a
+// genuine BigQuery failure, and buried the (half-wrong) claim in a note to the
+// owner. Real expiries are now caught proactively by SsoPrewarm and
+// BqHealthMonitor, which DM the owner. This preamble closes the other half:
+// forbid the session from *reporting* a credential as down unless a command it
+// ran in THIS session shows the failure. Prepended on fresh CLI boots only.
+const CREDENTIAL_HONESTY_PREAMBLE = [
+    'CREDENTIAL REPORTING RULE (read before investigating):',
+    'Do NOT state or imply that any credential, token, AWS profile, gcloud/BigQuery',
+    'auth, or SSO session is expired/unavailable/broken unless a command YOU ran in',
+    'THIS session produced the actual error. Never infer one credential is dead',
+    'because a different one failed — verify each independently before reporting it:',
+    '  • AWS: `aws sts get-caller-identity --profile <profile>`',
+    '  • BigQuery: `bq query --use_legacy_sql=false "SELECT 1"`',
+    'If a check genuinely fails, quote the real error and use the documented',
+    'fallback. If you did not test it, do not mention its status at all.',
+].join('\n');
+
 // ─── Claude Code built-in LOCAL slash commands ─────────────────────────────
 //
 // Classification from an empirical survey of Claude Code 2.1.198 driven over
@@ -2667,6 +2689,14 @@ ${formatted}`
             if (graphSystemBlock && isFreshCliBoot) {
                 fullCommand = `${graphSystemBlock}\n\n---\n\n${fullCommand}`;
                 this.logger.info(`Graph system block prepended (${graphSystemBlock.length} chars) for session ${session.sessionName}`);
+            }
+
+            // Prepend the credential-honesty rule on fresh CLI boots so
+            // investigations verify each credential before reporting it as
+            // down, instead of guessing/conflating (see the constant's note).
+            if (isFreshCliBoot) {
+                fullCommand = `${CREDENTIAL_HONESTY_PREAMBLE}\n\n---\n\n${fullCommand}`;
+                this.logger.info(`Credential-honesty preamble prepended for session ${session.sessionName}`);
             }
 
             // Restricted (team, non-owner) users: prepend the access boundary
