@@ -12,6 +12,7 @@ const Logger = require('./src/core/logger');
 const SlackSocketHandler = require('./src/channels/slack/socket');
 const { runDailySummary, parseChannelsConfig } = require('./src/services/daily-summary');
 const { SsoPrewarm } = require('./src/services/sso-prewarm');
+const { BqHealthMonitor } = require('./src/services/bq-health');
 const mcp = require('./src/mcp');
 
 // Load environment variables
@@ -108,6 +109,13 @@ const config = {
         .filter(Boolean),
     ssoPrewarmIntervalMs: parseInt(process.env.SSO_PREWARM_INTERVAL_MS) || 1800000, // 30 min
     ssoPrewarmTimeoutMs: parseInt(process.env.SSO_PREWARM_TIMEOUT_MS) || 120000, // 2 min. (Briefly tried 10s on 2026-05-26 to "fail fast" past the broken headless-login, but measured `/credentials` latency for legit cached responses is 20-40s due to serial socat handling + repeated aws shell-outs in serve-credentials.sh. 10s would alert false-positive. Revisit if serve-credentials.sh is ever profiled and sped up.)
+    // BigQuery auth health monitor. Unlike SSO there's no auto-reseed —
+    // `gcloud auth login` is interactive — so this only detects the expiry and
+    // DMs the owner to refresh, instead of it silently surfacing mid-incident.
+    bqHealthEnabled: (process.env.BQ_HEALTH_ENABLED || '').toLowerCase() === 'true',
+    bqHealthCommand: process.env.BQ_HEALTH_COMMAND || 'bq',
+    bqHealthIntervalMs: parseInt(process.env.BQ_HEALTH_INTERVAL_MS) || 1800000, // 30 min
+    bqHealthTimeoutMs: parseInt(process.env.BQ_HEALTH_TIMEOUT_MS) || 60000, // 1 min
 };
 
 // Validate configuration
@@ -235,6 +243,7 @@ async function start() {
     logger.info(`- Daily Summary: ${config.dailySummaryChannels ? `${config.dailySummaryTime} → ${config.dailySummaryChannels}` : 'Not configured'}`);
     logger.info(`- App Mode: ${config.appMode}`);
     logger.info(`- SSO Pre-warm: ${config.ssoPrewarmEnabled ? `${config.ssoPrewarmProfiles.join(', ')} every ${config.ssoPrewarmIntervalMs}ms via ${config.ssoPrewarmUrl}` : 'Disabled'}`);
+    logger.info(`- BQ Health Monitor: ${config.bqHealthEnabled ? `every ${config.bqHealthIntervalMs}ms (timeout ${config.bqHealthTimeoutMs}ms)` : 'Disabled'}`);
 
     // MCP slack-ask: wire Bolt action/view handlers BEFORE socket connect so
     // we don't miss button taps that arrive during the start window.
@@ -318,6 +327,23 @@ async function start() {
     } else if (config.ssoPrewarmEnabled && config.appMode === 'local') {
         logger.info('SSO pre-warm skipped: APP_MODE=local does not handle alerts');
     }
+
+    // BQ health monitor — same gating as SSO pre-warm: only instances that run
+    // investigations (cloud/all) query BigQuery, and gating to one instance
+    // avoids duplicate owner DMs when local + cloud run on the same Slack app.
+    if (config.bqHealthEnabled && config.appMode !== 'local') {
+        const bqHealth = new BqHealthMonitor({
+            bqCommand: config.bqHealthCommand,
+            intervalMs: config.bqHealthIntervalMs,
+            timeoutMs: config.bqHealthTimeoutMs,
+            slackClient: handler.app.client,
+            ownerUserId: config.ownerUserId,
+        });
+        handler.bqHealth = bqHealth;
+        bqHealth.start();
+    } else if (config.bqHealthEnabled && config.appMode === 'local') {
+        logger.info('BQ health monitor skipped: APP_MODE=local does not run investigations');
+    }
 }
 
 start().catch((error) => {
@@ -329,6 +355,7 @@ start().catch((error) => {
 function shutdown() {
     logger.info('Shutting down Slack Socket Mode server...');
     if (handler.ssoPrewarm) handler.ssoPrewarm.stop();
+    if (handler.bqHealth) handler.bqHealth.stop();
     Promise.resolve()
         .then(() => mcp.stopMcpServer())
         .catch((err) => logger.warn(`mcp stop failed: ${err.message}`))
