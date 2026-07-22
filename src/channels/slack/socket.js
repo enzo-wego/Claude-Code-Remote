@@ -1125,17 +1125,15 @@ class SlackSocketHandler {
      */
     async _detectProjectFromThread(messages) {
         try {
-            const { GoogleGenerativeAI } = require('@google/generative-ai');
-            const apiKey = process.env.GEMINI_API_KEY;
-            if (!apiKey) return null;
+            const { openrouterComplete } = require('../../utils/openrouter');
+            if (!process.env.OPENROUTER_API_KEY) return null;
 
             const formatted = await this._formatThreadContext(messages);
             const repoRoot = this.config.repoRoot || '';
 
-            const genAI = new GoogleGenerativeAI(apiKey);
-            const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-            const result = await model.generateContent(
-                `From this Slack thread, identify the project directory path that was being used for the Claude Code session.
+            const detected = (await openrouterComplete([{
+                role: 'user',
+                content: `From this Slack thread, identify the project directory path that was being used for the Claude Code session.
 Look for patterns like:
 - "start claude from X project"
 - "Starting Claude session in /path/to/..."
@@ -1146,9 +1144,8 @@ The repo root is: ${repoRoot}
 Return ONLY the absolute directory path, nothing else. If you cannot determine it, return "unknown".
 
 Thread:
-${formatted}`
-            );
-            const detected = result.response.text().trim();
+${formatted}`,
+            }], { maxTokens: 100 })).trim();
             if (detected && detected !== 'unknown' && detected.startsWith('/')) {
                 this.logger.info(`Gemini detected project from thread: ${detected}`);
                 return detected;
