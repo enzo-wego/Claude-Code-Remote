@@ -989,17 +989,13 @@ class SlackSocketHandler {
     async _fetchFileContents(files) {
         if (!files || files.length === 0) return null;
 
-        const { GoogleGenerativeAI } = require('@google/generative-ai');
-        const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) {
-            this.logger.warn('GEMINI_API_KEY not set, skipping file content extraction');
+        const { openrouterComplete, fileToContentPart } = require('../../utils/openrouter');
+        if (!process.env.OPENROUTER_API_KEY) {
+            this.logger.warn('OPENROUTER_API_KEY not set, skipping file content extraction');
             return null;
         }
 
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
         const parts = [];
-
         for (const file of files) {
             if (!file.mimetype || file.size > 10000000) continue;
 
@@ -1010,14 +1006,22 @@ class SlackSocketHandler {
                 });
                 const base64 = Buffer.from(response.data).toString('base64');
 
-                const result = await model.generateContent([
-                    { text: `Describe this file concisely for a software engineer. For images: what it shows, key details, any visible text. For code/text/logs: summarize the content and key points. File: ${file.name} (${file.mimetype}). Keep it under 300 words.` },
-                    { inlineData: { mimeType: file.mimetype, data: base64 } }
-                ]);
+                const filePart = fileToContentPart(file.mimetype, base64, file.name);
+                if (!filePart) {
+                    this.logger.warn(`Skipping unsupported file ${file.name} (${file.mimetype})`);
+                    continue;
+                }
 
-                const description = result.response.text().trim();
+                const description = await openrouterComplete([{
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: `Describe this file concisely for a software engineer. For images: what it shows, key details, any visible text. For code/text/logs: summarize the content and key points. File: ${file.name} (${file.mimetype}). Keep it under 300 words.` },
+                        filePart,
+                    ],
+                }], { maxTokens: 600 });
+
                 parts.push(`[Attached: ${file.name}]\n${description}`);
-                this.logger.info(`Gemini described ${file.name} (${file.mimetype}, ${file.size}b): ${description.substring(0, 80)}...`);
+                this.logger.info(`OpenRouter described ${file.name} (${file.mimetype}, ${file.size}b): ${description.substring(0, 80)}...`);
             } catch (e) {
                 this.logger.warn(`Failed to process file ${file.name}: ${e.message}`);
             }
