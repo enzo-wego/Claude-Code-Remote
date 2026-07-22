@@ -989,17 +989,13 @@ class SlackSocketHandler {
     async _fetchFileContents(files) {
         if (!files || files.length === 0) return null;
 
-        const { GoogleGenerativeAI } = require('@google/generative-ai');
-        const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) {
-            this.logger.warn('GEMINI_API_KEY not set, skipping file content extraction');
+        const { openrouterComplete, fileToContentPart } = require('../../utils/openrouter');
+        if (!process.env.OPENROUTER_API_KEY) {
+            this.logger.warn('OPENROUTER_API_KEY not set, skipping file content extraction');
             return null;
         }
 
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
         const parts = [];
-
         for (const file of files) {
             if (!file.mimetype || file.size > 10000000) continue;
 
@@ -1010,14 +1006,22 @@ class SlackSocketHandler {
                 });
                 const base64 = Buffer.from(response.data).toString('base64');
 
-                const result = await model.generateContent([
-                    { text: `Describe this file concisely for a software engineer. For images: what it shows, key details, any visible text. For code/text/logs: summarize the content and key points. File: ${file.name} (${file.mimetype}). Keep it under 300 words.` },
-                    { inlineData: { mimeType: file.mimetype, data: base64 } }
-                ]);
+                const filePart = fileToContentPart(file.mimetype, base64, file.name);
+                if (!filePart) {
+                    this.logger.warn(`Skipping unsupported file ${file.name} (${file.mimetype})`);
+                    continue;
+                }
 
-                const description = result.response.text().trim();
+                const description = await openrouterComplete([{
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: `Describe this file concisely for a software engineer. For images: what it shows, key details, any visible text. For code/text/logs: summarize the content and key points. File: ${file.name} (${file.mimetype}). Keep it under 300 words.` },
+                        filePart,
+                    ],
+                }], { maxTokens: 600 });
+
                 parts.push(`[Attached: ${file.name}]\n${description}`);
-                this.logger.info(`Gemini described ${file.name} (${file.mimetype}, ${file.size}b): ${description.substring(0, 80)}...`);
+                this.logger.info(`OpenRouter described ${file.name} (${file.mimetype}, ${file.size}b): ${description.substring(0, 80)}...`);
             } catch (e) {
                 this.logger.warn(`Failed to process file ${file.name}: ${e.message}`);
             }
@@ -1088,31 +1092,29 @@ class SlackSocketHandler {
     async _summarizeThreadContext(messages) {
         const formatted = await this._formatThreadContext(messages);
         try {
-            const { GoogleGenerativeAI } = require('@google/generative-ai');
-            const apiKey = process.env.GEMINI_API_KEY;
-            if (!apiKey) {
-                this.logger.warn('GEMINI_API_KEY not set, using raw thread context');
+            const { openrouterComplete } = require('../../utils/openrouter');
+            if (!process.env.OPENROUTER_API_KEY) {
+                this.logger.warn('OPENROUTER_API_KEY not set, using raw thread context');
                 return formatted;
             }
 
-            // Truncate if too large — keep last ~800KB (Gemini Flash handles ~1M tokens)
+            // Truncate very large threads — keep the last ~800KB.
             const maxChars = 800000;
             let content = formatted;
             if (content.length > maxChars) {
                 content = '... (earlier messages truncated)\n\n' + content.slice(-maxChars);
-                this.logger.info(`Thread truncated from ${formatted.length} to ${maxChars} chars for Gemini`);
+                this.logger.info(`Thread truncated from ${formatted.length} to ${maxChars} chars`);
             }
 
-            const genAI = new GoogleGenerativeAI(apiKey);
-            const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-            const result = await model.generateContent(
-                `Summarize this Slack thread conversation concisely. Focus on: what was requested, what was done, current state, and any pending items. Keep it under 500 words.\n\n${content}`
-            );
-            const summary = result.response.text();
+            const summary = await openrouterComplete([{
+                role: 'user',
+                content: `Summarize this Slack thread conversation concisely. Focus on: what was requested, what was done, current state, and any pending items. Keep it under 500 words.\n\n${content}`,
+            }], { maxTokens: 800 });
+
             this.logger.info(`Thread summarized: ${messages.length} messages → ${summary.length} chars`);
             return `Previous conversation summary:\n${summary}`;
         } catch (err) {
-            this.logger.warn(`Gemini summarization failed, using raw context: ${err.message}`);
+            this.logger.warn(`Summarization failed, using raw context: ${err.message}`);
             return formatted;
         }
     }
@@ -1123,17 +1125,15 @@ class SlackSocketHandler {
      */
     async _detectProjectFromThread(messages) {
         try {
-            const { GoogleGenerativeAI } = require('@google/generative-ai');
-            const apiKey = process.env.GEMINI_API_KEY;
-            if (!apiKey) return null;
+            const { openrouterComplete } = require('../../utils/openrouter');
+            if (!process.env.OPENROUTER_API_KEY) return null;
 
             const formatted = await this._formatThreadContext(messages);
             const repoRoot = this.config.repoRoot || '';
 
-            const genAI = new GoogleGenerativeAI(apiKey);
-            const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-            const result = await model.generateContent(
-                `From this Slack thread, identify the project directory path that was being used for the Claude Code session.
+            const detected = (await openrouterComplete([{
+                role: 'user',
+                content: `From this Slack thread, identify the project directory path that was being used for the Claude Code session.
 Look for patterns like:
 - "start claude from X project"
 - "Starting Claude session in /path/to/..."
@@ -1144,9 +1144,8 @@ The repo root is: ${repoRoot}
 Return ONLY the absolute directory path, nothing else. If you cannot determine it, return "unknown".
 
 Thread:
-${formatted}`
-            );
-            const detected = result.response.text().trim();
+${formatted}`,
+            }], { maxTokens: 100 })).trim();
             if (detected && detected !== 'unknown' && detected.startsWith('/')) {
                 this.logger.info(`Gemini detected project from thread: ${detected}`);
                 return detected;
