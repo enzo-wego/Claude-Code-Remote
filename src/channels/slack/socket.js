@@ -3598,6 +3598,31 @@ ${formatted}`
         return clean(lines.slice(-25));
     }
 
+    // Detects an unsent paste still sitting in the CLI's composer — the
+    // fingerprint of a swallowed Enter. Codex renders unsubmitted pasted input as
+    // "› [Pasted Content N chars]" ON the composer prompt line; once the command
+    // is actually submitted that placeholder scrolls up into history, off the
+    // prompt line, and the composer returns to its empty greyed hint. Anchoring
+    // the match to the prompt char (`›`/`❯`/`>`) means we only flag content that
+    // is still in the input box — never a message that already went through — so
+    // callers can safely treat a hit as "the command was pasted but never sent".
+    _pasteStuckInComposer(output, adapter) {
+        const indicators = (adapter && adapter.pasteLandedIndicators) || [];
+        if (!indicators.length) return false;
+        // The live composer is the BOTTOM-most prompt line — history prompts sit
+        // above it (Codex echoes a submitted user message as its own "› …" line,
+        // so matching any prompt line would false-positive on an already-sent
+        // command). Only an unsent paste lands in the composer, so check just it.
+        let composer = null;
+        for (const line of (output || '').split('\n')) {
+            if (/^[)❯>›]/.test(line.trim())) composer = line;
+        }
+        if (composer === null) return false;
+        return indicators.some(p =>
+            typeof p === 'string' ? composer.includes(p) : p.test(composer)
+        );
+    }
+
     async _injectCommand(sessionName, command, cliType = 'claude') {
         const os = require('os');
         const adapter = getCliAdapter(cliType);
@@ -3755,6 +3780,18 @@ ${formatted}`
                         await new Promise(r => setTimeout(r, 1500));
                         continue;
                     }
+                    // Enter-swallow guard: a prompt is visible and the pane changed,
+                    // but the paste placeholder is STILL in the composer — the Enter
+                    // was dropped by a late boot/banner redraw (Codex renders `›`
+                    // seconds before its submit handler is live) and the command was
+                    // never submitted. An idle composer holding unsent content looks
+                    // identical to "returned to prompt after responding", so don't
+                    // declare success on hasPrompt alone — press Enter again (the loop
+                    // re-sends on the next iteration with a longer settle wait).
+                    if (this._pasteStuckInComposer(output, adapter)) {
+                        this.logger.warn(`Prompt visible but paste still in composer (Enter swallowed) — re-pressing Enter (attempt ${attempt + 1}) for ${sessionName}`);
+                        continue;
+                    }
                     this.logger.info(`Prompt visible after Enter attempt ${attempt + 1} — Claude likely already responded for ${sessionName}`);
                     return preInjectOutput;
                 }
@@ -3763,7 +3800,12 @@ ${formatted}`
             // After all retries, check one final time — if Claude shows prompt, it processed the command
             const finalOutput = this._captureOutput(sessionName);
             const finalHasPrompt = /^[)❯>›]\s*$/m.test(finalOutput);
-            if (finalHasPrompt) {
+            // Same Enter-swallow guard as the loop: a bare prompt only means
+            // "already responded" if the paste is no longer sitting in the box.
+            // If it still is, fall through to the silent-drop detection below,
+            // which clears the input and fails loudly (flips the alert to ✗ /
+            // triggers requeue) instead of leaving a silently unsent command.
+            if (finalHasPrompt && !this._pasteStuckInComposer(finalOutput, adapter)) {
                 this.logger.info(`Prompt visible after all Enter attempts — Claude likely already responded for ${sessionName}`);
                 return preInjectOutput;
             }
@@ -4103,6 +4145,17 @@ ${formatted}`
         let lastAutoApproveAt = 0;
         const confirmThreshold = 2;   // ticks the dialog must persist before we click
         const autoApproveCooldownMs = 4000;
+        // Unsent-paste recovery net (Codex Enter-swallow). If the injector's Enter
+        // was dropped, the pasted command sits in the composer unsubmitted: no
+        // spinner, no detectable idle prompt, the pane frozen at
+        // prompt=false working=false forever (incident 2026-07-21, slack-G2LX-…).
+        // When we still see a paste placeholder in the composer with nothing
+        // running, re-press Enter to submit it. Debounced + cooled-down like
+        // auto-approve so we nudge once, not every tick.
+        let pasteStuckCount = 0;
+        let lastPasteEnterAt = 0;
+        const pasteStuckThreshold = 3;      // ticks an unsent paste must persist before nudging
+        const pasteEnterCooldownMs = 6000;  // gap between Enter nudges so keystrokes settle
         const stableThreshold = 3;
 
         const interval = setInterval(async () => {
@@ -4397,6 +4450,25 @@ ${formatted}`
                 }
             } else {
                 confirmCount = 0;
+            }
+
+            // Unsent-paste recovery — see the pasteStuck* declarations above.
+            // Only fires while nothing is running (isWorking false): a live turn
+            // never shows the placeholder in the composer, and an idle real prompt
+            // has no placeholder, so this matches only a genuinely swallowed Enter.
+            // An extra Enter on an already-empty composer is a harmless no-op.
+            if (!isWorking && this._pasteStuckInComposer(currentOutput, adapter)) {
+                pasteStuckCount++;
+                if (pasteStuckCount >= pasteStuckThreshold &&
+                    Date.now() - lastPasteEnterAt >= pasteEnterCooldownMs) {
+                    this.logger.warn(`Unsent paste detected in composer for ${sessionName} — re-pressing Enter to submit`);
+                    try { execSync(`tmux send-keys -t ${sessionName} Enter`); } catch (_) { /* pane gone */ }
+                    lastPasteEnterAt = Date.now();
+                    pasteStuckCount = 0;
+                    stableCount = 0;
+                }
+            } else {
+                pasteStuckCount = 0;
             }
 
             // FIX A — forward-progress fingerprint. Strip digit runs (the
