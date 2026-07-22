@@ -192,13 +192,13 @@ class BqHealthMonitor {
         const authExpiry = this._isAuthExpiry(errMsg);
         const lines = [];
         if (authExpiry) {
-            lines.push(':warning: *BigQuery auth expired — needs `gcloud auth login`*');
-            lines.push('_The bot cannot self-recover (login is interactive). BQ-dependent investigations will fail or fall back until refreshed._');
+            lines.push(':warning: *BigQuery auth expired — needs `gcloud auth application-default login`*');
+            lines.push('_BQ now authenticates via ADC (see /usr/local/bin/bq shim). The bot cannot self-recover (login is interactive). BQ-dependent investigations will fail or fall back until refreshed._');
         } else {
             lines.push(':warning: *BigQuery health check failing*');
         }
         lines.push('*Fix:* on the VPS as the bot user, run:');
-        lines.push('```gcloud auth login```');
+        lines.push('```gcloud auth application-default login```');
         lines.push(`*Error:* ${errMsg.slice(0, 300)}`);
         const text = lines.join('\n');
         try {
