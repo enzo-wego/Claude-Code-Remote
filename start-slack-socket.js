@@ -13,6 +13,7 @@ const SlackSocketHandler = require('./src/channels/slack/socket');
 const { runDailySummary, parseChannelsConfig } = require('./src/services/daily-summary');
 const { SsoPrewarm } = require('./src/services/sso-prewarm');
 const { BqHealthMonitor } = require('./src/services/bq-health');
+const { CredentialHealthMonitor } = require('./src/services/credential-health');
 const mcp = require('./src/mcp');
 
 // Load environment variables
@@ -116,6 +117,13 @@ const config = {
     bqHealthCommand: process.env.BQ_HEALTH_COMMAND || 'bq',
     bqHealthIntervalMs: parseInt(process.env.BQ_HEALTH_INTERVAL_MS) || 1800000, // 30 min
     bqHealthTimeoutMs: parseInt(process.env.BQ_HEALTH_TIMEOUT_MS) || 60000, // 1 min
+    // Google Workspace (gws CLI: Gmail/Docs/Sheets/Drive) auth health monitor.
+    // Same idea as BQ — gws uses its own long-lived OAuth (~/.config/gws); when
+    // it expires the fix is an interactive `gws auth login`, so detect + DM.
+    gwsHealthEnabled: (process.env.GWS_HEALTH_ENABLED || '').toLowerCase() === 'true',
+    gwsHealthCommand: process.env.GWS_HEALTH_COMMAND || 'gws',
+    gwsHealthIntervalMs: parseInt(process.env.GWS_HEALTH_INTERVAL_MS) || 1800000, // 30 min
+    gwsHealthTimeoutMs: parseInt(process.env.GWS_HEALTH_TIMEOUT_MS) || 30000, // 30 s
 };
 
 // Validate configuration
@@ -244,6 +252,7 @@ async function start() {
     logger.info(`- App Mode: ${config.appMode}`);
     logger.info(`- SSO Pre-warm: ${config.ssoPrewarmEnabled ? `${config.ssoPrewarmProfiles.join(', ')} every ${config.ssoPrewarmIntervalMs}ms via ${config.ssoPrewarmUrl}` : 'Disabled'}`);
     logger.info(`- BQ Health Monitor: ${config.bqHealthEnabled ? `every ${config.bqHealthIntervalMs}ms (timeout ${config.bqHealthTimeoutMs}ms)` : 'Disabled'}`);
+    logger.info(`- GWS Health Monitor: ${config.gwsHealthEnabled ? `every ${config.gwsHealthIntervalMs}ms (timeout ${config.gwsHealthTimeoutMs}ms)` : 'Disabled'}`);
 
     // MCP slack-ask: wire Bolt action/view handlers BEFORE socket connect so
     // we don't miss button taps that arrive during the start window.
@@ -344,6 +353,29 @@ async function start() {
     } else if (config.bqHealthEnabled && config.appMode === 'local') {
         logger.info('BQ health monitor skipped: APP_MODE=local does not run investigations');
     }
+
+    // Google Workspace (gws) health monitor — same gating as BQ. Probes a cheap
+    // read-only call; a non-zero exit means the OAuth token can't refresh.
+    if (config.gwsHealthEnabled && config.appMode !== 'local') {
+        const gwsHealth = new CredentialHealthMonitor({
+            name: 'Google Workspace (gws)',
+            logName: 'GwsHealth',
+            command: config.gwsHealthCommand,
+            checkArgs: ['drive', 'about', 'get', '--params', '{"fields":"user"}'],
+            recoveryCommand: 'gws auth login',
+            recoveryNote: 'gws (Gmail/Docs/Sheets/Drive) uses its own OAuth in ~/.config/gws. '
+                + 'Login is interactive, so the bot cannot self-recover; Workspace actions '
+                + 'fail until refreshed.',
+            intervalMs: config.gwsHealthIntervalMs,
+            timeoutMs: config.gwsHealthTimeoutMs,
+            slackClient: handler.app.client,
+            ownerUserId: config.ownerUserId,
+        });
+        handler.gwsHealth = gwsHealth;
+        gwsHealth.start();
+    } else if (config.gwsHealthEnabled && config.appMode === 'local') {
+        logger.info('GWS health monitor skipped: APP_MODE=local does not run investigations');
+    }
 }
 
 start().catch((error) => {
@@ -356,6 +388,7 @@ function shutdown() {
     logger.info('Shutting down Slack Socket Mode server...');
     if (handler.ssoPrewarm) handler.ssoPrewarm.stop();
     if (handler.bqHealth) handler.bqHealth.stop();
+    if (handler.gwsHealth) handler.gwsHealth.stop();
     Promise.resolve()
         .then(() => mcp.stopMcpServer())
         .catch((err) => logger.warn(`mcp stop failed: ${err.message}`))
