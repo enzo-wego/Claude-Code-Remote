@@ -1092,31 +1092,29 @@ class SlackSocketHandler {
     async _summarizeThreadContext(messages) {
         const formatted = await this._formatThreadContext(messages);
         try {
-            const { GoogleGenerativeAI } = require('@google/generative-ai');
-            const apiKey = process.env.GEMINI_API_KEY;
-            if (!apiKey) {
-                this.logger.warn('GEMINI_API_KEY not set, using raw thread context');
+            const { openrouterComplete } = require('../../utils/openrouter');
+            if (!process.env.OPENROUTER_API_KEY) {
+                this.logger.warn('OPENROUTER_API_KEY not set, using raw thread context');
                 return formatted;
             }
 
-            // Truncate if too large — keep last ~800KB (Gemini Flash handles ~1M tokens)
+            // Truncate very large threads — keep the last ~800KB.
             const maxChars = 800000;
             let content = formatted;
             if (content.length > maxChars) {
                 content = '... (earlier messages truncated)\n\n' + content.slice(-maxChars);
-                this.logger.info(`Thread truncated from ${formatted.length} to ${maxChars} chars for Gemini`);
+                this.logger.info(`Thread truncated from ${formatted.length} to ${maxChars} chars`);
             }
 
-            const genAI = new GoogleGenerativeAI(apiKey);
-            const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-            const result = await model.generateContent(
-                `Summarize this Slack thread conversation concisely. Focus on: what was requested, what was done, current state, and any pending items. Keep it under 500 words.\n\n${content}`
-            );
-            const summary = result.response.text();
+            const summary = await openrouterComplete([{
+                role: 'user',
+                content: `Summarize this Slack thread conversation concisely. Focus on: what was requested, what was done, current state, and any pending items. Keep it under 500 words.\n\n${content}`,
+            }], { maxTokens: 800 });
+
             this.logger.info(`Thread summarized: ${messages.length} messages → ${summary.length} chars`);
             return `Previous conversation summary:\n${summary}`;
         } catch (err) {
-            this.logger.warn(`Gemini summarization failed, using raw context: ${err.message}`);
+            this.logger.warn(`Summarization failed, using raw context: ${err.message}`);
             return formatted;
         }
     }
