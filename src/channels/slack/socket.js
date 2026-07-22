@@ -2038,6 +2038,15 @@ ${formatted}`,
             }
         }
 
+        // Continuation replies inject text straight into the live session and skip
+        // _fetchThreadMessages, so attachments on a reply are otherwise dropped. Fetch
+        // them here (only for an active session — new sessions already handle files via
+        // _fetchThreadMessages, and doing it twice would double-describe).
+        if (activeSession && event.files && event.files.length > 0) {
+            const fileContents = await this._fetchFileContents(event.files);
+            if (fileContents) text += '\n' + fileContents;
+        }
+
         await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId, null, graphSystemBlock, restricted);
     }
 
