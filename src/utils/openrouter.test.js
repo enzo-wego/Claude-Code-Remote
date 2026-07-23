@@ -1,4 +1,12 @@
-const { openrouterComplete, fileToContentPart } = require('./openrouter');
+const { openrouterComplete, fileToContentPart, messagesToGoogleParts } = require('./openrouter');
+
+// Mock the Google SDK so the google-provider path can be exercised without a key.
+const mockGenerateContent = jest.fn(async () => ({ response: { text: () => '  g-out  ' } }));
+jest.mock('@google/generative-ai', () => ({
+    GoogleGenerativeAI: jest.fn(() => ({
+        getGenerativeModel: jest.fn(() => ({ generateContent: mockGenerateContent })),
+    })),
+}));
 
 describe('openrouterComplete', () => {
     const OLD_KEY = process.env.OPENROUTER_API_KEY;
@@ -50,5 +58,46 @@ describe('fileToContentPart', () => {
         expect(p.type).toBe('text');
         expect(p.text).toContain('hello code');
         expect(p.text).toContain('a.txt');
+    });
+});
+
+describe('messagesToGoogleParts (OpenAI → Gemini translation)', () => {
+    test('string content → text part', () => {
+        expect(messagesToGoogleParts([{ role: 'user', content: 'hi' }])).toEqual([{ text: 'hi' }]);
+    });
+
+    test('text part + image_url data-URI → text + inlineData', () => {
+        const parts = messagesToGoogleParts([{
+            role: 'user',
+            content: [
+                { type: 'text', text: 'describe this' },
+                { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAB' } },
+            ],
+        }]);
+        expect(parts).toEqual([
+            { text: 'describe this' },
+            { inlineData: { mimeType: 'image/png', data: 'AAAB' } },
+        ]);
+    });
+});
+
+describe('openrouterComplete with LLM_PROVIDER=google', () => {
+    const OLD = { provider: process.env.LLM_PROVIDER, key: process.env.GOOGLE_API_KEY };
+    beforeEach(() => { process.env.LLM_PROVIDER = 'google'; mockGenerateContent.mockClear(); });
+    afterEach(() => {
+        process.env.LLM_PROVIDER = OLD.provider;
+        process.env.GOOGLE_API_KEY = OLD.key;
+    });
+
+    test('routes to Google (no fetch), returns trimmed text', async () => {
+        process.env.GOOGLE_API_KEY = 'AIza-test';
+        const out = await openrouterComplete([{ role: 'user', content: 'x' }]);
+        expect(out).toBe('g-out');
+        expect(mockGenerateContent).toHaveBeenCalledWith([{ text: 'x' }]);
+    });
+
+    test('throws a clear error when GOOGLE_API_KEY is missing', async () => {
+        delete process.env.GOOGLE_API_KEY;
+        await expect(openrouterComplete([{ role: 'user', content: 'x' }])).rejects.toThrow('GOOGLE_API_KEY');
     });
 });
