@@ -273,13 +273,16 @@ does the reading), not CPU-heavy. What genuinely needs your Mac is your repos, y
 <code>target=vps</code> in the same queue and still make the 06:00 report.</p>
 
 <ul>
-  <li><b>The mind is one long conversation, not one long process.</b> Your DM maps to a single
-  resumable Claude Code session. tmux may die overnight; the next wake does
-  <code>claude --resume</code> — Day 30's brief knows what you snoozed on Day 29.
+  <li><b>The mind is always standing: one long conversation IN one always-ready process.</b>
+  The companion process is kept resident 24/7 (exempt from idle kill; a keepalive respawns it in
+  seconds with <code>claude --resume</code> if it ever dies) — so it reacts to events in seconds,
+  and a crash or deploy costs a heartbeat, never a memory. Day 30 knows what you snoozed on Day 29.
   <code>/exit</code> is the only deliberate amnesia.</li>
-  <li><b>Decisions are its turns.</b> Something wakes it (scheduler, your DM, a button, an
-  interrupt) → it reads memory + runs collectors → reasons in context → the decision is what it
-  does: agenda updates, a brief, a draft, or silence.</li>
+  <li><b>It is always looking, and decisions are its turns.</b> Perception streams in 24/7
+  (Slack events, GitHub, Jira, graph). Passing events are injected the moment they happen; a
+  heartbeat every ~15–30 min makes it scan its whole world unprompted — agenda, graph, streams —
+  and decide: act, speak, or stay silent. The 22:00 plan and 06:00 report are just its two biggest
+  scheduled thoughts.</li>
   <li><b>Hands are parallel, the person is one.</b> Thread sessions and Mac review panes share the
   same persona/rules and report everything back into memory — ask "how's the incident going?" and
   the mind answers from its own live hands.</li>

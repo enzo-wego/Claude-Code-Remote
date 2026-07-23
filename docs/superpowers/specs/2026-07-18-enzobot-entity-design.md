@@ -49,8 +49,8 @@ actually ships should shrink week over week.
 | Decision | Choice |
 |---|---|
 | Trust level | **Plan-approved autonomy** (revised 2026-07-23): nightly batch plan confirmed once at 22:00; easy whitelisted kinds run at midnight without confirmation; outward actions (posting/merging/transitions) always owner-gated taps. Daytime remains suggest-first. |
-| The mind | **One durable DM companion session** — the EnzoBot DM channel maps to a single resumable Claude Code session (session id persisted in SQLite, `--resume` on every turn, auto-compaction). Survives restarts. |
-| Pulses | Scheduled/triggered work = **injected turns into the companion**, not separate processes. One mind that did the thinking can explain the thinking. |
+| The mind | **One durable DM companion session, kept resident** (revised 2026-07-23): the EnzoBot DM maps to a single resumable Claude Code session (session id in SQLite, auto-compaction). The process is kept alive 24/7 — exempt from idle kill; a keepalive sweep respawns it with `--resume` within seconds if dead — so it reacts to events in seconds and a crash/deploy never costs memory. Conversation = identity; resident process = readiness. |
+| Pulses | Scheduled/triggered work = **injected turns into the companion**, not separate processes. One mind that did the thinking can explain the thinking. Three injection sources: **events** (the moment they pass the tier filters), a **heartbeat look-around** every ~15–30 min ("scan agenda/graph/streams — anything need action?" — usually answered with silence), and **scheduled thoughts** (22:00 plan, 06:00 report). |
 | Open loops | New `agenda` table in `slack-sessions.db`. Personal messages (DMs, private channels) are read live via xoxc/xoxd and never persisted — only the derived agenda entry is. |
 | Identity + rules | **Unified `directives` store in agent-mem** (persona + learned rules), synced across machines, injected into every session of every CLI via the existing session-start hook. One brain, one source of truth. |
 | World / episodes | agent-mem graph (world model) and flat memory (episodic history) — both already wired to this repo. |
@@ -89,8 +89,10 @@ agenda (SQLite)  ←─────────────────→└─
 
 ### 1. Companion session (this repo)
 - DM channel key (channel-only, not thread) maps to one session row; `claude_session_id`
-  never rotates. Exempt from thread-session inactivity deletion — tmux may die, the
-  Claude session resumes on next turn (existing dead-tmux resume path, re-keyed).
+  never rotates. **Resident:** exempt from the inactivity timeout entirely (no idle tmux
+  kill, no row deletion); a keepalive sweep (piggybacked on the existing `_sweepInterval`)
+  respawns the tmux + `--resume` within seconds if the process is found dead. The
+  dead-tmux resume path remains the crash-recovery fallback.
 - Runs in a workspace dir on the VPS (`~/enzobot-home/`, scratch only — no memory files).
 - Has the slack-ask MCP (ask_user) and the new agent-mem MCP.
 

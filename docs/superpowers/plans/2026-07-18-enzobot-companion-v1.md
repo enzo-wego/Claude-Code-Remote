@@ -1205,11 +1205,39 @@ Three places:
 
 Place this after the tmux-alive check shows the tmux is dead, before the row delete. Locate the exact delete with `grep -n "_deleteSession\|deleteSession" src/channels/slack/socket.js | head` and apply in the reconcile loop only.
 
-3. Inactivity timeout (`_startSessionTimeout`, ~4550): the timeout may kill tmux (fine — resume revives it) but must not delete the row. Run `grep -n "_deleteSession(sessionKey)" src/channels/slack/socket.js` — for any call inside the timeout path, guard:
+3. Inactivity timeout (`_startSessionTimeout`, ~4550): the companion is **resident** — never
+   idle-killed at all. At the top of `_startSessionTimeout`, short-circuit:
 
 ```js
-                if (!isCompanionKey(sessionKey)) this._deleteSession(sessionKey);
+        if (isCompanionKey(sessionKey)) return; // resident mind: no idle timeout
 ```
+
+   Also run `grep -n "_deleteSession(sessionKey)" src/channels/slack/socket.js` — for any call
+   inside timeout/sweep paths, guard with `if (!isCompanionKey(sessionKey))`.
+
+4. Keepalive respawn (the "always ready" guarantee): in the existing periodic sweep
+   (`_sweepInterval`, ~4857), add a check — if `COMPANION_ENABLED === 'true'`, a companion row
+   exists, and its tmux is dead, respawn it immediately by injecting a no-op resume turn:
+
+```js
+        // Entity: resident-mind keepalive — respawn the companion within one sweep tick.
+        try {
+            if (process.env.COMPANION_ENABLED === 'true') {
+                const row = this._getAllSessions().find(s => isCompanionKey(s.sessionKey));
+                if (row && !this._isTmuxSessionAlive(row.sessionName)) {
+                    this.logger.warn('Companion tmux dead — respawning with --resume');
+                    await this._injectCompanionPrompt(
+                        '(system) You were restarted. Resume quietly — no reply needed unless something is pending.'
+                    );
+                }
+            }
+        } catch (err) {
+            this.logger.error(`companion keepalive failed: ${err.message}`);
+        }
+```
+
+   (Confirm the sweep callback is `async` or wrap in an IIFE; match the sweep's existing error
+   style. `_isTmuxSessionAlive` already exists — verify the exact name with grep.)
 
 - [ ] **Step 8: Strip sentinel at posting sites**
 
