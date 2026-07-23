@@ -62,6 +62,11 @@ const config = {
     // and these members get through. Members get RESTRICTED sessions (no
     // personal/server info); only the owner gets full access. Empty → open.
     allowedSubteams: process.env.SLACK_ALLOWED_SUBTEAMS ? process.env.SLACK_ALLOWED_SUBTEAMS.split(',').map(id => id.trim()).filter(Boolean) : [],
+    // Subteam IDs whose members may direct repo WRITE actions (PR approve/
+    // merge, push, commit) under the bot's git identity. Should be a subset of
+    // allowedSubteams. Empty → only the owner can trigger writes. See
+    // AccessControl.isWriteAuthorized() / writeGrantPreamble().
+    writeSubteams: process.env.SLACK_WRITE_SUBTEAMS ? process.env.SLACK_WRITE_SUBTEAMS.split(',').map(id => id.trim()).filter(Boolean) : [],
     httpPort: parseInt(process.env.SLACK_HTTP_PORT) || 9999,
     // Alert monitoring
     monitorChannels: process.env.MONITOR_CHANNELS || '',
@@ -233,6 +238,7 @@ async function start() {
     logger.info(`- Channel ID: ${config.channelId || 'Any'}`);
     logger.info(`- Whitelist: ${config.whitelist.length > 0 ? config.whitelist.join(', ') : 'None'}`);
     logger.info(`- Allowed Subteams: ${config.allowedSubteams.length > 0 ? config.allowedSubteams.join(', ') : 'None'}`);
+    logger.info(`- Write-authorized Subteams: ${config.writeSubteams.length > 0 ? config.writeSubteams.join(', ') : 'Owner only'}`);
     logger.info(`- Access control: ${(config.allowedSubteams.length > 0 || config.whitelist.length > 0) ? 'ENFORCED (owner + team only)' : 'OFF (all authorized)'}`);
     logger.info(`- HTTP Port: ${config.httpPort}`);
     logger.info(`- Monitor Channels: ${config.monitorChannels || 'None'}`);

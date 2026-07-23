@@ -255,6 +255,7 @@ class SlackSocketHandler {
             ownerUserId: config.ownerUserId,
             allowedSubteams: config.allowedSubteams || [],
             whitelist: config.whitelist || [],
+            writeSubteams: config.writeSubteams || [],
             logger: this.logger,
         });
 
@@ -1962,6 +1963,11 @@ ${formatted}`,
         // Restricted = allowed but not the owner. Their session gets a boundary
         // block that forbids disclosing personal / server info.
         const restricted = this.accessControl.isRestricted(userId);
+        // Write-authorized = owner or a member of a write-authorized subteam
+        // (SLACK_WRITE_SUBTEAMS). They may direct repo write actions (PR
+        // approve/merge, push) under the bot's git identity. Every other allowed
+        // teammate can chat but not trigger writes under the owner's identity.
+        const writeAuthorized = await this.accessControl.isWriteAuthorized(userId);
 
         let text = rawText.replace(/<@[A-Z0-9]+>/g, '').trim();
 
@@ -2047,7 +2053,7 @@ ${formatted}`,
             if (fileContents) text += '\n' + fileContents;
         }
 
-        await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId, null, graphSystemBlock, restricted);
+        await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId, null, graphSystemBlock, restricted, writeAuthorized);
     }
 
     /**
@@ -2117,7 +2123,7 @@ ${formatted}`,
 
     // ─── Command Processing ──────────────────────────────────────────
 
-    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliHint = null, graphSystemBlock = '', restricted = false) {
+    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliHint = null, graphSystemBlock = '', restricted = false, writeAuthorized = false) {
         // Create a say function if one wasn't provided (e.g. alert triggers)
         if (!say) {
             say = async (msg) => {
@@ -2713,11 +2719,26 @@ ${formatted}`,
             // even if a different, non-owner user replies later in the thread.
             // Slash commands must stay first-char, so append there instead.
             if (restricted) {
-                const boundary = this.accessControl.restrictionPreamble();
+                let boundary = this.accessControl.restrictionPreamble();
+                // Write-authorized teammate (member of SLACK_WRITE_SUBTEAMS):
+                // grant repo write actions on top of the disclosure boundary.
+                if (writeAuthorized) {
+                    boundary = `${boundary}\n\n${this.accessControl.writeGrantPreamble()}`;
+                }
                 fullCommand = command.startsWith('/')
                     ? `${fullCommand}\n\n${boundary}`
                     : `${boundary}\n\n---\n\n${fullCommand}`;
-                this.logger.info(`Access boundary injected (restricted user) for session ${session.sessionName}`);
+                this.logger.info(`Access boundary injected (restricted user${writeAuthorized ? ', write-authorized' : ''}) for session ${session.sessionName}`);
+            } else if (this.accessControl.isOwner(userId)) {
+                // Owner turn: assert full authority so the model stops refusing
+                // owner-authorized writes (PR approvals, pushes) as third-party.
+                // Re-asserted every owner turn, like the restricted block, so it
+                // survives a live session and earlier refusals in-thread.
+                const ownerPre = this.accessControl.ownerPreamble();
+                fullCommand = command.startsWith('/')
+                    ? `${fullCommand}\n\n${ownerPre}`
+                    : `${ownerPre}\n\n---\n\n${fullCommand}`;
+                this.logger.info(`Owner-authority preamble injected for session ${session.sessionName}`);
             }
 
             // Inject the command into the tmux session.

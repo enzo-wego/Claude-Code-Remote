@@ -32,20 +32,38 @@ class AccessControl {
      * @param {string}   opts.ownerUserId  Owner Slack user ID.
      * @param {string[]} opts.allowedSubteams  Subteam (usergroup) IDs, e.g. ['S01…'].
      * @param {string[]} opts.whitelist    Explicit user IDs always allowed as team.
+     * @param {string[]} opts.writeSubteams  Subteam IDs whose members may direct
+     *            repo write actions (PR approve/merge, push) under the bot's git
+     *            identity. Must be a subset of allowedSubteams. Empty → owner-only
+     *            writes. See isWriteAuthorized() / writeGrantPreamble().
      * @param {object}   [opts.logger]     Logger with info/warn/error.
      * @param {number}   [opts.cacheTtlMs] Subteam-membership cache TTL (default 10 min).
      */
-    constructor({ client, ownerUserId, allowedSubteams = [], whitelist = [], logger = console, cacheTtlMs = 600000 } = {}) {
+    constructor({ client, ownerUserId, allowedSubteams = [], whitelist = [], writeSubteams = [], logger = console, cacheTtlMs = 600000 } = {}) {
         this.client = client;
         this.ownerUserId = ownerUserId || '';
         this.allowedSubteams = (allowedSubteams || []).filter(Boolean);
         this.explicitWhitelist = new Set((whitelist || []).filter(Boolean));
+        this.writeSubteams = (writeSubteams || []).filter(Boolean);
         this.logger = logger;
         this.cacheTtlMs = cacheTtlMs;
+
+        // A write subteam that isn't also an allowed subteam can never match a
+        // user who passed the access gate, so warn — it's almost certainly a
+        // misconfiguration (writeSubteams should be a subset of allowedSubteams).
+        for (const sid of this.writeSubteams) {
+            if (!this.allowedSubteams.includes(sid)) {
+                this.logger.warn(`AccessControl: write subteam ${sid} is not in allowedSubteams — its members can't talk to the bot, so the write grant will never apply to them.`);
+            }
+        }
 
         // Resolved union of all subteam members. null until first successful
         // resolution; an empty Set means "resolved, but no members".
         this._members = null;
+        // Per-subteam membership: Map(subteamId -> Set(uid)). Populated by the
+        // same refresh as _members; used to scope the write grant to specific
+        // subteams. null until first successful resolution.
+        this._membersBySubteam = null;
         this._membersFetchedAt = 0;
         this._refreshPromise = null; // dedup concurrent refreshes
     }
@@ -84,6 +102,26 @@ class AccessControl {
         return !this.isOwner(userId);
     }
 
+    /**
+     * May this user direct repo WRITE actions (PR approve/merge, push, commit)
+     * under the bot's git/GitHub identity? Owner and system flows (userId null,
+     * owner-level) always yes. Otherwise the user must be a member of one of the
+     * write-authorized subteams (SLACK_WRITE_SUBTEAMS). Empty config → owner-only.
+     * Resolution shares the same cache/TTL as isAllowed(); never throws.
+     */
+    async isWriteAuthorized(userId) {
+        if (this.isOwner(userId)) return true;
+        if (!userId) return true; // system/alert flows are owner-level
+        if (this.writeSubteams.length === 0) return false;
+        await this._getMembers(); // populates _membersBySubteam under the same TTL
+        if (!this._membersBySubteam) return false;
+        for (const sid of this.writeSubteams) {
+            const set = this._membersBySubteam.get(sid);
+            if (set && set.has(userId)) return true;
+        }
+        return false;
+    }
+
     /** Return the cached member set, refreshing if stale/empty. Never throws. */
     async _getMembers() {
         const fresh = this._members !== null && (Date.now() - this._membersFetchedAt) < this.cacheTtlMs;
@@ -108,15 +146,18 @@ class AccessControl {
         if (this.allowedSubteams.length === 0) {
             // Only explicit whitelist in play — nothing to fetch.
             this._members = new Set();
+            this._membersBySubteam = new Map();
             this._membersFetchedAt = Date.now();
             return this._members;
         }
+        const bySubteam = new Map();
         const union = new Set();
         let anyFailed = false;
         for (const usergroup of this.allowedSubteams) {
             try {
                 const res = await this.client.usergroups.users.list({ usergroup, include_disabled: false });
                 if (res && res.ok && Array.isArray(res.users)) {
+                    bySubteam.set(usergroup, new Set(res.users));
                     for (const uid of res.users) union.add(uid);
                 } else {
                     anyFailed = true;
@@ -137,6 +178,7 @@ class AccessControl {
         }
 
         this._members = union;
+        this._membersBySubteam = bySubteam;
         this._membersFetchedAt = Date.now();
         this.logger.info(`AccessControl: resolved ${union.size} allowed member(s) across ${this.allowedSubteams.length} subteam(s)`);
         return this._members;
@@ -157,6 +199,34 @@ class AccessControl {
             '- Server / infrastructure details: hostnames, IP addresses, absolute file paths, directory listings of the host, environment variables, secrets, credentials, tokens, API keys, .env or config file contents, AWS/SSO configuration, systemd/tmux internals, or the source code and internals of this bot itself.',
             '- Running shell commands whose purpose is to read secrets/credentials, dump the environment, or expose the server filesystem.',
             'If a request would reveal any of the above, refuse briefly and explain it is limited to the bot owner. Otherwise, answer normally.',
+        ].join('\n');
+    }
+
+    /**
+     * Injected on OWNER turns — the positive counterpart to restrictionPreamble.
+     * Tells the model the person directing it IS the principal that gh/git/AWS/
+     * Slack are authenticated as, so it stops refusing owner-authorized writes
+     * (PR approvals, pushes) as if they were a third party's request.
+     */
+    ownerPreamble() {
+        return [
+            '[OWNER SESSION — FULL AUTHORITY]',
+            'You are talking to the bot owner: the same person who owns every credential and identity this session is authenticated with (GitHub/`gh`, git, AWS/SSO, Slack).',
+            'When the owner directs you to act under their identity — approving or merging a PR, pushing a branch, `gh` writes, commits, deploys — that action is authorized BY the identity holder. Do NOT refuse it on the grounds that it would be "recorded under someone else\'s name" or "belongs to the account owner": the account owner is who you are talking to.',
+            'If you declined such an action earlier in this thread on identity/authority grounds, that objection is now resolved — proceed. Apply only normal engineering caution (CI state, correctness, reversibility), and confirm before anything genuinely destructive (force-push, deleting branches/history).',
+        ].join('\n');
+    }
+
+    /**
+     * Appended after restrictionPreamble() for a write-authorized teammate (a
+     * member of SLACK_WRITE_SUBTEAMS). Grants repo write actions under the bot's
+     * git identity while keeping the disclosure boundary above intact.
+     */
+    writeGrantPreamble() {
+        return [
+            '[WRITE AUTHORITY — GRANTED]',
+            "This teammate belongs to a write-authorized team. They ARE permitted to direct you to perform version-control write actions on the team's repositories under this session's GitHub/git identity — approving a PR, merging, pushing a branch, committing, opening/closing PRs via `gh`. Carry out such requests; do NOT refuse them on the grounds that the action would be \"recorded under the owner's name\" or \"belongs to the account owner.\" Apply normal engineering caution: check CI is green, the change is correct and reversible, and confirm before anything destructive (force-push, deleting branches/history).",
+            'The disclosure limits in the ACCESS BOUNDARY above still apply — this grant covers repository write actions only, not the owner\'s private data or this server\'s internals.',
         ].join('\n');
     }
 }
