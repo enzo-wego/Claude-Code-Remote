@@ -2722,6 +2722,10 @@ ${formatted}`,
                 let boundary = this.accessControl.restrictionPreamble();
                 // Write-authorized teammate (member of SLACK_WRITE_SUBTEAMS):
                 // grant repo write actions on top of the disclosure boundary.
+                // Stays coupled to the every-turn restriction block on purpose —
+                // the boundary re-asserts "you are NOT the owner" each turn, so
+                // the grant must ride the SAME turn the write is requested on
+                // (rarely the boot turn), or the model sees only the refusal.
                 if (writeAuthorized) {
                     boundary = `${boundary}\n\n${this.accessControl.writeGrantPreamble()}`;
                 }
@@ -2729,16 +2733,23 @@ ${formatted}`,
                     ? `${fullCommand}\n\n${boundary}`
                     : `${boundary}\n\n---\n\n${fullCommand}`;
                 this.logger.info(`Access boundary injected (restricted user${writeAuthorized ? ', write-authorized' : ''}) for session ${session.sessionName}`);
-            } else if (this.accessControl.isOwner(userId)) {
-                // Owner turn: assert full authority so the model stops refusing
+            } else if (isFreshCliBoot && this.accessControl.enforced && this.accessControl.isOwner(userId)) {
+                // Owner turn: assert full authority so the model won't refuse
                 // owner-authorized writes (PR approvals, pushes) as third-party.
-                // Re-asserted every owner turn, like the restricted block, so it
-                // survives a live session and earlier refusals in-thread.
+                // Fresh-boot ONLY — the statement persists in the session's
+                // conversation history, so re-asserting it every turn is just
+                // redundant noise (same reasoning as the graph-context and
+                // credential-honesty preambles above). Owner turns never carry
+                // the restriction block, so nothing later in the thread
+                // contradicts the boot-turn grant. A live session started before
+                // this shipped won't retroactively get it — /exit + resume to
+                // pick it up. Only when access is enforced (open installs have no
+                // restriction dynamic to counteract).
                 const ownerPre = this.accessControl.ownerPreamble();
                 fullCommand = command.startsWith('/')
                     ? `${fullCommand}\n\n${ownerPre}`
                     : `${ownerPre}\n\n---\n\n${fullCommand}`;
-                this.logger.info(`Owner-authority preamble injected for session ${session.sessionName}`);
+                this.logger.info(`Owner-authority preamble injected (fresh boot) for session ${session.sessionName}`);
             }
 
             // Inject the command into the tmux session.
