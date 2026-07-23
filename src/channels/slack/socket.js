@@ -16,6 +16,7 @@ const Logger = require('../../core/logger');
 const AlertMonitor = require('./alert-monitor');
 const DelayAlertMonitor = require('./delay-alert-monitor');
 const { AccessControl } = require('./access-control');
+const { buildHomeView } = require('./home-tab');
 const { runDailySummary, parseChannelsConfig } = require('../../services/daily-summary');
 const { getCliAdapter, adapterNames } = require('../../cli');
 const graphIngest = require('../../graph-ingest');
@@ -1761,6 +1762,38 @@ ${formatted}`,
                 } catch { /* ignore */ }
             }
         });
+
+        // Entity: App Home status board. Repaint whenever the user opens the tab.
+        this.app.event('app_home_opened', async ({ event }) => {
+            if (event.tab && event.tab !== 'home') return;
+            try {
+                const view = buildHomeView(this._collectHomeState(event.user));
+                await this.app.client.views.publish({ user_id: event.user, view });
+            } catch (err) {
+                this.logger.warn(`home tab publish failed: ${err.message}`);
+            }
+        });
+    }
+
+    /** Gather live state for the App Home board (owner sees internals). */
+    _collectHomeState(userId) {
+        const rows = this._stmts.all.all();
+        return {
+            isOwner: Boolean(this.config.ownerUserId) && userId === this.config.ownerUserId,
+            uptimeSec: process.uptime(),
+            sessions: rows.map(r => ({
+                name: r.session_name,
+                cliType: r.cli_type || 'claude',
+                repoPath: r.repo_path,
+                alive: this._isTmuxSessionAlive(r.session_name),
+                updatedAt: r.updated_at,
+            })),
+            queue: {
+                pending: this._queueStmts.countPending.get().count,
+                processing: this._queueStmts.countProcessing.get().count,
+            },
+            schedules: { dailySummaryTime: this.config.dailySummaryChannels ? this.config.dailySummaryTime : null },
+        };
     }
 
     async _handleMonitoredMessage(event) {
