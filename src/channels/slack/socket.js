@@ -258,6 +258,9 @@ class SlackSocketHandler {
             writeSubteams: config.writeSubteams || [],
             logger: this.logger,
         });
+        // slackUid -> { name, at } cache for the per-turn sender-identity header
+        // (_resolveSenderName). 10-min TTL; best-effort, never blocks a message.
+        this._senderNameCache = new Map();
 
         this._setupListeners();
         this._setupHttpServer();
@@ -1968,6 +1971,9 @@ ${formatted}`,
         // approve/merge, push) under the bot's git identity. Every other allowed
         // teammate can chat but not trigger writes under the owner's identity.
         const writeAuthorized = await this.accessControl.isWriteAuthorized(userId);
+        // Resolve the sender's display name so the injected prompt can tell the
+        // model WHO sent this turn (see _senderIdentityHeader). Cached; best-effort.
+        const senderName = await this._resolveSenderName(userId);
 
         let text = rawText.replace(/<@[A-Z0-9]+>/g, '').trim();
 
@@ -2053,7 +2059,7 @@ ${formatted}`,
             if (fileContents) text += '\n' + fileContents;
         }
 
-        await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId, null, graphSystemBlock, restricted, writeAuthorized);
+        await this._processCommand(channelId, threadTs, text, say, event.ts, null, userId, null, graphSystemBlock, restricted, writeAuthorized, senderName);
     }
 
     /**
@@ -2123,7 +2129,50 @@ ${formatted}`,
 
     // ─── Command Processing ──────────────────────────────────────────
 
-    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliHint = null, graphSystemBlock = '', restricted = false, writeAuthorized = false) {
+    /**
+     * Resolve a Slack user ID to a human display name (real name preferred),
+     * cached with a 10-min TTL. Best-effort: returns null on any failure so a
+     * lookup hiccup never blocks or breaks a message. Stage-2 will enrich this
+     * with agent-mem org context (team/manager); today it's Slack users.info.
+     */
+    async _resolveSenderName(userId) {
+        if (!userId) return null;
+        const cached = this._senderNameCache.get(userId);
+        if (cached && Date.now() - cached.at < 600000) return cached.name;
+        let name = null;
+        try {
+            const info = await this.app.client.users.info({ user: userId });
+            const u = info.user || {};
+            const p = u.profile || {};
+            name = String(p.real_name || u.real_name || p.display_name || u.name || '').trim() || null;
+        } catch (err) {
+            this.logger.warn(`sender name resolve failed for ${userId}: ${err.message}`);
+        }
+        this._senderNameCache.set(userId, { name, at: Date.now() });
+        return name;
+    }
+
+    /**
+     * Build the one-line per-turn sender-identity header prepended to an
+     * injected message so the model knows who sent THIS turn. Role is derived
+     * from the access tier the bot already computed. Returns '' when there's no
+     * user (system/alert flows) so those are left untouched.
+     */
+    _senderIdentityHeader(userId, senderName, { writeAuthorized = false } = {}) {
+        if (!userId) return '';
+        const who = senderName || `Slack user ${userId}`;
+        let role;
+        if (this.accessControl.isOwner(userId)) {
+            role = 'the bot owner — full authority over this session\'s identity';
+        } else if (writeAuthorized) {
+            role = 'a write-authorized teammate (may direct PR approve/merge/push under the bot identity)';
+        } else {
+            role = 'a Wego teammate';
+        }
+        return `[Message from: ${who} — ${role}]`;
+    }
+
+    async _processCommand(channelId, threadTs, command, say, messageTs, alertMessageTs = null, userId = null, cliHint = null, graphSystemBlock = '', restricted = false, writeAuthorized = false, senderName = null) {
         // Create a say function if one wasn't provided (e.g. alert triggers)
         if (!say) {
             say = async (msg) => {
@@ -2750,6 +2799,20 @@ ${formatted}`,
                     ? `${fullCommand}\n\n${ownerPre}`
                     : `${ownerPre}\n\n---\n\n${fullCommand}`;
                 this.logger.info(`Owner-authority preamble injected (fresh boot) for session ${session.sessionName}`);
+            }
+
+            // Per-turn sender identity header. The bot injects only the raw
+            // message text, so the model otherwise can't tell who sent THIS turn
+            // (it saw every turn as one anonymous "user" — why it once refused
+            // the owner's own approve request). Unlike the authority preamble
+            // (fresh-boot only), this is legitimately per-turn: the speaker can
+            // change with every message in a thread. Kept to one short line —
+            // it's message metadata, not a standing instruction.
+            const idHeader = this._senderIdentityHeader(userId, senderName, { writeAuthorized });
+            if (idHeader) {
+                fullCommand = command.startsWith('/')
+                    ? `${fullCommand}\n\n${idHeader}`
+                    : `${idHeader}\n\n---\n\n${fullCommand}`;
             }
 
             // Inject the command into the tmux session.
