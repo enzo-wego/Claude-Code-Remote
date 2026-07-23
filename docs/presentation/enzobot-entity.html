@@ -229,23 +229,48 @@ by an agent that gets a little more <em>you</em> every night.</div>
 
 <h2><span class="n">§2</span> How it works</h2>
 
-<h3>One mind, many hands</h3>
-<pre><code>PERCEPTION (24/7)                    MIND (VPS)                       VOICE
-Slack bot token ─→ graph-ingest ─┐  ┌────────────────────────────┐
-Slack as-Enzo (xoxc, live) ──────┼─→│ DM companion session        │→ 08:30 brief
-GitHub (read PAT) ───────────────┤  │ ONE durable Claude session  │→ review drafts
-Jira (read token) ───────────────┘  │ (resume id in SQLite;       │→ interrupts
-                                    │  pulses = injected turns)   │→ silence
-agent-mem graph  ←─ /resolve ──────→│                             │
-agent-mem flat   ←─ hooks (auto) ──→│ agenda (open loops, SQLite) │
-directives (persona+rules) ────────→└──────────┬─────────────────┘
-                                               │ jobs queue (lease/complete)
-                                               ▼ Mac polls outbound ~10s (NAT-safe,
-                                                 lid closed → jobs just wait)
-                                    EXECUTION PLANE (your Mac)
-                                    launchd runner → herdr 'enzobot' workspace
-                                    → bare claude TUI per job (watchable!)
-                                    → agent-status done → result → VPS → DM</code></pre>
+<h3>The structure — two machines, three channels</h3>
+<p class="muted">"EnzoEntity" is not one program: it's a mind, hands, and memory spread across your
+two machines. "EnzoBot" (the Slack app on the VPS) is its face and nervous system.</p>
+<pre><code>┌─ VPS ─ always awake · stable network ──────────────────────────────┐
+│  EnzoBot service (node, existing claude-remote)                     │
+│    ├─ Slack Socket Mode      ← the FACE: all DMs/briefs/buttons     │
+│    ├─ schedulers             ← 22:00 plan · 06:00 report pulses     │
+│    ├─ jobs queue + agenda (SQLite)                                  │
+│    └─ HTTP :9999             ← /runner/lease /runner/complete       │
+│                                                                     │
+│  MIND: "enzobot-companion" (Claude Code in tmux, resumable)          │
+│    └─ one continuous conversation: plans at 22:00, reports at       │
+│       06:00, chats all day. Token-heavy, not CPU-heavy → fits VPS.  │
+│                                                                     │
+│  agent-mem worker (Go) ── graph + flat memory + directives          │
+└──────────┬─────────────────────────────────────┬────────────────────┘
+           │ ① jobs: Mac polls outbound ~10s     │ ② agent-mem sync
+           │   lease → execute → report          │   (one brain, both machines)
+┌─ Your Mac ─ the muscle · repos · your gh auth ──┴───────────────────┐
+│  enzobot-runner (launchd)  → runs each job as a Claude Code TUI     │
+│  HANDS: herdr 'enzobot' workspace panes (watchable, agent-status)   │
+│  agent-mem worker (local)  ← your local coding sessions feed it     │
+└─────────────────────────────────────────────────────────────────────┘
+           ③ Slack — the only surface YOU ever touch</code></pre>
+
+<div class="scroll"><table>
+  <tr><th>Channel</th><th>Carries</th><th>Direction &amp; transport</th></tr>
+  <tr><td>① Jobs queue</td><td>Work: "review #418 tonight" → result back</td><td>Mac → VPS outbound HTTPS poll (~10s). No ports on the Mac, no VPN; lid closed → jobs wait</td></tr>
+  <tr><td>② agent-mem sync</td><td>The brain: graph, episodes, directives/rules</td><td>Both machines run a worker; data syncs — a rule taught on VPS governs the Mac's hands</td></tr>
+  <tr><td>③ Slack</td><td>Everything human: briefs, confirms, drafts, chat</td><td>EnzoBot posts; you tap. Whichever machine worked, one face</td></tr>
+</table></div>
+
+<p><b>Why the mind lives on the VPS, not the Mac:</b> the 22:00 planner and 06:00 reporter must
+fire whether or not your laptop is open — and a PR review is <em>token</em>-heavy (Claude's API
+does the reading), not CPU-heavy. What genuinely needs your Mac is your repos, your
+<code>gh</code> auth, and watchability — exactly what the <em>hands</em> need, not the mind.</p>
+
+<p><b>The Mac at night</b> (22:05–05:30 execution window) — pick per habit:
+(a) plugged in + <code>pmset</code>/Amphetamine awake at night → full capacity;
+(b) scheduled wake (<code>pmset repeat wakeorpoweron</code> e.g. 02:00–03:00) → cheap middle ground;
+(c) do nothing → Mac-only jobs wait for the lid, while API-only analyses run with
+<code>target=vps</code> in the same queue and still make the 06:00 report.</p>
 
 <ul>
   <li><b>The mind is one long conversation, not one long process.</b> Your DM maps to a single
