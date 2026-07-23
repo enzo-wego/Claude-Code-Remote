@@ -1,0 +1,302 @@
+<title>EnzoBot "Entity" — Overview</title>
+<style>
+  :root {
+    --bg: #fdfdfc; --panel: #f4f6f8; --border: #d6dce2;
+    --fg: #1c2733; --muted: #5c6b7a; --accent: #0b66c3;
+    --good: #1a7f37; --warn: #9a6700; --bad: #c93c37; --future: #8250df;
+    --chat-bg: #ffffff; --chat-hover: #f8f8f8;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1116; --panel: #171d24; --border: #2e3742;
+      --fg: #e4ebf2; --muted: #8a97a5; --accent: #5aa7ff;
+      --good: #46c05b; --warn: #d9a62e; --bad: #f2635d; --future: #b48cff;
+      --chat-bg: #14191f; --chat-hover: #1a2027;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1116; --panel: #171d24; --border: #2e3742;
+    --fg: #e4ebf2; --muted: #8a97a5; --accent: #5aa7ff;
+    --good: #46c05b; --warn: #d9a62e; --bad: #f2635d; --future: #b48cff;
+    --chat-bg: #14191f; --chat-hover: #1a2027;
+  }
+  :root[data-theme="light"] {
+    --bg: #fdfdfc; --panel: #f4f6f8; --border: #d6dce2;
+    --fg: #1c2733; --muted: #5c6b7a; --accent: #0b66c3;
+    --good: #1a7f37; --warn: #9a6700; --bad: #c93c37; --future: #8250df;
+    --chat-bg: #ffffff; --chat-hover: #f8f8f8;
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 880px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+  .eyebrow { font-size: .78rem; font-weight: 600; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 .5rem; }
+  h1 { font-size: 2rem; line-height: 1.2; margin: 0; text-wrap: balance; }
+  .subtitle { color: var(--muted); margin: .5rem 0 0; }
+  h2 { font-size: 1.35rem; margin: 3rem 0 1rem; padding-bottom: .35rem;
+    border-bottom: 2px solid var(--accent); }
+  h2 .n { color: var(--accent); font-family: var(--mono); margin-right: .5rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .5rem; }
+  p { margin: .6rem 0; }
+  .muted { color: var(--muted); }
+  .tag { display: inline-block; padding: .04rem .5rem; border-radius: 999px;
+    font-size: .72rem; font-weight: 600; border: 1px solid var(--border); vertical-align: middle; }
+  .tag.v1 { color: var(--good); border-color: var(--good); }
+  .tag.v15 { color: var(--warn); border-color: var(--warn); }
+  .tag.v2 { color: var(--future); border-color: var(--future); }
+  .tag.done { color: var(--good); border-color: var(--good); }
+  .vision { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--accent);
+    border-radius: 6px; padding: 1rem 1.3rem; margin: 1.4rem 0; }
+  .ba { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1rem; margin: 1.2rem 0; }
+  .ba .col { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.2rem; }
+  .ba h3 { margin: 0 0 .6rem; font-size: .95rem; }
+  .ba .before h3 { color: var(--bad); } .ba .after h3 { color: var(--good); }
+  .ba ul { margin: 0; padding-left: 1.2rem; font-size: .9rem; }
+  .ba li { margin: .3rem 0; }
+  .ba .time { display: inline-block; margin-top: .7rem; font: 600 .85rem var(--mono);
+    padding: .1rem .6rem; border-radius: 999px; border: 1px solid var(--border); }
+  .slack { background: var(--chat-bg); border: 1px solid var(--border);
+    border-radius: 10px; margin: 1.2rem 0; overflow: hidden; }
+  .slack .bar { padding: .5rem .9rem; border-bottom: 1px solid var(--border);
+    font-size: .82rem; font-weight: 700; }
+  .slack .bar .sub { font-weight: 400; color: var(--muted); }
+  .msg { display: grid; grid-template-columns: 38px 1fr; gap: .7rem; padding: .65rem .9rem; }
+  .msg:hover { background: var(--chat-hover); }
+  .avatar { width: 36px; height: 36px; border-radius: 6px; display: flex;
+    align-items: center; justify-content: center; font-size: 1.15rem;
+    background: var(--panel); border: 1px solid var(--border); }
+  .avatar.bot { background: #0b66c31a; }
+  .msg .head { font-size: .92rem; }
+  .msg .head b { margin-right: .4rem; }
+  .msg .head .app { font-size: .62rem; font-weight: 700; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 3px; padding: 0 .25rem;
+    vertical-align: middle; margin-right: .4rem; }
+  .msg .head .ts { color: var(--muted); font-size: .78rem; }
+  .msg .body { font-size: .92rem; margin-top: .1rem; }
+  .msg .body a { color: var(--accent); text-decoration: none; }
+  .msg .body .item { margin: .55rem 0 .15rem; }
+  .btnrow { display: flex; gap: .45rem; margin: .35rem 0 .2rem; flex-wrap: wrap; }
+  .sbtn { font-size: .8rem; font-weight: 600; padding: .22rem .7rem;
+    border: 1px solid var(--border); border-radius: 6px; background: var(--panel); }
+  .sbtn.primary { background: var(--good); color: #fff; border-color: var(--good); }
+  code { font-family: var(--mono); font-size: .86em; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 4px; padding: .05rem .3rem; }
+  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 1rem; overflow-x: auto; font: 13px/1.5 var(--mono); }
+  pre code { background: none; border: none; padding: 0; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .9rem; }
+  th, td { border: 1px solid var(--border); padding: .5rem .7rem; text-align: left; vertical-align: top; }
+  th { background: var(--panel); }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 1rem 0; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: .9rem 1.1rem; }
+  .card .layer { font-size: .72rem; font-weight: 600; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 .3rem; }
+  .card h4 { margin: 0 0 .35rem; font-size: .92rem; }
+  .card p { margin: 0; font-size: .85rem; color: var(--muted); }
+  .note { background: var(--panel); border: 1px solid var(--border);
+    border-left: 4px solid var(--good); border-radius: 6px;
+    padding: .8rem 1.1rem; margin: 1.2rem 0; font-size: .92rem; }
+  .no { color: var(--bad); }
+</style>
+
+<main>
+
+<p class="eyebrow">EnzoBot · Entity project · single reference · updated 2026-07-23</p>
+<h1>EnzoBot — The Entity</h1>
+<p class="subtitle">One page: § 1 what changes for you · § 2 how it works · § 3 the plan.</p>
+
+<div class="vision">
+  <strong>Goal:</strong> an intelligence that has <em>already read</em> your whole digital world,
+  never forgets, exists as <em>one continuous being</em> across every machine — and <strong>works your
+  night shift</strong>: at 22:00 it plans tonight's work and checks quota, you confirm with one tap;
+  while you sleep it reviews PRs and analyzes your tasks; at 06:00 the results — and its plan for
+  your day — are waiting. Easy whitelisted tasks run at midnight without even asking.
+  And it <strong>becomes you, day by day</strong>: every night it studies how you actually decided
+  and edits itself closer to your judgment.
+  <strong>The inversion from the film:</strong> it serves you, its beliefs are inspectable,
+  outward actions always wait for your tap, and you hold the kill switch.
+</div>
+
+<h2><span class="n">§1</span> What changes for you</h2>
+
+<div class="ba">
+  <div class="col before">
+    <h3>Before — every morning today</h3>
+    <ul>
+      <li>Walk Gmail → Slack → GitHub → Jira, channel by channel</li>
+      <li>Hold it all in your head, decide the next hour</li>
+      <li>Review requests wait until you find them</li>
+      <li>Things you meant to get back to… quietly slip</li>
+    </ul>
+    <span class="time">~30–45 min before real work starts</span>
+  </div>
+  <div class="col after">
+    <h3>After — it's already done</h3>
+    <ul>
+      <li>08:30 brief is waiting: one ranked list <em>with reasons</em></li>
+      <li>Tap ✅ / 💤 / ▶ — triage in seconds</li>
+      <li>Review requests arrive <em>already drafted</em> — tap 📤 to post</li>
+      <li>Nothing slips: every open loop is tracked until <em>you</em> close it</li>
+    </ul>
+    <span class="time">~2–5 min, straight to the decision</span>
+  </div>
+</div>
+
+<h3>The nightly work cycle <span class="tag v1">Plan E — the core loop</span></h3>
+<pre><code>22:00  PLAN     analyzes everything since yesterday 22:00 → drafts tonight's work
+                plan → checks Claude quota fits → DMs you: "Tonight: review #418,
+                #421 · analyze PAY-2160 + sprint status · prep daily report.
+                Quota: fits. [✅ Approve] [✏️ Edit] [Skip]"
+22:05  WORK     you sleep; it executes the approved batch on your Mac + VPS
+–05:30          (midnight: easy whitelisted tasks run even without a confirm)
+06:00  REPORT   one DM: what it DID (drafts ready to post), what it FOUND,
+                and ITS PLAN for your day — ranked, with reasons
+06:00+ LEARN    it has also studied yesterday's decisions (what you acted on,
+                how you edited its drafts) → updated its own rules — becoming you</code></pre>
+
+<h3>The 06:00 report — night results + your day's plan <span class="tag v1">v1</span></h3>
+<div class="slack">
+  <div class="bar">💬 EnzoBot <span class="sub">— Direct message · 06:00</span></div>
+  <div class="msg">
+    <div class="avatar bot">🧠</div>
+    <div>
+      <div class="head"><b>EnzoBot</b><span class="app">APP</span><span class="ts">6:00 AM</span></div>
+      <div class="body">
+        <b>Morning report</b> — night plan done: 2 review drafts ready below, sprint analysis attached. For your first hour:
+        <div class="item"><b>1. <a>Review: fix refund flow (wego/payments#412)</a></b><br>
+        <span class="muted">CI green at 06:12. Sarah is blocked on this for the CKO release.</span></div>
+        <div class="btnrow"><span class="sbtn">✅ Done</span><span class="sbtn">💤 Snooze</span><span class="sbtn primary">▶ Work on it</span></div>
+        <div class="item"><b>2. <a>Reply needed in #payments-cko (asked by Minh)</a></b><br>
+        <span class="muted">Partner waiting 26h — relates to Tuesday's incident (graph context attached).</span></div>
+        <div class="btnrow"><span class="sbtn">✅ Done</span><span class="sbtn">💤 Snooze</span><span class="sbtn primary">▶ Work on it</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3>Auto-review: drafted on your Mac, posted with one tap <span class="tag v1">Plan D</span></h3>
+<div class="slack">
+  <div class="bar">💬 EnzoBot <span class="sub">— 10:47, unprompted</span></div>
+  <div class="msg">
+    <div class="avatar bot">🧠</div>
+    <div>
+      <div class="head"><b>EnzoBot</b><span class="app">APP</span><span class="ts">10:47 AM</span></div>
+      <div class="body"><b>Review draft ready:</b> <a>wego/payments#418</a><br>
+      <span class="muted">2 blocking, 3 suggestions — drafted on your Mac (watch it in the <code>enzobot</code> herdr workspace)</span>
+      <pre style="margin:.5rem 0"><code>Verdict: needs changes.
+## Blocking
+1. retry loop drops the idempotency key on attempt 2 (settlement.go:88)
+2. EGP rounding path has no test — same class as PAY-2111 …</code></pre>
+      <div class="btnrow"><span class="sbtn primary">📤 Post review</span><span class="sbtn">🗑 Discard</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="msg">
+    <div class="avatar">🧔</div>
+    <div>
+      <div class="head"><b>Enzo</b><span class="ts">10:52 AM</span></div>
+      <div class="body"><i>taps 📤 Post review</i> → posted from your Mac, as you, via your own <code>gh</code> auth.</div>
+    </div>
+  </div>
+</div>
+
+<h3>It remembers, and you can teach it <span class="tag v1">v1</span></h3>
+<div class="slack">
+  <div class="bar">💬 EnzoBot <span class="sub">— days later, same conversation</span></div>
+  <div class="msg">
+    <div class="avatar">🧔</div>
+    <div>
+      <div class="head"><b>Enzo</b><span class="ts">2:15 PM</span></div>
+      <div class="body">that refund PR we discussed — merged in the end? and remember: no draft PRs in my brief</div>
+    </div>
+  </div>
+  <div class="msg">
+    <div class="avatar bot">🧠</div>
+    <div>
+      <div class="head"><b>EnzoBot</b><span class="app">APP</span><span class="ts">2:15 PM</span></div>
+      <div class="body">Merged Saturday 14:02 after Sarah fixed the idempotency issue you flagged; the EGP test landed as #415. And saved: drafts stay out of your brief — synced to every machine I run on.</div>
+    </div>
+  </div>
+</div>
+
+<div class="note"><b>The one-line version:</b> you approve tonight's plan with one tap at 22:00,
+sleep, and wake at 06:00 to finished work — reviews drafted, tasks analyzed, your day planned —
+by an agent that gets a little more <em>you</em> every night.</div>
+
+<h2><span class="n">§2</span> How it works</h2>
+
+<h3>One mind, many hands</h3>
+<pre><code>PERCEPTION (24/7)                    MIND (VPS)                       VOICE
+Slack bot token ─→ graph-ingest ─┐  ┌────────────────────────────┐
+Slack as-Enzo (xoxc, live) ──────┼─→│ DM companion session        │→ 08:30 brief
+GitHub (read PAT) ───────────────┤  │ ONE durable Claude session  │→ review drafts
+Jira (read token) ───────────────┘  │ (resume id in SQLite;       │→ interrupts
+                                    │  pulses = injected turns)   │→ silence
+agent-mem graph  ←─ /resolve ──────→│                             │
+agent-mem flat   ←─ hooks (auto) ──→│ agenda (open loops, SQLite) │
+directives (persona+rules) ────────→└──────────┬─────────────────┘
+                                               │ jobs queue (lease/complete)
+                                               ▼ Mac polls outbound ~10s (NAT-safe,
+                                                 lid closed → jobs just wait)
+                                    EXECUTION PLANE (your Mac)
+                                    launchd runner → herdr 'enzobot' workspace
+                                    → bare claude TUI per job (watchable!)
+                                    → agent-status done → result → VPS → DM</code></pre>
+
+<ul>
+  <li><b>The mind is one long conversation, not one long process.</b> Your DM maps to a single
+  resumable Claude Code session. tmux may die overnight; the next wake does
+  <code>claude --resume</code> — Day 30's brief knows what you snoozed on Day 29.
+  <code>/exit</code> is the only deliberate amnesia.</li>
+  <li><b>Decisions are its turns.</b> Something wakes it (scheduler, your DM, a button, an
+  interrupt) → it reads memory + runs collectors → reasons in context → the decision is what it
+  does: agenda updates, a brief, a draft, or silence.</li>
+  <li><b>Hands are parallel, the person is one.</b> Thread sessions and Mac review panes share the
+  same persona/rules and report everything back into memory — ask "how's the incident going?" and
+  the mind answers from its own live hands.</li>
+  <li><b>VPS = signal (stable network, light judgment) · Mac = muscle (heavy jobs, your repos, your
+  <code>gh</code>).</b> Queue in between: sleep-proof, no ports on your laptop, no write creds on the VPS.</li>
+</ul>
+
+<h3>Four memory layers</h3>
+<div class="cols">
+  <div class="card"><p class="layer">World</p><h4>agent-mem graph</h4><p>Who/what relates to what — Slack, Jira, PRs, incidents. Live today.</p></div>
+  <div class="card"><p class="layer">Episodes</p><h4>agent-mem flat</h4><p>What every session did, auto-summarized via hooks. Live today.</p></div>
+  <div class="card"><p class="layer">Identity</p><h4>directives <span class="tag v1">Plan A</span></h4><p>Persona + rules you teach it; synced + injected into every session, every machine.</p></div>
+  <div class="card"><p class="layer">Open loops</p><h4>agenda <span class="tag v1">Plan B</span></h4><p>What's pending for you. Personal DMs are read live, never stored.</p></div>
+</div>
+
+<h3>The leash (never changes without your say)</h3>
+<ul>
+  <li>Night autonomy is plan-scoped: the 22:00 batch you approved + your easy-task whitelist — nothing else runs unattended</li>
+  <li class="no">Never posts, replies, approves, or merges on its own — outward actions happen only behind your explicit tap, using your own auth</li>
+  <li class="no">Never stores your personal DMs / private-channel content</li>
+  <li class="no">Never self-deploys code — self-fixes arrive as PR suggestions</li>
+  <li>Every belief inspectable: agenda rows, rules, memory — all readable files/tables</li>
+</ul>
+
+<h2><span class="n">§3</span> The plan</h2>
+
+<div class="scroll"><table>
+  <tr><th>Step</th><th>What</th><th>Status</th></tr>
+  <tr><td><b>Spec</b></td><td>Design agreed &amp; written — <code>docs/superpowers/specs/2026-07-18-enzobot-entity-design.md</code></td><td><span class="tag done">✅ committed</span></td></tr>
+  <tr><td><b>Plan B</b> · ~1–2 d</td><td>Companion session + agenda + 08:30 brief + buttons + Slack/GitHub/Jira collectors — 11 TDD tasks, ships dark behind <code>COMPANION_ENABLED</code> — <code>plans/2026-07-18-enzobot-companion-v1.md</code></td><td><span class="tag done">✅ plan ready</span> → execute</td></tr>
+  <tr><td><b>Plan D</b> · ~1–2 d</td><td>Mac execution plane: VPS jobs queue (leases) + launchd runner + herdr panes + auto-review draft→📤 — <code>plans/2026-07-23-enzobot-plan-d-mac-runner.md</code></td><td><span class="tag done">✅ plan ready</span> → execute after B</td></tr>
+  <tr><td><b>Plan E</b> · ~1–2 d</td><td><strong>Night work cycle (the corrected core):</strong> 22:00 plan + quota check + ✅ confirm → overnight batch via the jobs queue (midnight whitelist skips confirm) → 06:00 report with results + your day's plan → nightly learning loop ("becoming Enzo")</td><td>to write, after D</td></tr>
+  <tr><td><b>Enable</b> · ~½ d</td><td>VPS: read-scoped GitHub/Jira creds, companion home, flip flags · Mac: <code>~/.enzobot-runner.json</code> + launchd</td><td>after B/D</td></tr>
+  <tr><td><b>Plan A</b> · ~1 d</td><td>agent-mem (Go): <code>directives</code> table + API + session-start injection + thin MCP shim — rules sync everywhere</td><td>to write</td></tr>
+  <tr><td><b>Plan C</b> · ~1 d</td><td>Tier 1–2 interrupts (speak the moment it matters) + lifecycle whispers + live-pane introspection</td><td>to write</td></tr>
+  <tr><td><b>Tune</b> · 2–3 wk</td><td>Live usage: ranking quality, interrupt noise, snooze patterns — the data v1.5 needs</td><td>—</td></tr>
+  <tr><td><span class="tag v15">v1.5</span></td><td>Tier-3 interrupt judgment · self-diagnosis → PR-fix drafts · Gmail collector · quota estimator upgraded from heuristic to measured usage</td><td>after tuning</td></tr>
+  <tr><td><span class="tag v2">v2</span></td><td>Companion-orchestrated hands · per-repo auto-post whitelist (reviews without the tap) · directed ticket execution → PR</td><td>later</td></tr>
+</table></div>
+
+<p class="muted">Repo docs are the source of truth: spec + plans under <code>docs/superpowers/</code>,
+this page under <code>docs/presentation/enzobot-entity.html</code>. Conversations above are
+illustrative; phrasing and rankings will be the model's own.</p>
+
+</main>

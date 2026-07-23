@@ -13,14 +13,42 @@ one continuous being across every machine — and uses all of that only to hand 
 the right next move.
 
 The deliberate inversion from the film: The Entity serves itself and manipulates.
-EnzoBot serves Enzo, every belief it holds is inspectable, it **suggests instead of
-acts**, and Enzo holds the kill switch.
+EnzoBot serves Enzo, every belief it holds is inspectable, and Enzo holds the kill
+switch.
+
+**The nightly work cycle (core goal, per owner correction 2026-07-23):** the agent
+works while Enzo sleeps, under *plan-approved autonomy*:
+
+- **22:00 — plan:** analyze everything since yesterday 22:00 (PRs awaiting review,
+  task/ticket status, stale threads) and draft a night work plan; **check Claude
+  usage quota** to confirm the plan fits tonight's budget.
+- **22:00 — confirm:** DM the plan + quota estimate to Enzo; one ✅ approves the batch.
+- **overnight — work:** execute the approved batch autonomously (review drafts on the
+  Mac, status analyses, preparation). No per-item approvals.
+- **06:00 — report:** one DM with everything done (results, drafts ready to post),
+  everything found, and the agent's proposed plan for Enzo's day.
+
+Outward actions (posting reviews/replies, merging, ticket transitions) remain
+owner-gated taps even inside an approved batch.
+
+**Easy-task whitelist (no confirmation needed):** task kinds Enzo has marked easy
+(e.g. review drafts for small PRs, daily status analysis, memory consolidation,
+report preparation) run at midnight autonomously even if the 22:00 plan was never
+confirmed. The whitelist is a set of directives Enzo edits by telling the agent.
+
+**Becoming Enzo, day by day (the learning loop):** the nightly cycle is also study
+time. Each night the agent reviews the day's evidence of Enzo's actual judgment —
+which brief items he acted on vs ignored, how he edited its review drafts before
+posting, what he replied in threads vs what the agent would have drafted, which
+suggestions he rejected — and distills the deltas into directives (style, priorities,
+taste). Success metric: the edit-distance between the agent's drafts and what Enzo
+actually ships should shrink week over week.
 
 ## Core decisions (all confirmed with owner)
 
 | Decision | Choice |
 |---|---|
-| Trust level | **Suggest-only.** EnzoBot proposes; Enzo executes. No autonomous outward actions. |
+| Trust level | **Plan-approved autonomy** (revised 2026-07-23): nightly batch plan confirmed once at 22:00; easy whitelisted kinds run at midnight without confirmation; outward actions (posting/merging/transitions) always owner-gated taps. Daytime remains suggest-first. |
 | The mind | **One durable DM companion session** — the EnzoBot DM channel maps to a single resumable Claude Code session (session id persisted in SQLite, `--resume` on every turn, auto-compaction). Survives restarts. |
 | Pulses | Scheduled/triggered work = **injected turns into the companion**, not separate processes. One mind that did the thinking can explain the thinking. |
 | Open loops | New `agenda` table in `slack-sessions.db`. Personal messages (DMs, private channels) are read live via xoxc/xoxd and never persisted — only the derived agenda entry is. |
@@ -118,10 +146,16 @@ Companion session machinery · agenda table · chief-of-staff skill + 08:30 puls
 brief with buttons · Slack/GitHub/Jira collectors · Tier 1+2 interrupts ·
 agent-mem directives + injection · agent-mem MCP shim · read creds on VPS.
 
-**v1.5 — the night shift** (needs v1 usage data to tune)
-Nightly consolidation pulse (close stale agenda, distill session, write learned rules,
-rebirth session when context degrades) · prep pulse (pre-warm brief material ~05:00) ·
-self-diagnosis → PR-suggestion drafts · Tier-3 interrupt judgment · Mail (Gmail) collector.
+**Plan E — the night work cycle** (promoted to v1 core, 2026-07-23)
+22:00 planning pulse (analyze since yesterday 22:00 → night plan → quota check →
+confirm DM) · overnight batch execution via the Plan D job queue · midnight
+easy-task whitelist (no confirm) · 06:00 report pulse (results + drafts + today's
+plan) · nightly learning loop (distill Enzo's day-time decisions into directives —
+"becoming Enzo") · consolidation (close stale agenda, session rebirth when needed).
+
+**v1.5 — refinements** (needs live usage data to tune)
+Tier-3 interrupt judgment · self-diagnosis → PR-suggestion drafts · Mail (Gmail)
+collector · quota estimator upgraded from heuristic to measured usage.
 
 **v2 — hands at scale**
 Mac job-queue runner (`target_runner=local` polling daemon, launchd) for
