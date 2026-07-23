@@ -22,6 +22,7 @@ const graphIngest = require('../../graph-ingest');
 const { buildContext, handleCommand: graphHandleCommand } = require('../../graph-context');
 const { GraphContextConfig } = require('../../graph-context/config');
 const { AskerLookup } = require('../../graph-context/asker');
+const { GraphClient } = require('../../graph-context/client');
 
 // ─── Credential-honesty directive ──────────────────────────────────────────
 //
@@ -132,6 +133,24 @@ let _askerLookup = null;
 function _getAskerLookup() {
     if (!_askerLookup) _askerLookup = new AskerLookup({});
     return _askerLookup;
+}
+
+// Singleton agent-mem graph client for Slack UID -> profile lookups (sender
+// identity header). Returns null when AGENT_MEM_GRAPH_URL is unset so the
+// resolver silently falls back to Slack users.info. GraphClient's constructor
+// requires a baseUrl, so guard before constructing.
+let _graphClient = null;
+let _graphClientTried = false;
+function _getGraphClient() {
+    if (_graphClientTried) return _graphClient;
+    _graphClientTried = true;
+    if (process.env.AGENT_MEM_GRAPH_URL) {
+        _graphClient = new GraphClient({
+            baseUrl: process.env.AGENT_MEM_GRAPH_URL,
+            apiKey: process.env.AGENT_MEM_API_KEY,
+        });
+    }
+    return _graphClient;
 }
 
 /**
@@ -2140,16 +2159,36 @@ ${formatted}`,
         const cached = this._senderNameCache.get(userId);
         if (cached && Date.now() - cached.at < 600000) return cached.name;
         let name = null;
-        try {
-            const info = await this.app.client.users.info({ user: userId });
-            const u = info.user || {};
-            const p = u.profile || {};
-            name = String(p.real_name || u.real_name || p.display_name || u.name || '').trim() || null;
-        } catch (err) {
-            this.logger.warn(`sender name resolve failed for ${userId}: ${err.message}`);
+        let department = null;
+        // Prefer agent-mem member detection — gives name + org context
+        // (department). Best-effort; null on miss or when unconfigured.
+        const gc = _getGraphClient();
+        if (gc) {
+            try {
+                const prof = await gc.slackUser(userId);
+                if (prof) {
+                    name = String(prof.real_name || prof.display_name || '').trim() || null;
+                    department = String(prof.department || '').trim() || null;
+                }
+            } catch (err) {
+                this.logger.debug?.(`agent-mem slackUser lookup failed for ${userId}: ${err.message}`);
+            }
         }
-        this._senderNameCache.set(userId, { name, at: Date.now() });
-        return name;
+        // Fall back to Slack users.info for the name when agent-mem has none.
+        if (!name) {
+            try {
+                const info = await this.app.client.users.info({ user: userId });
+                const u = info.user || {};
+                const p = u.profile || {};
+                name = String(p.real_name || u.real_name || p.display_name || u.name || '').trim() || null;
+            } catch (err) {
+                this.logger.warn(`sender name resolve failed for ${userId}: ${err.message}`);
+            }
+        }
+        // Compose "Name (Department)" when org context is available.
+        const display = name ? (department ? `${name} (${department})` : name) : null;
+        this._senderNameCache.set(userId, { name: display, at: Date.now() });
+        return display;
     }
 
     /**

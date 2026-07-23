@@ -29,6 +29,16 @@ class GraphClient {
     return this._get(u.toString(), asker);
   }
 
+  // Resolve a single Slack user id to a profile
+  // ({ slack_user_id, display_name, real_name, is_bot, email, department, eeid }).
+  // Returns null on 404 / any error. See agent-mem GET /api/graph/slack-user.
+  async slackUser(uid) {
+    if (!uid) return null;
+    const u = new URL(this.baseUrl + '/api/graph/slack-user');
+    u.searchParams.set('id', uid);
+    return this._get(u.toString());
+  }
+
   async _post(path, body) {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), this.timeoutMs);
