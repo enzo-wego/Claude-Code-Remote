@@ -137,9 +137,44 @@ function mineLaneBlocks(tasks) {
     return blocks;
 }
 
+/**
+ * A teammate's PR. Nobody has asked you for anything, so there is no nudge and
+ * no auto-review — just visibility, and the option to pull one in yourself.
+ */
+function teamLaneBlocks(tasks) {
+    const blocks = [
+        { type: 'header', text: { type: 'plain_text', text: 'Team PRs' } },
+    ];
+
+    if (tasks.length === 0) {
+        blocks.push(section('_No open PRs from your team._'));
+        return blocks;
+    }
+
+    for (const task of tasks) {
+        blocks.push(section([
+            `${ciGlyph(task)} *<${task.url}|${titleOf(task)}>*`,
+            `\`${task.repo}#${task.number}\` · by *@${task.author || 'unknown'}*`
+                + (task.review_state === 'requested' ? ' · review requested' : ''),
+        ].join('\n')));
+        blocks.push({
+            type: 'actions',
+            elements: [
+                button('pr_review_now', '🔍 Review now', task.id),
+                linkButton('🔗 Open', task.url),
+                button('pr_dismiss', '🙈 Dismiss', task.id),
+            ],
+        });
+        blocks.push({ type: 'divider' });
+    }
+
+    return blocks;
+}
+
 function buildPrBoardBlocks(prTasks = []) {
     const review = prTasks.filter(task => (task.lane || 'review') === 'review');
     const mine = prTasks.filter(task => task.lane === 'mine');
+    const team = prTasks.filter(task => task.lane === 'team');
 
     const blocks = [
         {
@@ -163,6 +198,7 @@ function buildPrBoardBlocks(prTasks = []) {
     }
 
     blocks.push(...mineLaneBlocks(mine));
+    blocks.push(...teamLaneBlocks(team));
 
     return blocks;
 }

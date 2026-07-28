@@ -50,6 +50,25 @@ async function githubJson(url, token) {
     return response.json();
 }
 
+/**
+ * Logins on a team, e.g. 'wego/payments-geeks'.
+ *
+ * This is how "is this PR from my team?" gets answered. GitHub search cannot
+ * filter by email or team, and a shared repo like wego-docs carries PRs from
+ * every team — so authorship against the team roster is the only exact signal.
+ */
+async function fetchTeamMembers(token, team) {
+    const [org, slug] = String(team || '').split('/');
+    if (!org || !slug) throw new Error(`team must be 'org/slug', got '${team}'`);
+    const members = await githubJson(
+        `${GITHUB_API}/orgs/${org}/teams/${slug}/members?per_page=100`,
+        token
+    );
+    return (Array.isArray(members) ? members : [])
+        .map(member => member.login)
+        .filter(Boolean);
+}
+
 /** Team slugs (`org/slug`) the token owner belongs to. */
 async function fetchViewerTeams(token) {
     const teams = await githubJson(`${GITHUB_API}/user/teams?per_page=100`, token);
@@ -82,13 +101,25 @@ function parsePrUrl(htmlUrl) {
     return match ? { repo: match[1], number: Number(match[2]) } : null;
 }
 
+/**
+ * One page of search results, plus how many were left behind.
+ *
+ * 100 is the API maximum. A wide query genuinely exceeds it (all open PRs
+ * across six wego repos is 162), so truncation is reported rather than
+ * swallowed — a board that quietly drops PRs is worse than one that says it
+ * did. Callers log `dropped`; keep queries narrow enough that it stays 0.
+ */
 async function searchPrs(qualifier, token) {
     const query = `is:pr is:open archived:false ${qualifier}`;
     const data = await githubJson(
-        `${GITHUB_API}/search/issues?q=${encodeURIComponent(query)}&per_page=50`,
+        `${GITHUB_API}/search/issues?q=${encodeURIComponent(query)}&per_page=100`,
         token
     );
-    return data.items || [];
+    const items = data.items || [];
+    return {
+        items,
+        dropped: Math.max(0, Number(data.total_count || 0) - items.length),
+    };
 }
 
 async function fetchPrState({ repo, number, token, viewerLogin, viewerTeams = [] }) {
@@ -241,16 +272,21 @@ async function fetchViewerLogin(token) {
  * upsert() never touches `status`, so a PR the owner already dismissed or
  * finished stays retired instead of reappearing each sweep.
  */
-async function sweepReviewRequests(prTasks, token, { teams = [], viewerLogin } = {}) {
+async function sweepReviewRequests(prTasks, token, {
+    teams = [],
+    viewerLogin,
+    org = '',
+} = {}) {
     const seeded = [];
     const seen = new Set();
+    const scope = org ? `org:${org} ` : '';
 
     for (const qualifier of reviewQueries(teams)) {
         // One team's query failing (deleted team, missing scope) must not cost
         // us the other queries' results.
         let items;
         try {
-            items = await searchPrs(`${qualifier} draft:false`, token);
+            ({ items } = await searchPrs(`${scope}${qualifier} draft:false`, token));
         } catch (err) {
             if (qualifier === 'review-requested:@me') throw err;
             continue;
@@ -288,8 +324,9 @@ async function sweepReviewRequests(prTasks, token, { teams = [], viewerLogin } =
  * everyone else. Drafts are included — you still want to know if someone
  * commented on one.
  */
-async function sweepMyPrs(prTasks, token) {
-    const items = await searchPrs('author:@me', token);
+async function sweepMyPrs(prTasks, token, { org = '' } = {}) {
+    const scope = org ? `org:${org} ` : '';
+    const { items } = await searchPrs(`${scope}author:@me`, token);
     const seeded = [];
     for (const item of items) {
         const pull = parsePrUrl(item.html_url);
@@ -306,36 +343,79 @@ async function sweepMyPrs(prTasks, token) {
     return seeded;
 }
 
+/**
+ * Open PRs written by your teammates, anywhere in the org.
+ *
+ * Deliberately author-scoped rather than repo-scoped. A repo allowlist has both
+ * failure modes at once: it floods the board with other teams' work in shared
+ * repos (wego-docs, and 84 open PRs across pennyworth/roxana/olympias with none
+ * from this team), and it silently misses repos nobody remembered to list —
+ * payments-knowledge, wego-fares and yorktown-admin-proxy all turned up here
+ * without being named. `author:` OR-combines, so one query covers the org.
+ *
+ * Returns { seeded, dropped } so a truncated page is reported, not hidden.
+ */
+async function sweepTeamPrs(prTasks, token, { members = [], viewerLogin, org = '' } = {}) {
+    const others = members.filter(login => login && login !== viewerLogin);
+    if (others.length === 0) return { seeded: [], dropped: 0 };
+
+    const scope = org ? `org:${org} ` : '';
+    const authors = others.map(login => `author:${login}`).join(' ');
+    const { items, dropped } = await searchPrs(`${scope}${authors}`, token);
+
+    const seeded = [];
+    for (const item of items) {
+        const pull = parsePrUrl(item.html_url);
+        if (!pull) continue;
+        seeded.push(prTasks.upsert({
+            ...pull,
+            url: item.html_url,
+            title: item.title || null,
+            author: item.user?.login || null,
+            origin: 'github-team',
+            lane: 'team',
+        }));
+    }
+    return { seeded, dropped };
+}
+
+/**
+ * Refresh the two "waiting on a review" lanes. Team rows get the same CI and
+ * retirement treatment as review rows; only the review lane can become
+ * reviewReady(), so auto-review never fires on a teammate's PR unasked.
+ */
 async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
     const readyBefore = new Set(
         prTasks.reviewReady().map(task => task.id)
     );
 
-    for (const task of prTasks.listActive('review')) {
-        const state = await fetchPrState({
-            repo: task.repo,
-            number: task.number,
-            token,
-            viewerLogin,
-            viewerTeams,
-        });
-        if (state.closed) {
-            // Merged or closed on GitHub — the review is moot, so retire the
-            // card instead of leaving stale work on the board.
-            prTasks.setStatus(task.id, 'closed');
-            continue;
+    for (const lane of ['review', 'team']) {
+        for (const task of prTasks.listActive(lane)) {
+            const state = await fetchPrState({
+                repo: task.repo,
+                number: task.number,
+                token,
+                viewerLogin,
+                viewerTeams,
+            });
+            if (state.closed) {
+                // Merged or closed on GitHub — the review is moot, so retire
+                // the card instead of leaving stale work on the board.
+                prTasks.setStatus(task.id, 'closed');
+                continue;
+            }
+            prTasks.upsert({
+                repo: task.repo,
+                number: task.number,
+                url: task.url,
+                title: state.title,
+                author: state.author,
+                ci: state.ci,
+                reviewState: state.reviewState,
+                origin: task.origin,
+                lane,
+            });
         }
-        prTasks.upsert({
-            repo: task.repo,
-            number: task.number,
-            url: task.url,
-            title: state.title,
-            author: state.author,
-            ci: state.ci,
-            reviewState: state.reviewState,
-            origin: task.origin,
-            lane: 'review',
-        });
     }
 
     return prTasks.reviewReady()
@@ -419,6 +499,7 @@ module.exports = {
     fetchHumanCommentCount,
     fetchPrState,
     fetchReviewDecision,
+    fetchTeamMembers,
     fetchViewerLogin,
     fetchViewerTeams,
     mapCiState,
@@ -427,4 +508,5 @@ module.exports = {
     reviewQueries,
     sweepMyPrs,
     sweepReviewRequests,
+    sweepTeamPrs,
 };

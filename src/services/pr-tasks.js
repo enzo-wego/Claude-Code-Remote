@@ -1,12 +1,15 @@
 /**
- * PRs EnzoBot is tracking, in two lanes:
+ * PRs EnzoBot is tracking, in three lanes:
  *   lane='review' — someone is waiting on you.  detected → needs_review →
  *                   reviewing → drafted → posted | dismissed | closed
  *   lane='mine'   — you are waiting on someone else. Status stays 'detected'
  *                   until it merges/closes; the interesting state is
  *                   review_decision + the seen_comments watermark.
- * Origin: slack | github-sweep | github-mine. reviewReady() drives nudges and
- * auto-review, and is deliberately scoped to the review lane.
+ *   lane='team'   — a teammate's open PR, for awareness. Nobody has asked you
+ *                   for anything; you can pull it in with Review now.
+ * Precedence when a PR qualifies for more than one: mine > review > team.
+ * Origin: slack | github-sweep | github-mine | github-team. reviewReady()
+ * drives nudges and auto-review, scoped to the review lane only.
  */
 class PrTasks {
     constructor(db) {
@@ -66,7 +69,18 @@ class PrTasks {
                             THEN excluded.review_state
                         ELSE pr_tasks.review_state
                     END,
-                    lane=excluded.lane,
+                    -- Lane precedence: mine > review > team. A PR can satisfy
+                    -- more than one sweep (your own PR that also requests your
+                    -- team; a teammate's PR that requests you), so the stronger
+                    -- claim wins regardless of which sweep ran last.
+                    lane=CASE
+                        WHEN (CASE excluded.lane
+                                WHEN 'mine' THEN 0 WHEN 'review' THEN 1 ELSE 2 END)
+                          <= (CASE pr_tasks.lane
+                                WHEN 'mine' THEN 0 WHEN 'review' THEN 1 ELSE 2 END)
+                        THEN excluded.lane
+                        ELSE pr_tasks.lane
+                    END,
                     updated_at=@now
             `),
             byKey: db.prepare(

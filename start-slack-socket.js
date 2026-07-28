@@ -16,6 +16,7 @@ const {
     refreshMine,
     sweepMyPrs,
     sweepReviewRequests,
+    sweepTeamPrs,
 } = require('./src/services/pr-monitor');
 const { handlePrAction } = require('./src/channels/slack/pr-actions');
 const { buildMineChangeText } = require('./src/channels/slack/pr-board');
@@ -141,6 +142,12 @@ const config = {
         process.env.PR_MONITOR_INTERVAL_MIN || 15
     ),
     prAutoReview: process.env.PR_AUTO_REVIEW === 'true',
+    // Confine every PR sweep to one GitHub org, so personal repos stay off the
+    // work board. Empty → no org filter (everything the token can see).
+    prOrg: process.env.PR_ORG || 'wego',
+    // Team roster used to answer "is this PR from my team?" in shared repos.
+    // Empty → the Team PRs lane stays off.
+    prTeam: process.env.PR_TEAM || '',
     // App mode: 'local' (mentions only), 'cloud' (monitors + summary only), 'all' (everything)
     appMode: (process.env.APP_MODE || 'all').toLowerCase(),
     // SSO pre-warm (keeps the local SSO credential server's token hot so
@@ -278,12 +285,13 @@ async function runPrMonitor() {
     // Team review requests never match `review-requested:@me`, so the sweep
     // needs one query per team the owner belongs to.
     const teams = await handler._githubViewerTeams();
+    const org = config.prOrg || '';
 
     try {
         const seeded = await sweepReviewRequests(
             handler.prTasks,
             config.githubToken,
-            { teams, viewerLogin }
+            { teams, viewerLogin, org }
         );
         if (seeded.length) {
             logger.info(`PR sweep: ${seeded.length} PR(s) awaiting your review`);
@@ -293,12 +301,37 @@ async function runPrMonitor() {
     }
 
     try {
-        const mine = await sweepMyPrs(handler.prTasks, config.githubToken);
+        const mine = await sweepMyPrs(handler.prTasks, config.githubToken, { org });
         if (mine.length) {
             logger.info(`PR sweep: ${mine.length} open PR(s) of yours`);
         }
     } catch (err) {
         logger.warn(`My-PR sweep failed: ${err.message}`);
+    }
+
+    // Teammates' PRs. Author-scoped against the team roster, which is the only
+    // exact way to tell a payments PR from another team's in a shared repo.
+    try {
+        const members = await handler._githubTeamMembers();
+        if (members.length) {
+            const { seeded, dropped } = await sweepTeamPrs(
+                handler.prTasks,
+                config.githubToken,
+                { members, viewerLogin, org }
+            );
+            if (seeded.length) {
+                logger.info(
+                    `PR sweep: ${seeded.length} open PR(s) from ${config.prTeam}`
+                );
+            }
+            if (dropped > 0) {
+                logger.warn(
+                    `PR sweep: ${dropped} team PR(s) beyond the 100-result page were NOT tracked`
+                );
+            }
+        }
+    } catch (err) {
+        logger.warn(`Team-PR sweep failed: ${err.message}`);
     }
 
     const ready = await refreshAll(
@@ -400,7 +433,7 @@ async function start() {
     logger.info(`- Delay Alert CLI chain: ${config.delayAlertCliChain.join(' → ')}`);
     logger.info(`- Delay Alert Threshold: ${config.delayAlertThreshold} alerts in ${config.delayAlertWindowMs}ms`);
     logger.info(`- Daily Summary: ${config.dailySummaryChannels ? `${config.dailySummaryTime} → ${config.dailySummaryChannels}` : 'Not configured'}`);
-    logger.info(`- PR Review Board: ${config.prBoardEnabled ? `every ${config.prMonitorIntervalMin}m${config.prAutoReview ? ' · auto-draft' : ''}` : 'Disabled'}`);
+    logger.info(`- PR Review Board: ${config.prBoardEnabled ? `every ${config.prMonitorIntervalMin}m${config.prAutoReview ? ' · auto-draft' : ''} · scope ${config.prOrg ? `org:${config.prOrg}` : 'all repos'}${config.prTeam ? ` · team ${config.prTeam}` : ''}` : 'Disabled'}`);
     logger.info(`- App Mode: ${config.appMode}`);
     logger.info(`- SSO Pre-warm: ${config.ssoPrewarmEnabled ? `${config.ssoPrewarmProfiles.join(', ')} every ${config.ssoPrewarmIntervalMs}ms via ${config.ssoPrewarmUrl}` : 'Disabled'}`);
     logger.info(`- BQ Health Monitor: ${config.bqHealthEnabled ? `every ${config.bqHealthIntervalMs}ms (timeout ${config.bqHealthTimeoutMs}ms)` : 'Disabled'}`);

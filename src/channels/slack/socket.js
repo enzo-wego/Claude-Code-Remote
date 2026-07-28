@@ -27,12 +27,14 @@ const { handlePrAction } = require('./pr-actions');
 const { extractPrUrls, needsMyReview } = require('../../services/pr-detect');
 const {
     fetchPrState,
+    fetchTeamMembers,
     fetchViewerLogin,
     fetchViewerTeams,
     refreshAll,
     refreshMine,
     sweepMyPrs,
     sweepReviewRequests,
+    sweepTeamPrs,
 } = require('../../services/pr-monitor');
 const { runDailySummary, parseChannelsConfig } = require('../../services/daily-summary');
 const { getCliAdapter, adapterNames } = require('../../cli');
@@ -1651,6 +1653,26 @@ ${formatted}`,
     }
 
     /**
+     * Roster of the configured team, cached for the process lifetime. Empty
+     * when PR_TEAM is unset, which simply leaves the Team PRs lane empty.
+     */
+    async _githubTeamMembers() {
+        if (!this.config.prTeam) return [];
+        if (!this._githubTeamMembersPromise) {
+            this._githubTeamMembersPromise = fetchTeamMembers(
+                this._githubToken(),
+                this.config.prTeam
+            ).catch(err => {
+                this.logger.warn(
+                    `GitHub team roster lookup failed for ${this.config.prTeam}: ${err.message}`
+                );
+                return [];
+            });
+        }
+        return this._githubTeamMembersPromise;
+    }
+
+    /**
      * Teams the owner belongs to, cached for the process lifetime. Needed
      * because a review request aimed at a team never appears in
      * requested_reviewers, and `review-requested:@me` does not match it either.
@@ -2061,8 +2083,17 @@ ${formatted}`,
                 const viewerLogin = await this._githubViewerLogin()
                     .catch(() => null);
                 const teams = await this._githubViewerTeams();
-                await sweepReviewRequests(this.prTasks, token, { teams, viewerLogin });
-                await sweepMyPrs(this.prTasks, token);
+                const members = await this._githubTeamMembers();
+                const org = this.config.prOrg || '';
+                await sweepReviewRequests(this.prTasks, token, {
+                    teams, viewerLogin, org,
+                });
+                await sweepMyPrs(this.prTasks, token, { org });
+                if (members.length) {
+                    await sweepTeamPrs(this.prTasks, token, {
+                        members, viewerLogin, org,
+                    });
+                }
                 await refreshAll(this.prTasks, token, viewerLogin, teams);
                 await refreshMine(this.prTasks, token, viewerLogin);
             } catch (err) {
