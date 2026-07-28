@@ -1750,10 +1750,27 @@ ${formatted}`,
             if (!this.ssoPrewarm) return; // wrong instance (e.g. APP_MODE=local)
             const userId = body && body.user && body.user.id;
             if (this.config.ownerUserId && userId && userId !== this.config.ownerUserId) return;
+            // Minting a device code takes a few seconds. A button that stays
+            // silent that long invites repeat taps, and each tap used to DM
+            // another URL (3 near-identical DMs in 30s on 2026-07-26). Report
+            // progress on the tapped message itself; SsoPrewarm collapses the
+            // extra taps so at most one new DM comes out.
+            const dmChannel = body.channel && body.channel.id;
+            const dmTs = body.message && body.message.ts;
+            const dmText = (body.message && body.message.text) || '';
+            await this.ssoPrewarm.repaintDm(
+                dmChannel, dmTs, dmText, ':hourglass_flowing_sand: _Minting a fresh URL…_'
+            );
             try {
-                await this.ssoPrewarm.reseedNow('button');
+                const result = await this.ssoPrewarm.reseedNow('button');
+                const code = (result && result.user_code) || 'unknown';
+                await this.ssoPrewarm.repaintDm(dmChannel, dmTs, dmText, result && result.dmSent
+                    ? `:white_check_mark: _Fresh URL sent below (code \`${code}\`)._`
+                    : `:information_source: _Already re-seeding — approve code \`${code}\` from the newest DM._`);
             } catch (err) {
                 this.logger.error(`Re-seed button failed: ${err.message}`);
+                // Put the button back so the operator can retry from here.
+                await this.ssoPrewarm.repaintDm(dmChannel, dmTs, dmText, null);
                 try {
                     await this.app.client.chat.postMessage({
                         channel: userId || this.config.ownerUserId,

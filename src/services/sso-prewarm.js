@@ -56,6 +56,11 @@ const ADMIN_RESEED_TIMEOUT_MS = 15000;
 // waiting up to one full prewarm cycle (30min).
 const FAST_POLL_INTERVAL_MS = 10000;
 const FAST_POLL_MAX_MS = 11 * 60 * 1000;
+// Every SSO DM carries a "Re-seed now" button, and minting a device code takes
+// a few seconds — so repeat taps used to each mint their own DM (three within
+// 30s on 2026-07-26). Collapse them: a tap while one is in flight joins it, and
+// taps within this window return the already-DM'd URL instead of a new one.
+const RESEED_COOLDOWN_MS = 60 * 1000;
 
 const http = require('http');
 const https = require('https');
@@ -101,6 +106,14 @@ class SsoPrewarm {
         }
         this._scheduledTimer = null;
         this._scheduledApprovalTimer = null;
+        // Re-seed coalescing state (see RESEED_COOLDOWN_MS).
+        this._reseedInFlight = null;
+        this._lastReseedAt = null;
+        this._lastReseed = null;
+        // user_code of the most recent URL we actually DM'd, from any path
+        // (on-demand, scheduled, or reactive failure). Guards against posting
+        // a second copy of a URL the operator is already looking at.
+        this._lastDmUserCode = null;
     }
 
     start() {
@@ -177,12 +190,42 @@ class SsoPrewarm {
         return this.getStatus();
     }
 
-    // Operator-triggered immediate re-seed (Slack button / DM keyword). Mints a
-    // fresh device-code URL on demand, DMs it, and starts the same approval
-    // poll the scheduled path uses — so a human tap and the timer flow through
-    // identical machinery. Returns the reseed object; throws on failure so the
-    // caller can surface it.
+    // Operator-triggered immediate re-seed (Slack button / DM keyword).
+    //
+    // Guard in front of _mintAndDm: repeat taps are the norm (the mint takes
+    // seconds and every DM carries its own button), so a tap landing while one
+    // is in flight joins that promise, and a tap inside RESEED_COOLDOWN_MS
+    // returns the URL we already DM'd. Both cases come back with
+    // `dmSent: false` + `coalesced: true` so the caller can say so on the
+    // tapped message instead of leaving it looking ignored.
+    //
+    // Returns the reseed object; throws on failure so the caller can surface it.
     async reseedNow(trigger = 'manual') {
+        if (this._reseedInFlight) {
+            this.logger.info(`Re-seed already in flight — joining (trigger=${trigger})`);
+            const reseed = await this._reseedInFlight;
+            return { ...reseed, dmSent: false, coalesced: true };
+        }
+        const sinceLast = this._lastReseedAt ? Date.now() - this._lastReseedAt : Infinity;
+        if (this._lastReseed && sinceLast < RESEED_COOLDOWN_MS) {
+            this.logger.info(
+                `Re-seed suppressed (${Math.round(sinceLast / 1000)}s since the last one, ` +
+                `trigger=${trigger}) — code ${this._lastReseed.user_code} already DM'd`
+            );
+            return { ...this._lastReseed, dmSent: false, coalesced: true };
+        }
+        this._reseedInFlight = this._mintAndDm(trigger);
+        try {
+            return await this._reseedInFlight;
+        } finally {
+            this._reseedInFlight = null;
+        }
+    }
+
+    // Mints a fresh device-code URL, DMs it, and starts the same approval poll
+    // the scheduled path uses — so a human tap and the timer flow through
+    // identical machinery.
+    async _mintAndDm(trigger) {
         const reseed = await this._callAdminReseed();
         if (!reseed || !reseed.verification_url) {
             throw new Error(`/admin/reseed returned no URL (${JSON.stringify(reseed)})`);
@@ -194,7 +237,16 @@ class SsoPrewarm {
             `*User code:* \`${reseed.user_code}\``,
             `_Triggered from Slack (${trigger}). URL valid ~${mins}min._`,
         ].join('\n');
-        if (this.slackClient && this.ownerUserId) {
+        // sso_server hands back the in-flight URL when one is still live, so a
+        // repeat trigger can resolve to a code the operator is already staring
+        // at. Re-posting it adds nothing but noise.
+        const isDuplicateUrl = Boolean(reseed.reused)
+            && Boolean(reseed.user_code)
+            && reseed.user_code === this._lastDmUserCode;
+        let dmSent = false;
+        if (isDuplicateUrl) {
+            this.logger.info(`Re-seed DM skipped: code ${reseed.user_code} already DM'd (trigger=${trigger})`);
+        } else if (this.slackClient && this.ownerUserId) {
             try {
                 await this.slackClient.chat.postMessage({
                     channel: this.ownerUserId,
@@ -202,10 +254,14 @@ class SsoPrewarm {
                     blocks: this._dmBlocks(text),
                     unfurl_links: false,
                 });
+                dmSent = true;
+                this._lastDmUserCode = reseed.user_code || null;
             } catch (err) {
                 this.logger.error(`Failed to DM on-demand re-seed URL: ${err.message}`);
             }
         }
+        this._lastReseed = reseed;
+        this._lastReseedAt = Date.now();
         // Watch for approval exactly like the scheduled path: the SSO token's
         // expiresAt advances when `aws sso login` writes a fresh token.
         const baseline = await this._callReseedStatus().catch(() => null);
@@ -218,8 +274,28 @@ class SsoPrewarm {
             });
             this._pollScheduledApproval(baseline.sso_token_expires_at);
         }
-        this.logger.info(`On-demand re-seed issued (trigger=${trigger}, reused=${!!reseed.reused})`);
-        return reseed;
+        this.logger.info(
+            `On-demand re-seed issued (trigger=${trigger}, reused=${!!reseed.reused}, dmSent=${dmSent})`
+        );
+        return { ...reseed, dmSent, coalesced: false };
+    }
+
+    // Repaint an SSO DM whose "Re-seed now" button was just tapped. Minting a
+    // device code takes seconds, and a button that stays silent that long is
+    // what drove the repeat taps behind the duplicate DMs — so the tap gets
+    // acknowledged on the message itself. `note === null` restores the button
+    // (failure path) so the operator can retry. Cosmetic: never throws.
+    async repaintDm(channel, ts, text, note) {
+        if (!this.slackClient || !channel || !ts || !text) return;
+        const blocks = note === null ? this._dmBlocks(text) : [
+            { type: 'section', text: { type: 'mrkdwn', text } },
+            { type: 'context', elements: [{ type: 'mrkdwn', text: note }] },
+        ];
+        try {
+            await this.slackClient.chat.update({ channel, ts, text, blocks });
+        } catch (err) {
+            this.logger.debug(`Failed to repaint SSO DM ${ts}: ${err.message}`);
+        }
     }
 
     // Render a DM body as Block Kit with a "Re-seed now" button appended, so the
@@ -400,6 +476,7 @@ class SsoPrewarm {
                 blocks: this._dmBlocks(text),
                 unfurl_links: false,
             });
+            if (reseed && reseed.user_code) this._lastDmUserCode = reseed.user_code;
         } catch (err) {
             this.logger.error(`Failed to DM owner about SSO pre-warm failure: ${err.message}`);
         }
@@ -565,6 +642,9 @@ class SsoPrewarm {
                 blocks: this._dmBlocks(text),
                 unfurl_links: false,
             });
+            // A tap on this DM's button resolves to the same in-flight code;
+            // remembering it keeps _mintAndDm from posting a second copy.
+            this._lastDmUserCode = reseed.user_code || null;
             this.logger.info(`Scheduled re-seed DM sent (reused=${!!reseed.reused})`);
         } catch (err) {
             this.logger.error(`Failed to DM owner about scheduled re-seed: ${err.message}`);
