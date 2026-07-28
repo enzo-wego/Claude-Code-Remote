@@ -1,0 +1,60 @@
+async function handlePrAction({
+    actionId,
+    value,
+    prTasks,
+    jobs,
+}) {
+    const task = prTasks.get(Number(value));
+    if (!task) return `:warning: PR task ${value} not found.`;
+
+    switch (actionId) {
+        case 'pr_review_now': {
+            const job = jobs.enqueue('apex_review', {
+                repo: task.repo,
+                pr: task.number,
+                url: task.url,
+            }, {
+                dedupeKey: `apex_review:${task.repo}#${task.number}`,
+            });
+            if (!job) {
+                return `:information_source: Review for #${task.number} is already queued.`;
+            }
+            prTasks.setDraftJob(task.id, job.id);
+            return `:mag: Reviewing #${task.number} on your Mac…`;
+        }
+
+        case 'pr_post': {
+            const draft = task.draft_job_id
+                ? jobs.get(task.draft_job_id)
+                : null;
+            if (!draft || !draft.result_json) {
+                return `:warning: Draft for ${task.repo}#${task.number} is not available.`;
+            }
+            const result = JSON.parse(draft.result_json);
+            const queued = jobs.enqueue('post_review', {
+                repo: task.repo,
+                pr: task.number,
+                body_md: result.body_md || '',
+            }, {
+                dedupeKey: `post_review:${task.repo}#${task.number}`,
+            });
+            prTasks.setStatus(task.id, 'posted');
+            return queued
+                ? `:outbox_tray: Review for #${task.number} queued for posting from your Mac.`
+                : `:information_source: Review for #${task.number} is already queued for posting.`;
+        }
+
+        case 'pr_edit':
+            return ':pencil2: Reply here with the changes you want, then tap Post.';
+
+        case 'pr_discard':
+        case 'pr_dismiss':
+            prTasks.setStatus(task.id, 'dismissed');
+            return `:wastebasket: Dismissed ${task.repo}#${task.number}.`;
+
+        default:
+            return `:warning: Unknown PR action ${actionId}.`;
+    }
+}
+
+module.exports = { handlePrAction };
