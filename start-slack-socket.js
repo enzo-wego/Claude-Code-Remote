@@ -401,6 +401,16 @@ async function start() {
         if (!config.githubToken) {
             logger.warn('PR review board enabled without GITHUB_TOKEN; monitor disabled');
         } else {
+            // Prime once shortly after boot so a restart doesn't leave the
+            // board and Home tab stale for a whole interval. Delayed a little
+            // to let the Slack connection settle first.
+            handler.prMonitorPrimer = setTimeout(() => {
+                runPrMonitor().catch(err =>
+                    logger.error(`PR monitor (initial) failed: ${err.message}`)
+                );
+            }, 20_000);
+            handler.prMonitorPrimer.unref();
+
             handler.prMonitorInterval = setInterval(() => {
                 runPrMonitor().catch(err =>
                     logger.error(`PR monitor failed: ${err.message}`)
@@ -408,7 +418,8 @@ async function start() {
             }, config.prMonitorIntervalMin * 60_000);
             handler.prMonitorInterval.unref();
             logger.info(
-                `PR monitor scheduled every ${config.prMonitorIntervalMin}m`
+                `PR monitor scheduled every ${config.prMonitorIntervalMin}m `
+                + '(priming in 20s)'
             );
         }
     }
@@ -483,6 +494,9 @@ start().catch((error) => {
 // Handle graceful shutdown
 function shutdown() {
     logger.info('Shutting down Slack Socket Mode server...');
+    if (handler.prMonitorPrimer) {
+        clearTimeout(handler.prMonitorPrimer);
+    }
     if (handler.prMonitorInterval) {
         clearInterval(handler.prMonitorInterval);
     }
