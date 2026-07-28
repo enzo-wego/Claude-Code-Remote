@@ -1642,9 +1642,9 @@ ${formatted}`,
         const view = buildHomeView(state);
         try {
             await this.app.client.views.publish({ user_id: userId, view });
-            // Logged because a silent publish makes "is the board stale?"
-            // impossible to answer — Slack has no API to read a published view.
-            this.logger.debug(
+            // info, not debug: production runs at LOG_LEVEL=info, and a line
+            // nobody can see is not a diagnostic. Volume is ~15/hour.
+            this.logger.info(
                 `home published: user=${userId} blocks=${view.blocks.length}`
                 + ` prs=${(state.prTasks || []).length}`
                 + (refreshing ? ' (refreshing)' : '')
