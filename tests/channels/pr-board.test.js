@@ -47,12 +47,15 @@ describe('buildPrBoardBlocks', () => {
         expect(text).toContain('needs_review');
         expect(text).toContain('reviewing on your Mac');
 
+        // Task-scoped controls only — the board-level 🔄 Refresh lives in its
+        // own actions block and is asserted separately.
         const actionSets = blocks
             .filter(block => block.type === 'actions')
             .map(block => block.elements.map(element => ({
                 actionId: element.action_id,
                 value: element.value,
-            })));
+            })))
+            .filter(set => !set.some(el => el.actionId === 'pr_refresh'));
         expect(actionSets).toEqual([
             [
                 { actionId: 'pr_review_now', value: '1' },
@@ -90,5 +93,15 @@ describe('buildPrDraftResultBlocks', () => {
         expect(actions.elements.every(element => element.value === '3')).toBe(true);
         expect(JSON.stringify(blocks)).toContain('1 blocking');
         expect(JSON.stringify(blocks)).toContain('Fix this');
+    });
+});
+
+describe('refresh button', () => {
+    test('board header carries a pr_refresh button even when empty', () => {
+        const { buildPrBoardBlocks } = require('../../src/channels/slack/pr-board');
+        expect(JSON.stringify(buildPrBoardBlocks([]))).toContain('pr_refresh');
+        expect(JSON.stringify(buildPrBoardBlocks([
+            { id: 1, repo: 'a/b', number: 1, url: 'u', ci: 'green', review_state: 'requested', status: 'detected' },
+        ]))).toContain('pr_refresh');
     });
 });

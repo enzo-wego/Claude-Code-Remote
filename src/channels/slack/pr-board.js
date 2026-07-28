@@ -22,6 +22,14 @@ function buildPrBoardBlocks(prTasks = []) {
             type: 'header',
             text: { type: 'plain_text', text: 'PR Review Board' },
         },
+        {
+            // Re-sweeps GitHub on the spot rather than waiting for the next
+            // monitor cycle, then repaints. value is unused but Slack wants one.
+            type: 'actions',
+            elements: [
+                button('pr_refresh', '🔄 Refresh now', 'refresh'),
+            ],
+        },
     ];
 
     if (prTasks.length === 0) {

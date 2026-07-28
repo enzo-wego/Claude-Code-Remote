@@ -28,6 +28,8 @@ const { extractPrUrls, needsMyReview } = require('../../services/pr-detect');
 const {
     fetchPrState,
     fetchViewerLogin,
+    refreshAll,
+    sweepReviewRequests,
 } = require('../../services/pr-monitor');
 const { runDailySummary, parseChannelsConfig } = require('../../services/daily-summary');
 const { getCliAdapter, adapterNames } = require('../../cli');
@@ -1673,6 +1675,7 @@ ${formatted}`,
                     requestedReviewers: state.requestedReviewers,
                     me,
                     codeowner: state.codeowner,
+                    author: state.author,
                 })) {
                     continue;
                 }
@@ -1991,6 +1994,37 @@ ${formatted}`,
                 }
             });
         }
+
+        // Entity: on-demand board refresh. Re-sweeps GitHub and re-reads PR
+        // state now instead of waiting for the next monitor cycle, then
+        // repaints. Owner-only, like every other board action.
+        this.app.action('pr_refresh', async ({ ack, body }) => {
+            await ack();
+            const userId = body.user && body.user.id;
+            if (this.config.ownerUserId
+                && userId !== this.config.ownerUserId) {
+                return;
+            }
+            try {
+                const token = this.config.githubToken
+                    || process.env.GITHUB_TOKEN
+                    || '';
+                if (!token) {
+                    this.logger.warn('pr_refresh: no GitHub token configured');
+                    await this._publishHome(userId);
+                    return;
+                }
+                const viewerLogin = await this._githubViewerLogin()
+                    .catch(() => null);
+                await sweepReviewRequests(this.prTasks, token);
+                await refreshAll(this.prTasks, token, viewerLogin);
+            } catch (err) {
+                this.logger.error(`pr_refresh failed: ${err.message}`);
+            }
+            // Repaint regardless, so a failed sweep still shows current rows.
+            await this._publishHome(userId || this.config.ownerUserId)
+                .catch(() => {});
+        });
 
         // Entity: App Home status board. Repaint whenever the user opens the tab.
         this.app.event('app_home_opened', async ({ event }) => {

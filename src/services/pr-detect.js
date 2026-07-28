@@ -24,7 +24,13 @@ function needsMyReview({
     requestedReviewers = [],
     me,
     codeowner = false,
+    author = null,
 } = {}) {
+    // Never review your own PR. GitHub already prevents self-review-requests,
+    // so this is belt-and-braces today — but it keeps the guarantee explicit
+    // rather than resting on that quirk, and it closes the hole for the
+    // codeowner path, which would otherwise match your own PRs.
+    if (author && me && author === me) return false;
     return requestedReviewers.includes(me) || Boolean(codeowner);
 }
 

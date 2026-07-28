@@ -33,3 +33,23 @@ describe('pr-detect', () => {
         })).toBe(false);
     });
 });
+
+describe('needsMyReview ignores your own PRs', () => {
+    test('false when you authored it, even if somehow requested', () => {
+        expect(needsMyReview({
+            requestedReviewers: ['enzo'], me: 'enzo', author: 'enzo',
+        })).toBe(false);
+    });
+
+    test('false when you authored it and the codeowner path would match', () => {
+        expect(needsMyReview({
+            requestedReviewers: [], me: 'enzo', author: 'enzo', codeowner: true,
+        })).toBe(false);
+    });
+
+    test('still true for someone else PR requesting you', () => {
+        expect(needsMyReview({
+            requestedReviewers: ['enzo'], me: 'enzo', author: 'sarah',
+        })).toBe(true);
+    });
+});
