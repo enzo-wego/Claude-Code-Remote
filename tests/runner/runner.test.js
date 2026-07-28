@@ -77,4 +77,44 @@ describe('executeJob', () => {
         );
         expect(result.posted).toBe(true);
     });
+
+    test('apex_review job runs apex-review in a pane and reads the draft', async () => {
+        const jobsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ejobs-'));
+        const job = {
+            id: 7,
+            kind: 'apex_review',
+            payload_json: JSON.stringify({
+                repo: 'wego/payments',
+                pr: 413,
+                url: 'https://github.com/wego/payments/pull/413',
+            }),
+        };
+        const herdr = {
+            ensureWorkspace: jest.fn().mockReturnValue('w9'),
+            createJobPane: jest.fn().mockReturnValue({ paneId: 'w9:p2' }),
+            startAgent: jest.fn(),
+            submitTask: jest.fn(),
+            waitDone: jest.fn(() => {
+                fs.writeFileSync(
+                    path.join(jobsDir, '7', 'result.md'),
+                    'Verdict: changes requested'
+                );
+                fs.writeFileSync(
+                    path.join(jobsDir, '7', 'result.md.summary'),
+                    '1 blocking'
+                );
+            }),
+            readTail: jest.fn().mockReturnValue('RESULT_READY'),
+        };
+
+        const result = await executeJob(job, {
+            jobsDir,
+            repoRoot: '/tmp',
+            repoMap: { 'wego/payments': '/tmp/payments' },
+            cliCommand: 'claude',
+        }, herdr);
+
+        expect(result.summary).toBe('1 blocking');
+        expect(herdr.submitTask.mock.calls[0][1]).toContain('/apex-review');
+    });
 });

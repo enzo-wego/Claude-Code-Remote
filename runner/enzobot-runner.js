@@ -16,7 +16,10 @@ const os = require('os');
 const path = require('path');
 const childProcess = require('child_process');
 const herdrDefault = require('./herdr-exec');
-const { buildReviewPrompt } = require('./prompts');
+const {
+    buildReviewPrompt,
+    buildApexReviewPrompt,
+} = require('./prompts');
 
 function loadConfig() {
     const configPath = path.join(os.homedir(), '.enzobot-runner.json');
@@ -78,7 +81,7 @@ async function executeJob(
         return { posted: true };
     }
 
-    if (job.kind === 'review') {
+    if (job.kind === 'review' || job.kind === 'apex_review') {
         const directory = path.join(config.jobsDir, String(job.id));
         fs.mkdirSync(directory, { recursive: true });
         const resultPath = path.join(directory, 'result.md');
@@ -86,13 +89,18 @@ async function executeJob(
 
         const workspaceId = herdr.ensureWorkspace();
         const { paneId } = herdr.createJobPane(workspaceId, {
-            label: `review-${payload.pr}`,
+            label: job.kind === 'apex_review'
+                ? `apex-review-${payload.pr}`
+                : `review-${payload.pr}`,
             cwd: checkout,
         });
         herdr.startAgent(paneId, config.cliCommand);
+        const prompt = job.kind === 'apex_review'
+            ? buildApexReviewPrompt(payload, resultPath)
+            : buildReviewPrompt(payload, resultPath, checkout);
         herdr.submitTask(
             paneId,
-            buildReviewPrompt(payload, resultPath, checkout)
+            prompt
         );
         herdr.waitDone(paneId, config.jobTimeoutMs);
 

@@ -26,4 +26,16 @@ function buildReviewPrompt(payload, resultPath, checkoutPath) {
     ].join('\n');
 }
 
-module.exports = { buildReviewPrompt };
+function buildApexReviewPrompt(payload, resultPath) {
+    return [
+        `Review pull request ${payload.repo}#${payload.pr} (${payload.url}).`,
+        'Run the /apex-review skill on it. It reviews in an isolated worktree and never posts.',
+        "From apex-review's findings, keep only must-fix + high-confidence items.",
+        `Write the final review as GitHub-flavored markdown to: ${resultPath}`,
+        '(verdict line, then ## Blocking / ## Suggestions / ## Nits — omit empty sections).',
+        `Write a one-line summary (counts) to ${resultPath}.summary. Then print RESULT_READY.`,
+        'Do NOT post anything to GitHub. Draft only.',
+    ].join('\n');
+}
+
+module.exports = { buildReviewPrompt, buildApexReviewPrompt };
