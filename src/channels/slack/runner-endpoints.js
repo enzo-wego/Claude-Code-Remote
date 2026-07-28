@@ -15,51 +15,59 @@ function tokenOk(req, token) {
 }
 
 function makeRunnerHandlers({ jobs, token, onResult }) {
+    // `jobs` may be a thunk. The daily restart closes the SQLite handle and
+    // _initDb() builds a new Jobs instance; a handler that captured the old one
+    // would keep running prepared statements bound to a closed connection.
+    const getJobs = typeof jobs === 'function' ? jobs : () => jobs;
+
+    // Express 4 ignores a rejected promise from an async handler, so a throw in
+    // here leaves the request hanging with no response instead of failing. The
+    // Mac runner polls with no fetch timeout, so one hang stops it permanently —
+    // always answer, even when the answer is 500.
+    const guard = handler => async (req, res) => {
+        if (!tokenOk(req, token)) {
+            return res.status(401).json({ error: 'bad token' });
+        }
+        try {
+            return await handler(req, res);
+        } catch (err) {
+            return res.status(500).json({ error: err.message });
+        }
+    };
+
     return {
-        async lease(req, res) {
-            if (!tokenOk(req, token)) {
-                return res.status(401).json({ error: 'bad token' });
-            }
-            const job = jobs.lease((req.body && req.body.target) || 'mac');
+        lease: guard(async (req, res) => {
+            const job = getJobs().lease((req.body && req.body.target) || 'mac');
             return res.json({ job: job || null });
-        },
+        }),
 
-        async complete(req, res) {
-            if (!tokenOk(req, token)) {
-                return res.status(401).json({ error: 'bad token' });
-            }
+        complete: guard(async (req, res) => {
             const { job_id, lease_id, result } = req.body || {};
-            const ok = jobs.complete(job_id, lease_id, result || {});
-            if (ok && onResult) await onResult(jobs.get(job_id));
+            const ok = getJobs().complete(job_id, lease_id, result || {});
+            if (ok && onResult) await onResult(getJobs().get(job_id));
             return res.json({ ok });
-        },
+        }),
 
-        async fail(req, res) {
-            if (!tokenOk(req, token)) {
-                return res.status(401).json({ error: 'bad token' });
-            }
+        fail: guard(async (req, res) => {
             const { job_id, lease_id, error } = req.body || {};
             return res.json({
-                ok: jobs.fail(job_id, lease_id, error || 'unknown'),
+                ok: getJobs().fail(job_id, lease_id, error || 'unknown'),
             });
-        },
+        }),
 
-        async enqueue(req, res) {
-            if (!tokenOk(req, token)) {
-                return res.status(401).json({ error: 'bad token' });
-            }
+        enqueue: guard(async (req, res) => {
             const { kind, payload, dedupe_key, target } = req.body || {};
             if (!kind || !payload) {
                 return res.status(400).json({
                     error: 'kind and payload required',
                 });
             }
-            const row = jobs.enqueue(kind, payload, {
+            const row = getJobs().enqueue(kind, payload, {
                 dedupeKey: dedupe_key || null,
                 target: target || 'mac',
             });
             return res.json({ job: row, deduped: row === null });
-        },
+        }),
     };
 }
 

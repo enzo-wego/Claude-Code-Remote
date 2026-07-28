@@ -6785,7 +6785,9 @@ ${formatted}`,
         // Entity Plan D: Mac-runner queue endpoints (token-authed).
         const { makeRunnerHandlers } = require('./runner-endpoints');
         const runnerHandlers = makeRunnerHandlers({
-            jobs: this.jobs,
+            // Resolved per request, not captured: _initDb() replaces this.jobs
+            // on every daily restart.
+            jobs: () => this.jobs,
             token: process.env.RUNNER_TOKEN || '',
             onResult: (job) => this._onJobResult(job),
         });
