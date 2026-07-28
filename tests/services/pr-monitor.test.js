@@ -4,6 +4,7 @@ const {
     fetchPrState,
     mapCiState,
     refreshAll,
+    sweepReviewRequests,
 } = require('../../src/services/pr-monitor');
 
 const createTasks = () => new PrTasks(new Database(':memory:'));
@@ -138,5 +139,58 @@ describe('closed PRs leave the board', () => {
         });
         // Another reviewer being pending is not my queue.
         expect(mine.reviewState).toBe('none');
+    });
+});
+
+describe('sweepReviewRequests', () => {
+    afterEach(() => { jest.restoreAllMocks(); });
+
+    test('seeds PRs awaiting review from the GitHub search API', async () => {
+        const tasks = createTasks();
+        jest.spyOn(global, 'fetch').mockResolvedValueOnce({
+            ok: true,
+            json: async () => ({
+                items: [
+                    {
+                        html_url: 'https://github.com/wego/payments/pull/412',
+                        title: 'Fix refund flow',
+                        user: { login: 'sarah' },
+                    },
+                    { html_url: 'https://not-a-pr.example/x', title: 'ignore me' },
+                ],
+            }),
+        });
+
+        const seeded = await sweepReviewRequests(tasks, 'token');
+
+        expect(seeded).toHaveLength(1);
+        expect(tasks.listActive()).toHaveLength(1);
+        expect(tasks.listActive()[0]).toEqual(expect.objectContaining({
+            repo: 'wego/payments',
+            number: 412,
+            review_state: 'requested',
+            origin: 'github-sweep',
+        }));
+    });
+
+    test('does not resurrect a PR the owner already dismissed', async () => {
+        const tasks = createTasks();
+        const task = tasks.upsert({ repo: 'wego/payments', number: 412, url: 'u' });
+        tasks.setStatus(task.id, 'dismissed');
+
+        jest.spyOn(global, 'fetch').mockResolvedValueOnce({
+            ok: true,
+            json: async () => ({
+                items: [{
+                    html_url: 'https://github.com/wego/payments/pull/412',
+                    title: 'Fix refund flow',
+                    user: { login: 'sarah' },
+                }],
+            }),
+        });
+        await sweepReviewRequests(tasks, 'token');
+
+        expect(tasks.get(task.id).status).toBe('dismissed');
+        expect(tasks.listActive()).toHaveLength(0);
     });
 });

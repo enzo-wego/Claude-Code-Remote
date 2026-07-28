@@ -11,7 +11,10 @@ const dotenv = require('dotenv');
 const Logger = require('./src/core/logger');
 const SlackSocketHandler = require('./src/channels/slack/socket');
 const { runDailySummary, parseChannelsConfig } = require('./src/services/daily-summary');
-const { refreshAll } = require('./src/services/pr-monitor');
+const {
+    refreshAll,
+    sweepReviewRequests,
+} = require('./src/services/pr-monitor');
 const { handlePrAction } = require('./src/channels/slack/pr-actions');
 const { SsoPrewarm } = require('./src/services/sso-prewarm');
 const { BqHealthMonitor } = require('./src/services/bq-health');
@@ -265,6 +268,22 @@ function scheduleDailySummary(time) {
 async function runPrMonitor() {
     // Scope "is a review still requested" to the owner, not any reviewer.
     const viewerLogin = await handler._githubViewerLogin().catch(() => null);
+
+    // Discover PRs awaiting review from GitHub itself, so the board is not
+    // limited to PRs that happened to be pasted into Slack. Never let a failed
+    // sweep (rate limit, transient 5xx) skip the refresh below.
+    try {
+        const seeded = await sweepReviewRequests(
+            handler.prTasks,
+            config.githubToken
+        );
+        if (seeded.length) {
+            logger.info(`PR sweep: ${seeded.length} PR(s) awaiting your review`);
+        }
+    } catch (err) {
+        logger.warn(`PR sweep failed: ${err.message}`);
+    }
+
     const ready = await refreshAll(
         handler.prTasks,
         config.githubToken,

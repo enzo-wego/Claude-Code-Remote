@@ -97,6 +97,40 @@ async function fetchViewerLogin(token) {
     return viewer.login;
 }
 
+/**
+ * Discover PRs awaiting the owner's review straight from GitHub.
+ *
+ * Without this the board only ever learns about PRs that happen to be pasted
+ * into Slack, so a fresh start (or any PR nobody linked) is invisible. Runs on
+ * every monitor cycle, so it also seeds the board immediately after a restart.
+ *
+ * upsert() never touches `status`, so a PR the owner already dismissed or
+ * finished stays retired instead of reappearing each sweep.
+ */
+async function sweepReviewRequests(prTasks, token) {
+    const query = 'is:pr is:open review-requested:@me archived:false draft:false';
+    const data = await githubJson(
+        `${GITHUB_API}/search/issues?q=${encodeURIComponent(query)}&per_page=50`,
+        token
+    );
+    const seeded = [];
+    for (const item of data.items || []) {
+        const match = String(item.html_url || '')
+            .match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+        if (!match) continue;
+        seeded.push(prTasks.upsert({
+            repo: match[1],
+            number: Number(match[2]),
+            url: item.html_url,
+            title: item.title || null,
+            author: item.user?.login || null,
+            reviewState: 'requested',
+            origin: 'github-sweep',
+        }));
+    }
+    return seeded;
+}
+
 async function refreshAll(prTasks, token, viewerLogin) {
     const readyBefore = new Set(
         prTasks.reviewReady().map(task => task.id)
@@ -136,4 +170,5 @@ module.exports = {
     fetchViewerLogin,
     mapCiState,
     refreshAll,
+    sweepReviewRequests,
 };
