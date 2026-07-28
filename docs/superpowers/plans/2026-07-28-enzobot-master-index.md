@@ -10,12 +10,22 @@ this file first, then the individual plan it points to. Execute plans in the ord
 
 | # | Plan file | Repo(s) touched | Depends on |
 |---|-----------|-----------------|------------|
-| 1 | `2026-07-18-enzobot-companion-v1.md` (Plan B) | Claude-Code-Remote | — |
-| 2 | `2026-07-23-enzobot-plan-d-mac-runner.md` (Plan D) | Claude-Code-Remote (+ Mac runner dir) | B |
-| 3 | `2026-07-28-enzobot-plan-e-night-cycle.md` (Plan E) | Claude-Code-Remote | B, D |
-| 4 | Enable (checklist in Plan B §11 + Plan D Task 8) | both machines' `.env` / config | B, D, E |
-| 5 | `2026-07-28-enzobot-plan-a-directives.md` (Plan A) | **agent-mem** (Go) | — (parallelizable) |
-| 6 | `2026-07-28-enzobot-plan-c-interrupts.md` (Plan C) | Claude-Code-Remote | B |
+| **1** | **`2026-07-28-enzobot-plan-h-home-task-board.md` (Plan H)** | Claude-Code-Remote | Plan B tasks 1,3,4,5,6 (agenda + collectors) |
+| 2 | `2026-07-18-enzobot-companion-v1.md` (Plan B) | Claude-Code-Remote | — |
+| 3 | `2026-07-23-enzobot-plan-d-mac-runner.md` (Plan D) | Claude-Code-Remote (+ Mac runner dir) | B |
+| 4 | `2026-07-28-enzobot-plan-e-night-cycle.md` (Plan E) | Claude-Code-Remote | B, D |
+| 5 | Enable (checklist in Plan B §11 + Plan D Task 8) | both machines' `.env` / config | B, D, E |
+| 6 | `2026-07-28-enzobot-plan-a-directives.md` (Plan A) | **agent-mem** (Go) | — (parallelizable) |
+| 7 | `2026-07-28-enzobot-plan-c-interrupts.md` (Plan C) | Claude-Code-Remote | B |
+
+**Plan H is the new Step 1 (human-in-the-loop task board).** It builds the shared task board
+on the Home tab — you and EnzoBot co-define tasks, you accept/reject its suggestions and
+manually add/status your own — BEFORE any autonomy. It reuses Plan B's agenda store + collectors
+(build those five tasks as part of H), and validates that EnzoBot picks the right work before
+Plans D/E ever act unattended. When Plan B's companion/brief later lands, it reads/writes the
+SAME agenda table, so the board and the brief stay in sync automatically.
+
+**Provider APIs:** Plan H adds **none** — pure HTTP collectors + SQLite + Block Kit.
 
 Plan A is in a **different repository** (`agent-mem`, Go). It has no code dependency on B/D/E
 and can be executed in parallel by a separate worker. Everything else is in this repo

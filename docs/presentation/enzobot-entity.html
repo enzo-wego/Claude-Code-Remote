@@ -359,12 +359,16 @@ superseded rules stay addressable, never deleted. Agenda items point into the wo
  SENSES  →  🅒 tiered interrupts           ──┘
             └── Enable: creds + flags on both machines ──────────┘
 
- order:  B ──→ D ──→ E ──→ Enable        A ∥ (parallel, other repo)     C (after B)
-         └── Claude-Code-Remote (Node) ──┘   └─ agent-mem (Go) ─┘   └─ this repo ─┘</code></pre>
+ order:  H ──→ B ──→ D ──→ E ──→ Enable    A ∥ (parallel, other repo)     C (after B)
+         └───── Claude-Code-Remote (Node) ─────┘  └─ agent-mem (Go) ─┘  └ this repo ┘
+
+ STEP 1 = 🅗 Home task board: you + EnzoBot co-define tasks on the Home tab,
+          you accept/reject its suggestions + add your own — BEFORE any autonomy.</code></pre>
 
 <div class="scroll"><table>
   <tr><th>Plan</th><th>Repo</th><th>Provider API in our code?</th><th>Handoff file</th></tr>
   <tr><td>Index</td><td>—</td><td>—</td><td><code>plans/2026-07-28-enzobot-master-index.md</code></td></tr>
+  <tr><td><b>🅗 Home task board (Step 1)</b></td><td>Claude-Code-Remote</td><td>No — HTTP collectors only</td><td><code>plans/2026-07-28-enzobot-plan-h-home-task-board.md</code></td></tr>
   <tr><td>🅑 Companion</td><td>Claude-Code-Remote</td><td>No — companion session does the thinking</td><td><code>plans/2026-07-18-enzobot-companion-v1.md</code></td></tr>
   <tr><td>🅓 Mac runner</td><td>Claude-Code-Remote</td><td>No — Claude Code in herdr pane reviews</td><td><code>plans/2026-07-23-enzobot-plan-d-mac-runner.md</code></td></tr>
   <tr><td>🅔 Night cycle</td><td>Claude-Code-Remote</td><td>No — reasoning in companion; quota is arithmetic</td><td><code>plans/2026-07-28-enzobot-plan-e-night-cycle.md</code></td></tr>
@@ -384,6 +388,7 @@ Each handoff <code>.md</code> states its repo + provider needs at the top, for a
 <div class="scroll"><table>
   <tr><th>Step</th><th>What</th><th>Status</th></tr>
   <tr><td><b>Spec</b></td><td>Design agreed &amp; written — <code>docs/superpowers/specs/2026-07-18-enzobot-entity-design.md</code></td><td><span class="tag done">✅ committed</span></td></tr>
+  <tr><td><b>Plan H</b> · Step 1 · ~1 d</td><td><b>Home task board</b> — you + EnzoBot co-define tasks on the Home tab (suggest → accept/reject, manual add/status). Human-in-the-loop gate before autonomy. Reuses Plan B's agenda + collectors — <code>plans/2026-07-28-enzobot-plan-h-home-task-board.md</code></td><td><span class="tag done">✅ plan ready</span> → build first</td></tr>
   <tr><td><b>Plan B</b> · ~1–2 d</td><td>Companion session + agenda + 08:30 brief + buttons + Slack/GitHub/Jira collectors — 11 TDD tasks, ships dark behind <code>COMPANION_ENABLED</code> — <code>plans/2026-07-18-enzobot-companion-v1.md</code></td><td><span class="tag done">✅ plan ready</span> → execute</td></tr>
   <tr><td><b>Plan D</b> · ~1–2 d</td><td>Mac execution plane: VPS jobs queue (leases) + launchd runner + herdr panes + auto-review draft→📤 — <code>plans/2026-07-23-enzobot-plan-d-mac-runner.md</code></td><td><span class="tag done">✅ plan ready</span> → execute after B</td></tr>
   <tr><td><b>Plan E</b> · ~1–2 d</td><td><strong>Night work cycle (the corrected core):</strong> 22:00 plan + quota check + ✅ confirm → overnight batch via the jobs queue (midnight whitelist skips confirm) → 06:00 report with results + your day's plan → nightly learning loop ("becoming Enzo")</td><td>to write, after D</td></tr>
@@ -404,6 +409,14 @@ declares a complexity budget (quota, max jobs, evidence required), the 06:00 rep
 grounding evaluator, and the nightly ratchet measures/improves the Entity itself.</p>
 
 <h3>Plan details — what we do · what you get · how we verify</h3>
+
+<h3 style="margin-top:2rem">🅗 Plan H — Home task board <span class="tag v1">Step 1 · plan ready · 6 tasks</span></h3>
+<div class="scroll"><table>
+  <tr><td>Build</td><td>Extend the agenda store (<code>origin</code> manual|suggested, statuses proposed/in_progress) · a pure board renderer for the Home tab · button + modal handlers (accept/reject/start/done/snooze, ➕ Add task modal) · 🔄 Suggest = run Slack/GitHub/Jira collectors → add tasks as <em>proposed</em>. Builds on the already-shipped Home tab v0. No companion, no autonomy.</td></tr>
+  <tr><td>Achieve</td><td>A shared task board you and EnzoBot co-manage: it suggests tasks from your sources, you <b>accept/reject</b> ("is it enough?"), you <b>add/edit/status</b> your own by hand. The human-in-the-loop validation gate — you confirm it picks the right work <em>before</em> any autonomy (D/E) is trusted.</td></tr>
+  <tr><td>Verify</td><td><b>Automated:</b> jest for agenda status transitions, board renderer (buttons per status), action handlers, add-task modal parse, suggest→proposed. <b>Live:</b> ➕ Add → task appears; ▶ Start → In progress; 🔄 Suggest → proposed rows from your real PRs/tickets → Accept/Reject works; non-owner sees only the minimal card.</td></tr>
+  <tr><td>Handoff</td><td><code>docs/superpowers/plans/2026-07-28-enzobot-plan-h-home-task-board.md</code></td></tr>
+</table></div>
 
 <h3 style="margin-top:2rem">🅑 Plan B — Companion + agenda + morning brief <span class="tag done">plan ready · 11 TDD tasks</span></h3>
 <div class="scroll"><table>
