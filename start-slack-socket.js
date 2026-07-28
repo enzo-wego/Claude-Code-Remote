@@ -263,7 +263,13 @@ function scheduleDailySummary(time) {
 }
 
 async function runPrMonitor() {
-    const ready = await refreshAll(handler.prTasks, config.githubToken);
+    // Scope "is a review still requested" to the owner, not any reviewer.
+    const viewerLogin = await handler._githubViewerLogin().catch(() => null);
+    const ready = await refreshAll(
+        handler.prTasks,
+        config.githubToken,
+        viewerLogin
+    );
     let dmChannel = null;
 
     for (const task of ready) {

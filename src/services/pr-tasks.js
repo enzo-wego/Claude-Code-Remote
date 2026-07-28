@@ -58,7 +58,7 @@ class PrTasks {
             get: db.prepare('SELECT * FROM pr_tasks WHERE id=?'),
             listActive: db.prepare(`
                 SELECT * FROM pr_tasks
-                WHERE status NOT IN ('posted','dismissed')
+                WHERE status NOT IN ('posted','dismissed','closed')
                 ORDER BY updated_at DESC
             `),
             reviewReady: db.prepare(`

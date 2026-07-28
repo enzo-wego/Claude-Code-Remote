@@ -50,7 +50,7 @@ async function githubJson(url, token) {
     return response.json();
 }
 
-async function fetchPrState({ repo, number, token }) {
+async function fetchPrState({ repo, number, token, viewerLogin }) {
     const pull = await githubJson(
         `${GITHUB_API}/repos/${repo}/pulls/${number}`,
         token
@@ -69,18 +69,23 @@ async function fetchPrState({ repo, number, token }) {
     const requestedReviewers = (pull.requested_reviewers || [])
         .map(reviewer => reviewer.login)
         .filter(Boolean);
-    const reviewState = requestedReviewers.length > 0
-        ? 'requested'
-        : pull.review_state === 'reviewed' || pull.reviewed === true
-            ? 'reviewed'
-            : 'none';
+    // GitHub drops you from requested_reviewers once you submit a review, so
+    // presence there is the signal. Scope it to the owner when we know who
+    // that is — another reviewer still being pending is not our business.
+    // (`pull.review_state` / `pull.reviewed` do not exist on this payload.)
+    const stillRequested = viewerLogin
+        ? requestedReviewers.includes(viewerLogin)
+        : requestedReviewers.length > 0;
 
     return {
         ci: mapCiState(checks),
-        reviewState,
+        reviewState: stillRequested ? 'requested' : 'none',
         title: pull.title || null,
         author: pull.user?.login || null,
         requestedReviewers,
+        // A PR that left GitHub's queue should leave the board too.
+        closed: pull.state === 'closed',
+        merged: Boolean(pull.merged_at),
     };
 }
 
@@ -92,7 +97,7 @@ async function fetchViewerLogin(token) {
     return viewer.login;
 }
 
-async function refreshAll(prTasks, token) {
+async function refreshAll(prTasks, token, viewerLogin) {
     const readyBefore = new Set(
         prTasks.reviewReady().map(task => task.id)
     );
@@ -102,7 +107,14 @@ async function refreshAll(prTasks, token) {
             repo: task.repo,
             number: task.number,
             token,
+            viewerLogin,
         });
+        if (state.closed) {
+            // Merged or closed on GitHub — the review is moot, so retire the
+            // card instead of leaving stale work on the board.
+            prTasks.setStatus(task.id, 'closed');
+            continue;
+        }
         prTasks.upsert({
             repo: task.repo,
             number: task.number,
