@@ -290,6 +290,48 @@ does the reading), not CPU-heavy. What genuinely needs your Mac is your repos, y
   <code>gh</code>).</b> Queue in between: sleep-proof, no ports on your laptop, no write creds on the VPS.</li>
 </ul>
 
+<h3>Graph engineering — the Entity as an AI Operating System</h3>
+<p class="muted">Pattern source: "Graph Engineering — The Karpathy Loop / Anthropic Playbook" (2026).
+Principle: <em>the graph is the spine of every component, not just memory</em> — and every
+important output must be traceable to an objective → plan → run → artifact → graph path →
+evaluator decision → bounded budget.</p>
+
+<div class="scroll"><table>
+  <tr><th>Plane</th><th>In the Entity</th></tr>
+  <tr><td>Control</td><td>EnzoBot service + companion (VPS): receives objectives (messages, schedules), plans, allocates quota budgets, decides when to stop</td></tr>
+  <tr><td>Execution</td><td>herdr panes (Mac) + tmux sessions (VPS) — isolated runs, watchable</td></tr>
+  <tr><td>Artifact</td><td>Review drafts, briefs, night plans, results — versioned, referenced from the graph</td></tr>
+  <tr><td>Graph</td><td>agent-mem: entities, claims (directives), tasks (agenda/jobs), runs, provenance edges</td></tr>
+  <tr><td>Evaluation</td><td>Grounding check before the 06:00 report · tests-green gates · your taps · nightly ratchet metrics</td></tr>
+</table></div>
+
+<p><b>The message-to-work flow, with graph writes at every step:</b></p>
+<pre><code>Slack msg ─→ agent-mem ENRICHES (graph context: who/what/related)
+          ─→ companion DECIDES — decision recorded with DERIVED_FROM edges
+             to the message + the rules consulted ("why?" is answerable)
+          ─→ if action: TASK node on the queue (ABOUT→ entities, budget attached)
+Mac runner ─→ leases task → claude in herdr pane = AGENT RUN
+             (run —EXECUTES→ task, —PRODUCED→ artifact —ABOUT→ entity)
+          ─→ pushes status/result back (VPS never reaches in; failures kept — they teach)
+VPS       ─→ Home tab = a serialized subgraph view: tasks by state, runs,
+             artifacts, evaluations — a window onto the graph
+06:00     ─→ EVALUATOR grounds every report claim against evidence
+             (a ranked item cites its graph path; a "reviewed" claim cites its artifact)</code></pre>
+
+<p><b>The ratchet — the Entity optimizes itself, safely (nightly schedule):</b></p>
+<pre><code>measure  → interrupt precision · brief quality (did you do #1 first?)
+           · draft edit-distance · job success rate · quota efficiency
+propose  → ONE bounded change (a directive, a threshold, a ranking weight)
+apply    → directives/config auto-apply, reversible (SUPERSEDES edge = git reset)
+evaluate → next day's metrics: keep if improved, revert if worse
+leash    → code changes NEVER self-apply — they arrive as PR suggestions</code></pre>
+
+<p class="muted">Directive rules are Claims with provenance: <code>DERIVED_FROM</code> the episode
+where you taught them (or marked <em>inferred</em> when the night loop learned them),
+<code>APPLIES_TO</code> entities for scoped injection, <code>SUPERSEDES</code> for versioning —
+superseded rules stay addressable, never deleted. Agenda items point into the world
+(<code>ABOUT→</code> graph nodes) so the graph ranks them and closes them when the world changes.</p>
+
 <h3>Four memory layers</h3>
 <div class="cols">
   <div class="card"><p class="layer">World</p><h4>agent-mem graph</h4><p>Who/what relates to what — Slack, Jira, PRs, incidents. Live today.</p></div>
@@ -322,6 +364,14 @@ does the reading), not CPU-heavy. What genuinely needs your Mac is your repos, y
   <tr><td><span class="tag v15">v1.5</span></td><td>Tier-3 interrupt judgment · self-diagnosis → PR-fix drafts · Gmail collector · quota estimator upgraded from heuristic to measured usage</td><td>after tuning</td></tr>
   <tr><td><span class="tag v2">v2</span></td><td>Companion-orchestrated hands · per-repo auto-post whitelist (reviews without the tap) · directed ticket execution → PR</td><td>later</td></tr>
 </table></div>
+
+<p><b>Graph-engineering deltas folded into each plan</b> (all additive): Plan A — directives
+become Claims (provenance <code>DERIVED_FROM</code>, scoped <code>APPLIES_TO</code> injection,
+<code>SUPERSEDES</code> versioning, taught-vs-inferred marking). Plan B — agenda gains
+<code>graph_node_id</code>, graph-driven ranking and auto-close. Plan D — job completions push
+<code>run —PRODUCED→ artifact —ABOUT→ entity</code> edges to agent-mem. Plan E — the 22:00 plan
+declares a complexity budget (quota, max jobs, evidence required), the 06:00 report passes a
+grounding evaluator, and the nightly ratchet measures/improves the Entity itself.</p>
 
 <p class="muted">Repo docs are the source of truth: spec + plans under <code>docs/superpowers/</code>,
 this page under <code>docs/presentation/enzobot-entity.html</code>. Conversations above are
