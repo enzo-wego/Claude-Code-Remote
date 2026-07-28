@@ -4,6 +4,7 @@
  * app_home_opened event. Grows agenda / night-plan / Mac-jobs / rules
  * sections as Plans B/D/E land.
  */
+const { buildPrBoardBlocks } = require('./pr-board');
 
 function fmtDuration(ms) {
     const m = Math.floor(ms / 60000);
@@ -36,6 +37,7 @@ function buildHomeView(state) {
             type: 'context',
             elements: [{ type: 'mrkdwn', text: 'Repaints each time you open this tab' }],
         },
+        ...buildPrBoardBlocks(state.prTasks || []),
         {
             type: 'section',
             text: { type: 'mrkdwn', text: `*Service*  up ${fmtDuration(state.uptimeSec * 1000)} · Socket Mode connected` },

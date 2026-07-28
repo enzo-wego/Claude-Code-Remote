@@ -84,6 +84,14 @@ async function fetchPrState({ repo, number, token }) {
     };
 }
 
+async function fetchViewerLogin(token) {
+    const viewer = await githubJson(`${GITHUB_API}/user`, token);
+    if (!viewer.login) {
+        throw new Error('GitHub /user response did not include login');
+    }
+    return viewer.login;
+}
+
 async function refreshAll(prTasks, token) {
     const readyBefore = new Set(
         prTasks.reviewReady().map(task => task.id)
@@ -111,4 +119,9 @@ async function refreshAll(prTasks, token) {
         .filter(task => !readyBefore.has(task.id));
 }
 
-module.exports = { fetchPrState, mapCiState, refreshAll };
+module.exports = {
+    fetchPrState,
+    fetchViewerLogin,
+    mapCiState,
+    refreshAll,
+};

@@ -11,6 +11,8 @@ const dotenv = require('dotenv');
 const Logger = require('./src/core/logger');
 const SlackSocketHandler = require('./src/channels/slack/socket');
 const { runDailySummary, parseChannelsConfig } = require('./src/services/daily-summary');
+const { refreshAll } = require('./src/services/pr-monitor');
+const { handlePrAction } = require('./src/channels/slack/pr-actions');
 const { SsoPrewarm } = require('./src/services/sso-prewarm');
 const { BqHealthMonitor } = require('./src/services/bq-health');
 const { CredentialHealthMonitor } = require('./src/services/credential-health');
@@ -102,6 +104,13 @@ const config = {
     dailySummaryModel: process.env.DAILY_SUMMARY_MODEL || 'sonnet',
     xoxcToken: process.env.SLACK_XOXC_TOKEN || '',
     xoxdToken: process.env.SLACK_XOXD_TOKEN || '',
+    // Entity Plan H: PR review board.
+    prBoardEnabled: process.env.PR_BOARD_ENABLED === 'true',
+    githubToken: process.env.GITHUB_TOKEN || '',
+    prMonitorIntervalMin: Number(
+        process.env.PR_MONITOR_INTERVAL_MIN || 15
+    ),
+    prAutoReview: process.env.PR_AUTO_REVIEW === 'true',
     // App mode: 'local' (mentions only), 'cloud' (monitors + summary only), 'all' (everything)
     appMode: (process.env.APP_MODE || 'all').toLowerCase(),
     // SSO pre-warm (keeps the local SSO credential server's token hot so
@@ -229,6 +238,47 @@ function scheduleDailySummary(time) {
     scheduleNext();
 }
 
+async function runPrMonitor() {
+    const ready = await refreshAll(handler.prTasks, config.githubToken);
+    let dmChannel = null;
+
+    for (const task of ready) {
+        let autoReview = '';
+        if (config.prAutoReview) {
+            autoReview = await handlePrAction({
+                actionId: 'pr_review_now',
+                value: String(task.id),
+                prTasks: handler.prTasks,
+                jobs: handler.jobs,
+            });
+        }
+
+        if (config.ownerUserId) {
+            if (!dmChannel) {
+                const dm = await handler.app.client.conversations.open({
+                    users: config.ownerUserId,
+                });
+                dmChannel = dm.channel.id;
+            }
+            const lines = [
+                `:large_green_circle: *${task.repo}#${task.number} is review-ready*`,
+                'CI is green and your review is still requested.',
+            ];
+            if (autoReview) lines.push(autoReview);
+            await handler.app.client.chat.postMessage({
+                channel: dmChannel,
+                text: lines.join('\n'),
+                unfurl_links: false,
+                unfurl_media: false,
+            });
+        }
+    }
+
+    if (config.ownerUserId) {
+        await handler._publishHome(config.ownerUserId);
+    }
+}
+
 async function start() {
     logger.info('Starting Slack Socket Mode server...');
     logger.info('Configuration:');
@@ -255,6 +305,7 @@ async function start() {
     logger.info(`- Delay Alert CLI chain: ${config.delayAlertCliChain.join(' → ')}`);
     logger.info(`- Delay Alert Threshold: ${config.delayAlertThreshold} alerts in ${config.delayAlertWindowMs}ms`);
     logger.info(`- Daily Summary: ${config.dailySummaryChannels ? `${config.dailySummaryTime} → ${config.dailySummaryChannels}` : 'Not configured'}`);
+    logger.info(`- PR Review Board: ${config.prBoardEnabled ? `every ${config.prMonitorIntervalMin}m${config.prAutoReview ? ' · auto-draft' : ''}` : 'Disabled'}`);
     logger.info(`- App Mode: ${config.appMode}`);
     logger.info(`- SSO Pre-warm: ${config.ssoPrewarmEnabled ? `${config.ssoPrewarmProfiles.join(', ')} every ${config.ssoPrewarmIntervalMs}ms via ${config.ssoPrewarmUrl}` : 'Disabled'}`);
     logger.info(`- BQ Health Monitor: ${config.bqHealthEnabled ? `every ${config.bqHealthIntervalMs}ms (timeout ${config.bqHealthTimeoutMs}ms)` : 'Disabled'}`);
@@ -320,6 +371,22 @@ async function start() {
     // Schedule daily summary if configured (skip in local mode)
     if (config.dailySummaryChannels && config.appMode !== 'local') {
         scheduleDailySummary(config.dailySummaryTime);
+    }
+
+    if (config.prBoardEnabled) {
+        if (!config.githubToken) {
+            logger.warn('PR review board enabled without GITHUB_TOKEN; monitor disabled');
+        } else {
+            handler.prMonitorInterval = setInterval(() => {
+                runPrMonitor().catch(err =>
+                    logger.error(`PR monitor failed: ${err.message}`)
+                );
+            }, config.prMonitorIntervalMin * 60_000);
+            handler.prMonitorInterval.unref();
+            logger.info(
+                `PR monitor scheduled every ${config.prMonitorIntervalMin}m`
+            );
+        }
     }
 
     // SSO pre-warm — only on instances that handle PD alerts (cloud/all).
@@ -392,6 +459,9 @@ start().catch((error) => {
 // Handle graceful shutdown
 function shutdown() {
     logger.info('Shutting down Slack Socket Mode server...');
+    if (handler.prMonitorInterval) {
+        clearInterval(handler.prMonitorInterval);
+    }
     if (handler.ssoPrewarm) handler.ssoPrewarm.stop();
     if (handler.bqHealth) handler.bqHealth.stop();
     if (handler.gwsHealth) handler.gwsHealth.stop();

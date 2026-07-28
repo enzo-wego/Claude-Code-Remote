@@ -78,7 +78,10 @@ async function executeJob(
             encoding: 'utf8',
             timeout: 60_000,
         });
-        return { posted: true };
+        return {
+            posted: true,
+            review_url: `https://github.com/${payload.repo}/pull/${payload.pr}`,
+        };
     }
 
     if (job.kind === 'review' || job.kind === 'apex_review') {

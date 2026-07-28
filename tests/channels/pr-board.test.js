@@ -1,4 +1,7 @@
-const { buildPrBoardBlocks } = require('../../src/channels/slack/pr-board');
+const {
+    buildPrBoardBlocks,
+    buildPrDraftResultBlocks,
+} = require('../../src/channels/slack/pr-board');
 
 describe('buildPrBoardBlocks', () => {
     test('renders PR identity, CI/review/status, and status-specific controls', () => {
@@ -61,5 +64,31 @@ describe('buildPrBoardBlocks', () => {
                 { actionId: 'pr_discard', value: '3' },
             ],
         ]);
+    });
+});
+
+describe('buildPrDraftResultBlocks', () => {
+    test('renders draft content with PR-specific Post/Edit/Discard buttons', () => {
+        const blocks = buildPrDraftResultBlocks({
+            id: 3,
+            repo: 'wego/payments',
+            number: 413,
+            url: 'https://github.com/wego/payments/pull/413',
+            title: 'Guard signed discounts',
+        }, {
+            result_json: JSON.stringify({
+                summary: '1 blocking',
+                body_md: '## Blocking\n- Fix this',
+            }),
+        });
+        const actions = blocks.find(block => block.type === 'actions');
+        expect(actions.elements.map(element => element.action_id)).toEqual([
+            'pr_post',
+            'pr_edit',
+            'pr_discard',
+        ]);
+        expect(actions.elements.every(element => element.value === '3')).toBe(true);
+        expect(JSON.stringify(blocks)).toContain('1 blocking');
+        expect(JSON.stringify(blocks)).toContain('Fix this');
     });
 });

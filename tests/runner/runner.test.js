@@ -76,6 +76,9 @@ describe('executeJob', () => {
             expect.anything()
         );
         expect(result.posted).toBe(true);
+        expect(result.review_url).toBe(
+            'https://github.com/wego/payments/pull/412'
+        );
     });
 
     test('apex_review job runs apex-review in a pane and reads the draft', async () => {

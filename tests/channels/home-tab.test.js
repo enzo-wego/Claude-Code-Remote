@@ -13,6 +13,16 @@ describe('buildHomeView', () => {
             ],
             queue: { pending: 0, processing: 1 },
             schedules: { dailySummaryTime: '07:00' },
+            prTasks: [{
+                id: 1,
+                repo: 'wego/payments',
+                number: 412,
+                url: 'https://github.com/wego/payments/pull/412',
+                title: 'Fix tax rounding',
+                ci: 'green',
+                review_state: 'requested',
+                status: 'needs_review',
+            }],
             now,
         });
         expect(view.type).toBe('home');
@@ -25,6 +35,17 @@ describe('buildHomeView', () => {
         expect(text).toContain('1 processing');
         expect(text).toContain('07:00');
         expect(text).toContain('Coming soon');
+        expect(text).toContain('PR Review Board');
+        expect(text).toContain('Fix tax rounding');
+        const boardIndex = view.blocks.findIndex(block =>
+            block.type === 'header'
+            && block.text.text === 'PR Review Board'
+        );
+        const serviceIndex = view.blocks.findIndex(block =>
+            block.type === 'section'
+            && block.text.text.startsWith('*Service*')
+        );
+        expect(boardIndex).toBeLessThan(serviceIndex);
     });
 
     test('non-owner gets the minimal view with no internals', () => {

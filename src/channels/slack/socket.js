@@ -20,6 +20,15 @@ const DelayAlertMonitor = require('./delay-alert-monitor');
 const { AccessControl } = require('./access-control');
 const { buildHomeView } = require('./home-tab');
 const { buildReviewResultBlocks, handleJobAction } = require('./job-results');
+const {
+    buildPrDraftResultBlocks,
+} = require('./pr-board');
+const { handlePrAction } = require('./pr-actions');
+const { extractPrUrls, needsMyReview } = require('../../services/pr-detect');
+const {
+    fetchPrState,
+    fetchViewerLogin,
+} = require('../../services/pr-monitor');
 const { runDailySummary, parseChannelsConfig } = require('../../services/daily-summary');
 const { getCliAdapter, adapterNames } = require('../../cli');
 const graphIngest = require('../../graph-ingest');
@@ -1619,6 +1628,75 @@ ${formatted}`,
         }
     }
 
+    async _publishHome(userId = this.config.ownerUserId) {
+        if (!userId) return;
+        const view = buildHomeView(this._collectHomeState(userId));
+        await this.app.client.views.publish({ user_id: userId, view });
+    }
+
+    async _githubViewerLogin() {
+        if (!this._githubViewerLoginPromise) {
+            const token = this.config.githubToken
+                || process.env.GITHUB_TOKEN
+                || '';
+            this._githubViewerLoginPromise = fetchViewerLogin(token);
+        }
+        return this._githubViewerLoginPromise;
+    }
+
+    async _detectPrsFromMessage(event) {
+        if (!this.config.prBoardEnabled) return [];
+        if (event.subtype || event.bot_id || typeof event.text !== 'string') {
+            return [];
+        }
+        const urls = extractPrUrls(event.text);
+        if (urls.length === 0) return [];
+
+        const token = this.config.githubToken
+            || process.env.GITHUB_TOKEN
+            || '';
+        if (!token) {
+            this.logger.warn('PR board detection skipped: GITHUB_TOKEN is not configured');
+            return [];
+        }
+
+        const me = await this._githubViewerLogin();
+        const detected = [];
+        for (const pull of urls) {
+            try {
+                const state = await fetchPrState({
+                    repo: pull.repo,
+                    number: pull.number,
+                    token,
+                });
+                if (!needsMyReview({
+                    requestedReviewers: state.requestedReviewers,
+                    me,
+                    codeowner: state.codeowner,
+                })) {
+                    continue;
+                }
+                detected.push(this.prTasks.upsert({
+                    ...pull,
+                    title: state.title,
+                    author: state.author,
+                    ci: state.ci,
+                    reviewState: state.reviewState,
+                    origin: 'slack',
+                }));
+            } catch (err) {
+                this.logger.warn(
+                    `PR detection failed for ${pull.repo}#${pull.number}: ${err.message}`
+                );
+            }
+        }
+
+        if (detected.length > 0 && this.config.ownerUserId) {
+            await this._publishHome(this.config.ownerUserId);
+        }
+        return detected;
+    }
+
     async _onJobResult(job) {
         try {
             if (!this.config.ownerUserId) return;
@@ -1633,6 +1711,26 @@ ${formatted}`,
                     unfurl_links: false,
                     unfurl_media: false,
                 });
+            } else if (job.kind === 'apex_review') {
+                const task = this.prTasks.listActive().find(
+                    row => Number(row.draft_job_id) === Number(job.id)
+                );
+                if (!task) {
+                    this.logger.warn(
+                        `apex review job ${job.id} has no linked active PR task`
+                    );
+                    return;
+                }
+                this.prTasks.setStatus(task.id, 'drafted');
+                const drafted = this.prTasks.get(task.id);
+                await this.app.client.chat.postMessage({
+                    channel: dm.channel.id,
+                    text: `Apex review draft ready for ${task.repo}#${task.number}`,
+                    blocks: buildPrDraftResultBlocks(drafted, job),
+                    unfurl_links: false,
+                    unfurl_media: false,
+                });
+                await this._publishHome(this.config.ownerUserId);
             } else if (job.kind === 'post_review') {
                 const result = JSON.parse(job.result_json || '{}');
                 await this.app.client.chat.postMessage({
@@ -1714,6 +1812,16 @@ ${formatted}`,
                             }
                         }
                         return;
+                    }
+
+                    // Entity Plan H: detect PR URLs without delaying the Slack
+                    // listener. GitHub failures are logged inside the task.
+                    if (this.config.prBoardEnabled) {
+                        this._detectPrsFromMessage(event).catch(err =>
+                            this.logger.warn(
+                                `PR message detection failed: ${err.message}`
+                            )
+                        );
                     }
 
                     // Handle @mentions that arrive as 'message' instead of 'app_mention'
@@ -1819,6 +1927,11 @@ ${formatted}`,
         for (const actionId of ['job_post_review', 'job_discard']) {
             this.app.action(actionId, async ({ ack, body, action }) => {
                 await ack();
+                const userId = body.user && body.user.id;
+                if (this.config.ownerUserId
+                    && userId !== this.config.ownerUserId) {
+                    return;
+                }
                 try {
                     const reply = await handleJobAction({
                         actionId,
@@ -1837,12 +1950,53 @@ ${formatted}`,
             });
         }
 
+        const prActionIds = [
+            'pr_review_now',
+            'pr_post',
+            'pr_edit',
+            'pr_discard',
+            'pr_dismiss',
+        ];
+        for (const actionId of prActionIds) {
+            this.app.action(actionId, async ({ ack, body, action }) => {
+                await ack();
+                const userId = body.user && body.user.id;
+                if (this.config.ownerUserId
+                    && userId !== this.config.ownerUserId) {
+                    return;
+                }
+                try {
+                    const reply = await handlePrAction({
+                        actionId,
+                        value: action.value,
+                        prTasks: this.prTasks,
+                        jobs: this.jobs,
+                    });
+                    const dm = await this.app.client.conversations.open({
+                        users: userId || this.config.ownerUserId,
+                    });
+                    await this.app.client.chat.postMessage({
+                        channel: dm.channel.id,
+                        text: reply,
+                        unfurl_links: false,
+                        unfurl_media: false,
+                    });
+                    await this._publishHome(
+                        userId || this.config.ownerUserId
+                    );
+                } catch (err) {
+                    this.logger.error(
+                        `PR action ${actionId} failed: ${err.message}`
+                    );
+                }
+            });
+        }
+
         // Entity: App Home status board. Repaint whenever the user opens the tab.
         this.app.event('app_home_opened', async ({ event }) => {
             if (event.tab && event.tab !== 'home') return;
             try {
-                const view = buildHomeView(this._collectHomeState(event.user));
-                await this.app.client.views.publish({ user_id: event.user, view });
+                await this._publishHome(event.user);
             } catch (err) {
                 this.logger.warn(`home tab publish failed: ${err.message}`);
             }
@@ -1866,6 +2020,7 @@ ${formatted}`,
                 pending: this._queueStmts.countPending.get().count,
                 processing: this._queueStmts.countProcessing.get().count,
             },
+            prTasks: this.prTasks.listActive(),
             schedules: { dailySummaryTime: this.config.dailySummaryChannels ? this.config.dailySummaryTime : null },
         };
     }

@@ -87,4 +87,34 @@ function buildPrBoardBlocks(prTasks = []) {
     return blocks;
 }
 
-module.exports = { buildPrBoardBlocks };
+function buildPrDraftResultBlocks(task, jobRow) {
+    const result = JSON.parse(jobRow.result_json || '{}');
+    const title = task.title || `${task.repo}#${task.number}`;
+    const preview = (result.body_md || '').slice(0, 2500);
+    return [
+        {
+            type: 'section',
+            text: {
+                type: 'mrkdwn',
+                text: `*Apex review draft ready:* <${task.url}|${title}>\n_${result.summary || ''}_`,
+            },
+        },
+        {
+            type: 'section',
+            text: {
+                type: 'mrkdwn',
+                text: '```' + preview + '```',
+            },
+        },
+        {
+            type: 'actions',
+            elements: [
+                button('pr_post', '📤 Post', task.id, 'primary'),
+                button('pr_edit', '✏️ Edit', task.id),
+                button('pr_discard', '🗑 Discard', task.id, 'danger'),
+            ],
+        },
+    ];
+}
+
+module.exports = { buildPrBoardBlocks, buildPrDraftResultBlocks };
