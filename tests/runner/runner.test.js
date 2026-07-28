@@ -144,3 +144,49 @@ describe('herdr submitTask guards', () => {
             .toThrow(/single-line/);
     });
 });
+
+describe('tab naming', () => {
+    let jobsDir;
+    beforeEach(() => {
+        jobsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'label-'));
+    });
+
+    const run = async (payload) => {
+        const herdr = {
+            ensureWorkspace: jest.fn().mockReturnValue('wN'),
+            createJobPane: jest.fn().mockReturnValue({ paneId: 'wN:p2' }),
+            startAgent: jest.fn(),
+            submitTask: jest.fn(),
+            waitDone: jest.fn(() => {
+                const dir = path.join(jobsDir, '9');
+                fs.writeFileSync(path.join(dir, 'result.md'), 'ok');
+            }),
+            readTail: jest.fn().mockReturnValue(''),
+        };
+        await executeJob(
+            { id: 9, kind: 'apex_review', payload_json: JSON.stringify(payload) },
+            { jobsDir, repoRoot: '/tmp', repoMap: { [payload.repo]: '/tmp' }, cliCommand: 'claude' },
+            herdr
+        );
+        return herdr.createJobPane.mock.calls[0][1].label;
+    };
+
+    test('uses the Jira key from the PR title', async () => {
+        expect(await run({
+            repo: 'wego/payments', pr: 2210,
+            title: 'PAY-2225: add webhook/checkout/cron observability counters',
+        })).toBe('PAY-2225-pr2210');
+    });
+
+    test('falls back to the repo when the title carries no key', async () => {
+        expect(await run({
+            repo: 'wego/payments-knowledge', pr: 6,
+            title: 'apex-review: use fresh refs for cross-repo checks',
+        })).toBe('payments-knowledge-pr6');
+    });
+
+    test('survives a payload with no title at all', async () => {
+        expect(await run({ repo: 'wego/wego-docs', pr: 793 }))
+            .toBe('wego-docs-pr793');
+    });
+});

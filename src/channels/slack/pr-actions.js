@@ -13,6 +13,8 @@ async function handlePrAction({
                 repo: task.repo,
                 pr: task.number,
                 url: task.url,
+                // Carries the Jira key, which becomes the herdr tab name.
+                title: task.title,
             }, {
                 dedupeKey: `apex_review:${task.repo}#${task.number}`,
             });

@@ -46,6 +46,17 @@ function repoPath(config, repo) {
 }
 
 /**
+ * Tab label for a review pane. Every review shares the one `enzobot` workspace,
+ * so the tab name is the only thing distinguishing them — and the Jira key is
+ * how you recognise your own work. Falls back to the repo for PRs whose title
+ * carries no key (`ci: …`, `docs(e2e): …`).
+ */
+function jobLabel(repo, pr, title) {
+    const key = /\b([A-Z][A-Z0-9]+-\d+)\b/.exec(String(title || ''));
+    return `${key ? key[1] : String(repo).split('/').pop()}-pr${pr}`;
+}
+
+/**
  * Execute one leased job. The herdr adapter and execFileSync are injectable
  * so routing remains unit-testable without touching a live workspace.
  */
@@ -115,9 +126,7 @@ async function executeJob(
 
         const workspaceId = herdr.ensureWorkspace();
         const { paneId } = herdr.createJobPane(workspaceId, {
-            label: job.kind === 'apex_review'
-                ? `apex-review-${payload.pr}`
-                : `review-${payload.pr}`,
+            label: jobLabel(payload.repo, payload.pr, payload.title),
             cwd: checkout,
         });
         herdr.startAgent(paneId, config.cliCommand);

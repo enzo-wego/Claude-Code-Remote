@@ -32,6 +32,8 @@ describe('handlePrAction', () => {
             repo: 'wego/payments',
             pr: 412,
             url: 'https://github.com/wego/payments/pull/412',
+            // Rides along so the Mac can name the herdr tab after the ticket.
+            title: 'Fix tax rounding',
         });
         expect(prTasks.get(task.id)).toEqual(expect.objectContaining({
             status: 'reviewing',
