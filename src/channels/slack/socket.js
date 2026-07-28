@@ -1616,6 +1616,10 @@ ${formatted}`,
         }
     }
 
+    async _onJobResult(job) {
+        this.logger.info(`job ${job.id} done`);
+    }
+
     _setupListeners() {
         const mode = this.config.appMode || 'all';
 
@@ -6351,6 +6355,18 @@ ${formatted}`,
                 deliveryChannelId: this.config.channelId,
             }).catch(err => this.logger.error(`Daily summary error: ${err.message}`));
         });
+
+        // Entity Plan D: Mac-runner queue endpoints (token-authed).
+        const { makeRunnerHandlers } = require('./runner-endpoints');
+        const runnerHandlers = makeRunnerHandlers({
+            jobs: this.jobs,
+            token: process.env.RUNNER_TOKEN || '',
+            onResult: (job) => this._onJobResult(job),
+        });
+        httpApp.post('/runner/lease', (req, res) => runnerHandlers.lease(req, res));
+        httpApp.post('/runner/complete', (req, res) => runnerHandlers.complete(req, res));
+        httpApp.post('/runner/fail', (req, res) => runnerHandlers.fail(req, res));
+        httpApp.post('/jobs', (req, res) => runnerHandlers.enqueue(req, res));
 
         httpApp.get('/sso-status', (req, res) => {
             if (!this.ssoPrewarm) {
