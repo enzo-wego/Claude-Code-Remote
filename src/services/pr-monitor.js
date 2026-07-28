@@ -449,6 +449,25 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
                 prCreatedAt: state.createdAt,
                 isDraft: state.draft,
             });
+
+            // "Already approved" is the single most useful thing to know about
+            // a teammate's PR — it is the row you can skip. No viewerLogin here:
+            // unlike your own PRs, a review *you* left still counts, and seeing
+            // it is the point ("I already signed off on this one").
+            // Non-fatal: the decision is a decoration on the row. Losing it must
+            // not take the whole sweep down with it (mapLimit rejects on first
+            // throw), so keep whatever we recorded last time.
+            try {
+                const { decision, decisionBy } = await fetchReviewDecision({
+                    repo: task.repo,
+                    number: task.number,
+                    token,
+                });
+                prTasks.setDecision(task.id, {
+                    reviewDecision: decision,
+                    decisionBy,
+                });
+            } catch (_) { /* keep the previous decision */ }
         });
     }
 

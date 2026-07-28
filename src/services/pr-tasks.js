@@ -138,6 +138,14 @@ class PrTasks {
                     updated_at=@now
                 WHERE id=@id
             `),
+            // Decision without the comment watermark: the review/team lanes want
+            // "has anyone approved this" but must not touch seen_comments, which
+            // only the mine lane maintains.
+            setDecision: db.prepare(`
+                UPDATE pr_tasks
+                SET review_decision=?, decision_by=?, updated_at=?
+                WHERE id=?
+            `),
             getPref: db.prepare('SELECT value FROM board_prefs WHERE key=?'),
             setPref: db.prepare(`
                 INSERT INTO board_prefs (key, value) VALUES (?, ?)
@@ -217,6 +225,10 @@ class PrTasks {
             seenComments,
             now: Date.now(),
         });
+    }
+
+    setDecision(id, { reviewDecision = null, decisionBy = null }) {
+        this._s.setDecision.run(reviewDecision, decisionBy, Date.now(), id);
     }
 
     setDraftJob(id, jobId) {

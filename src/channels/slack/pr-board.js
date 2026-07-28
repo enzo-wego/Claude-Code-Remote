@@ -81,6 +81,16 @@ function ageOf(task, now = Date.now()) {
     return `${Math.floor(days / 7)}w`;
 }
 
+/** "approved @lei-wego", "changes requested @yanyi-wego", "no review". */
+function verdictOf(task) {
+    const who = task.decision_by ? ` @${task.decision_by}` : '';
+    return {
+        approved: `approved${who}`,
+        changes_requested: `changes requested${who}`,
+        commented: `commented${who}`,
+    }[task.review_decision] || 'no review';
+}
+
 function section(text, accessory) {
     const block = { type: 'section', text: { type: 'mrkdwn', text } };
     if (accessory) block.accessory = accessory;
@@ -119,10 +129,14 @@ function teamLaneBlocks(tasks) {
     );
 
     for (const task of oldestFirst) {
+        // Approval leads the row when there is one: an approved PR is the one
+        // you can scroll past, and that reads faster than a CI colour.
         blocks.push(row(task, {
-            glyph: ciGlyph(task),
+            glyph: DECISION_GLYPHS[task.review_decision] || ciGlyph(task),
             columns: [
                 `@${task.author || 'unknown'}`,
+                verdictOf(task),
+                `CI ${ciGlyph(task)}`,
                 task.review_state === 'requested' ? 'review requested' : '',
             ],
             accessory: overflow(task.id, [
@@ -184,20 +198,13 @@ function mineLaneBlocks(tasks) {
     }
 
     for (const task of tasks) {
-        const who = task.decision_by ? ` @${task.decision_by}` : '';
-        const verdict = {
-            approved: `approved${who}`,
-            changes_requested: `changes requested${who}`,
-            commented: `commented${who}`,
-        }[task.review_decision] || 'no review';
-
         const mergeable = task.review_decision === 'approved'
             && task.ci === 'green';
 
         blocks.push(row(task, {
             glyph: DECISION_GLYPHS[task.review_decision] || ciGlyph(task),
             columns: [
-                verdict,
+                verdictOf(task),
                 `CI ${ciGlyph(task)}`,
                 task.seen_comments ? `💬 ${task.seen_comments}` : '',
             ],

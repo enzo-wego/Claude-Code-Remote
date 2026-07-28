@@ -63,16 +63,24 @@ describe('refreshAll', () => {
                         { status: 'completed', conclusion: 'success' },
                     ],
                 }),
+            })
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => ([
+                    { user: { login: 'bob' }, state: 'APPROVED' },
+                ]),
             });
 
         const ready = await refreshAll(tasks, 'token');
 
-        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(fetchMock).toHaveBeenCalledTimes(3);
         expect(tasks.get(task.id)).toEqual(expect.objectContaining({
             ci: 'green',
             review_state: 'requested',
             title: 'Fix tax rounding',
             author: 'alice',
+            review_decision: 'approved',
+            decision_by: 'bob',
         }));
         expect(ready.map(row => row.id)).toEqual([task.id]);
     });

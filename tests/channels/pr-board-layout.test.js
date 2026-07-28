@@ -68,6 +68,30 @@ describe('table row shape', () => {
         expect(line).toContain('3d');
     });
 
+    test('an approved team PR leads with the approval glyph, not CI', () => {
+        const blocks = buildPrBoardBlocks([{
+            id: 1, lane: 'team', repo: 'wego/payments-knowledge', number: 6,
+            url: 'u', title: 'use fresh refs', author: 'yanyi-wego',
+            ci: 'pending', status: 'detected',
+            review_decision: 'approved', decision_by: 'lei-wego',
+        }]);
+        const line = blocks.find(b => b.accessory).text.text;
+        expect(line.startsWith('✅')).toBe(true);
+        expect(line).toContain('approved @lei-wego');
+        // CI is still visible, just demoted to a column.
+        expect(line).toContain('CI 🟡');
+    });
+
+    test('a team PR nobody has reviewed still leads with CI', () => {
+        const blocks = buildPrBoardBlocks([{
+            id: 1, lane: 'team', repo: 'a/b', number: 1, url: 'u',
+            title: 't', author: 'lei-wego', ci: 'red', status: 'detected',
+        }]);
+        const line = blocks.find(b => b.accessory).text.text;
+        expect(line.startsWith('🔴')).toBe(true);
+        expect(line).toContain('no review');
+    });
+
     test('long titles are truncated so rows stay one line', () => {
         const blocks = buildPrBoardBlocks([{
             id: 1, lane: 'team', repo: 'a/b', number: 1, url: 'u',
