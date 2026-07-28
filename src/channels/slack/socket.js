@@ -18,6 +18,7 @@ const AlertMonitor = require('./alert-monitor');
 const DelayAlertMonitor = require('./delay-alert-monitor');
 const { AccessControl } = require('./access-control');
 const { buildHomeView } = require('./home-tab');
+const { buildReviewResultBlocks, handleJobAction } = require('./job-results');
 const { runDailySummary, parseChannelsConfig } = require('../../services/daily-summary');
 const { getCliAdapter, adapterNames } = require('../../cli');
 const graphIngest = require('../../graph-ingest');
@@ -1617,7 +1618,33 @@ ${formatted}`,
     }
 
     async _onJobResult(job) {
-        this.logger.info(`job ${job.id} done`);
+        try {
+            if (!this.config.ownerUserId) return;
+            const dm = await this.app.client.conversations.open({
+                users: this.config.ownerUserId,
+            });
+            if (job.kind === 'review') {
+                await this.app.client.chat.postMessage({
+                    channel: dm.channel.id,
+                    text: 'Review draft ready',
+                    blocks: buildReviewResultBlocks(job),
+                    unfurl_links: false,
+                    unfurl_media: false,
+                });
+            } else if (job.kind === 'post_review') {
+                const result = JSON.parse(job.result_json || '{}');
+                await this.app.client.chat.postMessage({
+                    channel: dm.channel.id,
+                    unfurl_links: false,
+                    unfurl_media: false,
+                    text: result.review_url
+                        ? `:white_check_mark: Review posted: ${result.review_url}`
+                        : ':white_check_mark: Review posted.',
+                });
+            }
+        } catch (err) {
+            this.logger.error(`_onJobResult failed for job ${job.id}: ${err.message}`);
+        }
     }
 
     _setupListeners() {
@@ -1786,6 +1813,27 @@ ${formatted}`,
                 } catch { /* ignore */ }
             }
         });
+
+        for (const actionId of ['job_post_review', 'job_discard']) {
+            this.app.action(actionId, async ({ ack, body, action }) => {
+                await ack();
+                try {
+                    const reply = await handleJobAction({
+                        actionId,
+                        value: action.value,
+                        jobs: this.jobs,
+                    });
+                    await this.app.client.chat.postMessage({
+                        channel: body.channel.id,
+                        text: reply,
+                        unfurl_links: false,
+                        unfurl_media: false,
+                    });
+                } catch (err) {
+                    this.logger.error(`job action ${actionId} failed: ${err.message}`);
+                }
+            });
+        }
 
         // Entity: App Home status board. Repaint whenever the user opens the tab.
         this.app.event('app_home_opened', async ({ event }) => {
