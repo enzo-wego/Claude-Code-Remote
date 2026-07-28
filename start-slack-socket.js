@@ -49,6 +49,30 @@ function parseCliChain(raw, defaultChain = ['claude']) {
     return chain;
 }
 
+/**
+ * Resolve the GitHub token for read-only PR monitoring.
+ *
+ * Prefers GITHUB_TOKEN, but falls back to the already-authenticated `gh` CLI on
+ * the host. Reading it from `gh` avoids duplicating the same secret into .env
+ * and means a rotated OAuth token is picked up on the next restart instead of
+ * going stale. Returns '' when neither is available — the PR board then logs a
+ * warning and stays inert rather than failing.
+ */
+function resolveGithubToken() {
+    if (process.env.GITHUB_TOKEN) return process.env.GITHUB_TOKEN;
+    try {
+        return require('child_process')
+            .execFileSync('gh', ['auth', 'token'], {
+                encoding: 'utf8',
+                timeout: 5000,
+                stdio: ['ignore', 'pipe', 'ignore'],
+            })
+            .trim();
+    } catch {
+        return '';
+    }
+}
+
 // Load configuration
 const config = {
     botToken: process.env.SLACK_BOT_TOKEN,
@@ -106,7 +130,7 @@ const config = {
     xoxdToken: process.env.SLACK_XOXD_TOKEN || '',
     // Entity Plan H: PR review board.
     prBoardEnabled: process.env.PR_BOARD_ENABLED === 'true',
-    githubToken: process.env.GITHUB_TOKEN || '',
+    githubToken: resolveGithubToken(),
     prMonitorIntervalMin: Number(
         process.env.PR_MONITOR_INTERVAL_MIN || 15
     ),
