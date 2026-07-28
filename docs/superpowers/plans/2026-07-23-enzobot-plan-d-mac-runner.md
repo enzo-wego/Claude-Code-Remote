@@ -8,6 +8,10 @@
 
 **Tech Stack:** Node (existing repo for VPS side; runner uses only Node stdlib + global `fetch`), better-sqlite3, herdr CLI (Mac), `gh` CLI (Mac), launchd, jest.
 
+**Repository:** `Claude-Code-Remote` (this repo, Node.js) — VPS endpoints + a new `runner/` directory for the Mac daemon. No other repo.
+
+**Provider APIs:** **None in our code.** The queue and runner are plumbing. The review itself is Claude Code running in a herdr pane (Anthropic via Claude Code subscription auth, no API key). Do NOT add any LLM SDK call. (See `2026-07-28-enzobot-master-index.md` for the full provider matrix.)
+
 **Relation to other plans:** Independent of Plan B code (shares only the SQLite file + Express app). Plan B's brief later gains "review arrived" items for free once both exist. The spec's v2 "Mac job-queue runner" is pulled forward by this plan.
 
 ---

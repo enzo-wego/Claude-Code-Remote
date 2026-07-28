@@ -8,6 +8,10 @@
 
 **Tech Stack:** Node 26 (global `fetch`), better-sqlite3, @slack/bolt (existing), jest (existing, `npm test`), no new dependencies.
 
+**Repository:** `Claude-Code-Remote` (this repo, Node.js) — the only repo Plan B touches.
+
+**Provider APIs:** **None.** Collectors are plain HTTP (Slack/GitHub/Jira REST). The "smart" — ranking the brief, writing the reasons — is done BY the resident companion Claude Code session (Anthropic via Claude Code subscription auth, no API key in our code); we inject a prompt and read its reply. Do NOT add any LLM SDK call in this plan. (See `2026-07-28-enzobot-master-index.md` for the full provider matrix.)
+
 **Conventions:** 4-space indent, CommonJS `require`, `Logger` from `src/core/logger`. All work on branch `release` (repo convention). Feature is dark until `COMPANION_ENABLED=true`.
 
 ---
