@@ -31,13 +31,43 @@ function buildHomeView(state) {
         };
     }
 
+    // Page-level controls, not board-level: this page grows agenda / night
+    // plan / Mac jobs sections, and one Refresh should cover all of them.
+    const controls = [
+        {
+            type: 'button',
+            action_id: 'home_refresh',
+            text: { type: 'plain_text', text: '🔄 Refresh' },
+            value: 'all',
+            style: 'primary',
+        },
+        {
+            type: 'button',
+            action_id: 'home_toggle_drafts',
+            text: {
+                type: 'plain_text',
+                text: state.showDrafts ? '📝 Drafts: shown' : '📝 Drafts: hidden',
+            },
+            value: state.showDrafts ? 'hide' : 'show',
+        },
+    ];
+
     const blocks = [
         { type: 'header', text: { type: 'plain_text', text: '🧠 EnzoBot — live status' } },
+        { type: 'actions', elements: controls },
         {
             type: 'context',
-            elements: [{ type: 'mrkdwn', text: 'Repaints each time you open this tab' }],
+            elements: [{
+                type: 'mrkdwn',
+                text: state.refreshing
+                    ? ':hourglass_flowing_sand: _refreshing from GitHub…_'
+                    : `_updated <!date^${Math.floor(now / 1000)}^{date_short_pretty} {time}|just now>_`
+                        + (state.draftsHidden
+                            ? ` · ${state.draftsHidden} draft(s) hidden`
+                            : ''),
+            }],
         },
-        ...buildPrBoardBlocks(state.prTasks || [], { refreshing: state.refreshing }),
+        ...buildPrBoardBlocks(state.prTasks || []),
         {
             type: 'section',
             text: { type: 'mrkdwn', text: `*Service*  up ${fmtDuration(state.uptimeSec * 1000)} · Socket Mode connected` },

@@ -184,7 +184,7 @@ describe('board renders three lanes', () => {
 
     test('empty lanes each say so instead of vanishing', () => {
         const text = JSON.stringify(buildPrBoardBlocks([]));
-        expect(text).toContain('No pull requests need your review');
+        expect(text).toContain('Nothing is waiting on you');
         expect(text).toContain('No open PRs of yours');
         expect(text).toContain('No open PRs from your team');
     });

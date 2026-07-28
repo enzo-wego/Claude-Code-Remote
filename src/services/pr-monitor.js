@@ -339,6 +339,7 @@ async function sweepReviewRequests(prTasks, token, {
                 origin: 'github-sweep',
                 lane: 'review',
                 prCreatedAt: epoch(item.created_at),
+                isDraft: Boolean(item.draft),
             }));
         }
     }
@@ -366,6 +367,7 @@ async function sweepMyPrs(prTasks, token, { org = '' } = {}) {
             origin: 'github-mine',
             lane: 'mine',
             prCreatedAt: epoch(item.created_at),
+            isDraft: Boolean(item.draft),
         }));
     }
     return seeded;
@@ -403,6 +405,7 @@ async function sweepTeamPrs(prTasks, token, { members = [], viewerLogin, org = '
             origin: 'github-team',
             lane: 'team',
             prCreatedAt: epoch(item.created_at),
+            isDraft: Boolean(item.draft),
         }));
     }
     return { seeded, dropped };
@@ -444,6 +447,7 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
                 origin: task.origin,
                 lane,
                 prCreatedAt: state.createdAt,
+                isDraft: state.draft,
             });
         });
     }
@@ -496,6 +500,7 @@ async function refreshMine(prTasks, token, viewerLogin) {
             origin: task.origin,
             lane: 'mine',
             prCreatedAt: state.createdAt,
+            isDraft: state.draft,
         });
 
         const newComments = Math.max(0, humanComments - (task.seen_comments || 0));

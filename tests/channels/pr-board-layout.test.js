@@ -29,7 +29,7 @@ describe('section order', () => {
             { id: 1, lane: 'mine', repo: 'a/b', number: 1, url: 'u', ci: 'green', status: 'detected' },
             { id: 2, lane: 'team', repo: 'a/c', number: 2, url: 'u', ci: 'green', status: 'detected', author: 'lei-wego' },
         ]);
-        expect(headers(blocks)).toEqual(['PR Review Board', 'Team PRs', 'My PRs']);
+        expect(headers(blocks)).toEqual(['Needs my review', 'Team PRs', 'My PRs']);
     });
 });
 
@@ -121,24 +121,6 @@ describe('Dismiss makes a row disappear and stay gone', () => {
     });
 });
 
-describe('freshness line', () => {
-    const at = Date.parse('2026-07-28T14:35:00Z');
-
-    test('shows when the board was published, in the viewer timezone', () => {
-        const ctx = buildPrBoardBlocks([], { now: at })
-            .find(b => b.type === 'context');
-        // <!date^…> renders in each viewer's own timezone, so no hardcoded offset.
-        expect(ctx.elements[0].text).toContain(`<!date^${Math.floor(at / 1000)}^`);
-        expect(ctx.elements[0].text).toContain('updated');
-    });
-
-    test('says so while a manual refresh is in flight', () => {
-        const ctx = buildPrBoardBlocks([], { now: at, refreshing: true })
-            .find(b => b.type === 'context');
-        expect(ctx.elements[0].text).toContain('refreshing from GitHub');
-    });
-});
-
 describe('bounded concurrency', () => {
     const { mapLimit } = require('../../src/services/pr-monitor');
 
@@ -165,5 +147,31 @@ describe('bounded concurrency', () => {
         let called = false;
         await mapLimit([], 5, async () => { called = true; });
         expect(called).toBe(false);
+    });
+});
+
+describe('draft handling', () => {
+    test('draft status is recorded, and preferences round-trip', () => {
+        const tasks = createTasks();
+        const draft = tasks.upsert({
+            repo: 'wego/payments', number: 2200, url: 'u',
+            lane: 'mine', isDraft: true,
+        });
+        const ready = tasks.upsert({
+            repo: 'wego/payments', number: 2206, url: 'u',
+            lane: 'mine', isDraft: false,
+        });
+        expect(tasks.get(draft.id).is_draft).toBe(1);
+        expect(tasks.get(ready.id).is_draft).toBe(0);
+
+        // A later sweep that omits the flag must not silently clear it.
+        tasks.upsert({ repo: 'wego/payments', number: 2200, url: 'u', lane: 'mine' });
+        expect(tasks.get(draft.id).is_draft).toBe(1);
+
+        expect(tasks.getPref('show_drafts', 'false')).toBe('false');
+        tasks.setPref('show_drafts', 'true');
+        expect(tasks.getPref('show_drafts', 'false')).toBe('true');
+        tasks.setPref('show_drafts', 'false');
+        expect(tasks.getPref('show_drafts', 'false')).toBe('false');
     });
 });

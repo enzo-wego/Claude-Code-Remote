@@ -102,12 +102,14 @@ describe('buildPrDraftResultBlocks', () => {
     });
 });
 
-describe('refresh button', () => {
-    test('board header carries a pr_refresh button even when empty', () => {
+describe('board scope', () => {
+    test('carries no page-level controls — those moved to the home view', () => {
         const { buildPrBoardBlocks } = require('../../src/channels/slack/pr-board');
-        expect(JSON.stringify(buildPrBoardBlocks([]))).toContain('pr_refresh');
-        expect(JSON.stringify(buildPrBoardBlocks([
-            { id: 1, repo: 'a/b', number: 1, url: 'u', ci: 'green', review_state: 'requested', status: 'detected' },
-        ]))).toContain('pr_refresh');
+        const text = JSON.stringify(buildPrBoardBlocks([]));
+        expect(text).not.toContain('pr_refresh');
+        expect(text).not.toContain('home_refresh');
+        expect(text).not.toContain('home_toggle_drafts');
+        // But it still labels its own lanes.
+        expect(text).toContain('Needs my review');
     });
 });

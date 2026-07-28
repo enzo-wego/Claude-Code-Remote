@@ -2119,7 +2119,10 @@ ${formatted}`,
         // Entity: on-demand board refresh. Re-sweeps GitHub and re-reads PR
         // state now instead of waiting for the next monitor cycle, then
         // repaints. Owner-only, like every other board action.
-        this.app.action('pr_refresh', async ({ ack, body }) => {
+        // home_refresh is page-level: it re-sweeps everything the page shows.
+        // pr_refresh stays registered so a Home tab published before this
+        // rename still works when tapped.
+        const onRefresh = async ({ ack, body }) => {
             await ack();
             const userId = body.user && body.user.id;
             if (this.config.ownerUserId
@@ -2167,6 +2170,28 @@ ${formatted}`,
             }
             // Repaint regardless, so a failed sweep still shows current rows.
             await this._publishHome(target).catch(() => {});
+        };
+        this.app.action('home_refresh', onRefresh);
+        this.app.action('pr_refresh', onRefresh);
+
+        // Draft visibility. A pure view preference — no re-sweep, since draft
+        // status is already on every row.
+        this.app.action('home_toggle_drafts', async ({ ack, body, action }) => {
+            await ack();
+            const userId = body.user && body.user.id;
+            if (this.config.ownerUserId
+                && userId !== this.config.ownerUserId) {
+                return;
+            }
+            try {
+                this.prTasks.setPref(
+                    'show_drafts',
+                    action.value === 'show' ? 'true' : 'false'
+                );
+                await this._publishHome(userId || this.config.ownerUserId);
+            } catch (err) {
+                this.logger.error(`home_toggle_drafts failed: ${err.message}`);
+            }
         });
 
         // Entity: App Home status board. Repaint whenever the user opens the tab.
@@ -2178,6 +2203,25 @@ ${formatted}`,
                 this.logger.warn(`home tab publish failed: ${err.message}`);
             }
         });
+    }
+
+    /**
+     * Active PR rows for the board, minus drafts unless the owner asked to see
+     * them. Filtered at render time rather than at sweep time, so toggling is
+     * instant and needs no GitHub round trip.
+     */
+    _collectPrRows() {
+        const rows = this.prTasks.listActive();
+        const showDrafts = this.prTasks.getPref('show_drafts', 'false') === 'true';
+        if (showDrafts) {
+            return { prTasks: rows, showDrafts: true, draftsHidden: 0 };
+        }
+        const kept = rows.filter(row => !row.is_draft);
+        return {
+            prTasks: kept,
+            showDrafts: false,
+            draftsHidden: rows.length - kept.length,
+        };
     }
 
     /** Gather live state for the App Home board (owner sees internals). */
@@ -2197,7 +2241,7 @@ ${formatted}`,
                 pending: this._queueStmts.countPending.get().count,
                 processing: this._queueStmts.countProcessing.get().count,
             },
-            prTasks: this.prTasks.listActive(),
+            ...this._collectPrRows(),
             schedules: { dailySummaryTime: this.config.dailySummaryChannels ? this.config.dailySummaryTime : null },
         };
     }

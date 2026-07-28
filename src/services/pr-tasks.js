@@ -42,6 +42,19 @@ class PrTasks {
         // When GitHub says the PR was opened — not when we first saw it. Drives
         // the age column and the oldest-first ordering of the team lane.
         this._addColumn('pr_created_at', 'INTEGER');
+        // Draft PRs are usually noise on a review board — half of these rows
+        // were drafts — so they are recorded and filtered at render time rather
+        // than dropped, letting the toggle show them without a re-sweep.
+        this._addColumn('is_draft', 'INTEGER DEFAULT 0');
+
+        // Board preferences (draft visibility, and whatever the page grows
+        // next). One row per key; the board belongs to one owner.
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS board_prefs (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        `);
 
         db.exec(
             'CREATE INDEX IF NOT EXISTS idx_pr_status ON pr_tasks(status)'
@@ -53,11 +66,13 @@ class PrTasks {
             insert: db.prepare(`
                 INSERT INTO pr_tasks (
                     repo, number, url, title, author, ci, review_state,
-                    origin, lane, pr_created_at, created_at, updated_at
+                    origin, lane, pr_created_at, is_draft, created_at,
+                    updated_at
                 )
                 VALUES (
                     @repo, @number, @url, @title, @author, @ci,
-                    @review_state, @origin, @lane, @pr_created_at, @now, @now
+                    @review_state, @origin, @lane, @pr_created_at, @is_draft,
+                    @now, @now
                 )
                 ON CONFLICT(repo, number) DO UPDATE SET
                     url=excluded.url,
@@ -66,6 +81,7 @@ class PrTasks {
                     pr_created_at=COALESCE(
                         excluded.pr_created_at, pr_tasks.pr_created_at
                     ),
+                    is_draft=COALESCE(excluded.is_draft, pr_tasks.is_draft),
                     ci=CASE
                         WHEN excluded.ci!='unknown' THEN excluded.ci
                         ELSE pr_tasks.ci
@@ -122,6 +138,11 @@ class PrTasks {
                     updated_at=@now
                 WHERE id=@id
             `),
+            getPref: db.prepare('SELECT value FROM board_prefs WHERE key=?'),
+            setPref: db.prepare(`
+                INSERT INTO board_prefs (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            `),
             setDraftJob: db.prepare(`
                 UPDATE pr_tasks
                 SET draft_job_id=?, status=?, updated_at=?
@@ -151,6 +172,9 @@ class PrTasks {
             origin: task.origin || 'slack',
             lane: task.lane || 'review',
             pr_created_at: task.prCreatedAt || null,
+            is_draft: task.isDraft === undefined || task.isDraft === null
+                ? null
+                : Number(Boolean(task.isDraft)),
             now: Date.now(),
         });
         return this._s.byKey.get(task.repo, task.number);
@@ -169,6 +193,16 @@ class PrTasks {
 
     reviewReady() {
         return this._s.reviewReady.all();
+    }
+
+    /** Board preference, string-valued. */
+    getPref(key, fallback = null) {
+        const row = this._s.getPref.get(key);
+        return row ? row.value : fallback;
+    }
+
+    setPref(key, value) {
+        this._s.setPref.run(key, String(value));
     }
 
     setStatus(id, status) {

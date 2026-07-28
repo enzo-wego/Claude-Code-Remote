@@ -221,39 +221,18 @@ function mineLaneBlocks(tasks) {
     return blocks;
 }
 
-function buildPrBoardBlocks(prTasks = [], { now = Date.now(), refreshing = false } = {}) {
+function buildPrBoardBlocks(prTasks = []) {
     const review = prTasks.filter(task => (task.lane || 'review') === 'review');
     const mine = prTasks.filter(task => task.lane === 'mine');
     const team = prTasks.filter(task => task.lane === 'team');
 
-    const seconds = Math.floor(now / 1000);
-    const blocks = [
-        header('PR Review Board'),
-        {
-            // Re-sweeps GitHub on the spot rather than waiting for the next
-            // monitor cycle, then repaints. value is unused but Slack wants one.
-            type: 'actions',
-            elements: [button('pr_refresh', '🔄 Refresh now', 'refresh')],
-        },
-        {
-            // Without this there is no way to tell a fresh board from a stale
-            // one, which made "did Dismiss work?" unanswerable by looking.
-            // Slack renders <!date> in the viewer's own timezone.
-            type: 'context',
-            elements: [{
-                type: 'mrkdwn',
-                text: refreshing
-                    ? ':hourglass_flowing_sand: _refreshing from GitHub…_'
-                    : `_updated <!date^${seconds}^{date_short_pretty} {time}|just now>_`,
-            }],
-        },
-    ];
-
-    // Needs-your-review stays first: it is the only lane where someone is
-    // blocked on you. Team PRs sit above your own, which are the least urgent
-    // thing on the board.
+    // Every lane gets its own header. Without one, the review lane's empty
+    // state read as a caption on the page title instead of as a section.
+    // Needs-my-review stays first: it is the only lane where someone is blocked
+    // on you. Team PRs sit above your own, the least urgent thing here.
+    const blocks = [header('Needs my review')];
     if (review.length === 0) {
-        blocks.push(section('_No pull requests need your review._'));
+        blocks.push(section('_Nothing is waiting on you._'));
     } else {
         blocks.push(...reviewLaneBlocks(review));
     }

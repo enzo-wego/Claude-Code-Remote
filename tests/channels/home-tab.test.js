@@ -35,11 +35,11 @@ describe('buildHomeView', () => {
         expect(text).toContain('1 processing');
         expect(text).toContain('07:00');
         expect(text).toContain('Coming soon');
-        expect(text).toContain('PR Review Board');
+        expect(text).toContain('Needs my review');
         expect(text).toContain('Fix tax rounding');
         const boardIndex = view.blocks.findIndex(block =>
             block.type === 'header'
-            && block.text.text === 'PR Review Board'
+            && block.text.text === 'Needs my review'
         );
         const serviceIndex = view.blocks.findIndex(block =>
             block.type === 'section'
@@ -59,5 +59,52 @@ describe('buildHomeView', () => {
     test('owner view with no sessions renders none placeholder', () => {
         const view = buildHomeView({ isOwner: true, uptimeSec: 60, sessions: [], now });
         expect(JSON.stringify(view.blocks)).toContain('_none_');
+    });
+});
+
+describe('page-level controls', () => {
+    const now = 1_800_000_000_000;
+    const owner = extra => buildHomeView({
+        isOwner: true, uptimeSec: 60, sessions: [], now, ...extra,
+    });
+
+    test('Refresh and the drafts toggle sit above every section', () => {
+        const view = owner();
+        // Controls are page-scoped, not board-scoped: this page grows more
+        // sections and one Refresh must cover all of them.
+        expect(view.blocks[0].type).toBe('header');
+        const controls = view.blocks[1];
+        expect(controls.type).toBe('actions');
+        expect(controls.elements.map(e => e.action_id))
+            .toEqual(['home_refresh', 'home_toggle_drafts']);
+
+        const firstSection = view.blocks.findIndex(b => b.type === 'header' && b.text.text === 'Needs my review');
+        expect(firstSection).toBeGreaterThan(1);
+    });
+
+    test('freshness line renders in the viewer timezone', () => {
+        const ctx = owner().blocks.find(b => b.type === 'context');
+        expect(ctx.elements[0].text).toContain(`<!date^${now / 1000}^`);
+        expect(ctx.elements[0].text).toContain('updated');
+    });
+
+    test('says so while a refresh is in flight', () => {
+        const ctx = owner({ refreshing: true }).blocks.find(b => b.type === 'context');
+        expect(ctx.elements[0].text).toContain('refreshing from GitHub');
+    });
+
+    test('toggle label and value invert with the current state', () => {
+        const hidden = owner({ showDrafts: false }).blocks[1].elements[1];
+        expect(hidden.text.text).toContain('Drafts: hidden');
+        expect(hidden.value).toBe('show');
+
+        const shown = owner({ showDrafts: true }).blocks[1].elements[1];
+        expect(shown.text.text).toContain('Drafts: shown');
+        expect(shown.value).toBe('hide');
+    });
+
+    test('reports how many drafts were withheld', () => {
+        const ctx = owner({ draftsHidden: 5 }).blocks.find(b => b.type === 'context');
+        expect(ctx.elements[0].text).toContain('5 draft(s) hidden');
     });
 });
