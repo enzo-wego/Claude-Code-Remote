@@ -11,6 +11,12 @@ const DECISION_GLYPHS = {
     commented: '💬',
 };
 
+// Block Kit has no table element, and true column alignment exists only inside
+// a code block — which strips links and cannot hold buttons. So a "table" here
+// means: one line per PR, monospace repo#number so the left edge lines up, an
+// age column, and the action on the right as a section accessory.
+const TITLE_MAX = 62;
+
 function button(actionId, text, taskId, style) {
     const element = {
         type: 'button',
@@ -31,39 +37,125 @@ function linkButton(text, url) {
     };
 }
 
+/**
+ * A section takes exactly one accessory, so a row that needs several actions
+ * puts them in an overflow menu — keeping the row to a single block. Option
+ * values carry the action id so one handler can dispatch them all.
+ */
+function overflow(taskId, entries) {
+    return {
+        type: 'overflow',
+        action_id: 'pr_menu',
+        options: entries.map(entry => {
+            const option = {
+                text: { type: 'plain_text', text: entry.text },
+                value: `${entry.actionId}:${taskId}`,
+            };
+            if (entry.url) option.url = entry.url;
+            return option;
+        }),
+    };
+}
+
 function ciGlyph(task) {
     return CI_GLYPHS[task.ci] || CI_GLYPHS.unknown;
+}
+
+function truncate(text, max = TITLE_MAX) {
+    const value = String(text || '');
+    return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
 function titleOf(task) {
     return task.title || `${task.repo}#${task.number}`;
 }
 
-function section(text) {
-    return { type: 'section', text: { type: 'mrkdwn', text } };
+/** Compact age since the PR was opened on GitHub: 4h, 3d, 5w. */
+function ageOf(task, now = Date.now()) {
+    if (!task.pr_created_at) return '';
+    const hours = Math.floor((now - task.pr_created_at) / 3_600_000);
+    if (hours < 1) return 'new';
+    if (hours < 24) return `${hours}h`;
+    const days = Math.floor(hours / 24);
+    if (days < 14) return `${days}d`;
+    return `${Math.floor(days / 7)}w`;
+}
+
+function section(text, accessory) {
+    const block = { type: 'section', text: { type: 'mrkdwn', text } };
+    if (accessory) block.accessory = accessory;
+    return block;
+}
+
+/** One table row: glyph · repo#n · title · trailing columns. */
+function row(task, { glyph, columns = [], accessory }) {
+    const age = ageOf(task);
+    const cells = [...columns, age].filter(Boolean);
+    return section(
+        `${glyph} \`${task.repo}#${task.number}\`  *<${task.url}|${truncate(titleOf(task))}>*`
+            + (cells.length ? `  ·  ${cells.join('  ·  ')}` : ''),
+        accessory
+    );
+}
+
+function header(text) {
+    return { type: 'header', text: { type: 'plain_text', text } };
+}
+
+/**
+ * A teammate's PR. Nobody has asked you for anything, so there is no nudge and
+ * no auto-review — just visibility, and the option to pull one in yourself.
+ * Oldest first: a PR nobody has touched for three weeks is the one worth seeing.
+ */
+function teamLaneBlocks(tasks) {
+    const blocks = [header('Team PRs')];
+    if (tasks.length === 0) {
+        blocks.push(section('_No open PRs from your team._'));
+        return blocks;
+    }
+
+    const oldestFirst = [...tasks].sort(
+        (a, b) => (a.pr_created_at || 0) - (b.pr_created_at || 0)
+    );
+
+    for (const task of oldestFirst) {
+        blocks.push(row(task, {
+            glyph: ciGlyph(task),
+            columns: [
+                `@${task.author || 'unknown'}`,
+                task.review_state === 'requested' ? 'review requested' : '',
+            ],
+            accessory: overflow(task.id, [
+                { actionId: 'pr_review_now', text: '🔍 Review now' },
+                { actionId: 'pr_dismiss', text: '🙈 Dismiss' },
+                { actionId: 'pr_open', text: '🔗 Open on GitHub', url: task.url },
+            ]),
+        }));
+    }
+    return blocks;
 }
 
 /** Rows where someone is waiting on you. */
 function reviewLaneBlocks(tasks) {
     const blocks = [];
     for (const task of tasks) {
-        blocks.push(section([
-            `${ciGlyph(task)} *<${task.url}|${titleOf(task)}>*`,
-            `\`${task.repo}#${task.number}\` · review: *${task.review_state || 'unknown'}* · status: *${task.status}*`,
-        ].join('\n')));
+        const actionable = task.status === 'detected'
+            || task.status === 'needs_review';
+        blocks.push(row(task, {
+            glyph: ciGlyph(task),
+            columns: [
+                task.review_state || 'unknown',
+                task.status === 'reviewing' ? '_reviewing on your Mac…_' : '',
+            ],
+            accessory: actionable
+                ? button('pr_review_now', '🔍 Review now', task.id, 'primary')
+                : undefined,
+        }));
 
-        if (task.status === 'detected' || task.status === 'needs_review') {
+        if (actionable) {
             blocks.push({
                 type: 'actions',
-                elements: [
-                    button('pr_review_now', '🔍 Review now', task.id, 'primary'),
-                    button('pr_dismiss', '🙈 Dismiss', task.id),
-                ],
-            });
-        } else if (task.status === 'reviewing') {
-            blocks.push({
-                type: 'context',
-                elements: [{ type: 'mrkdwn', text: '_reviewing on your Mac…_' }],
+                elements: [button('pr_dismiss', '🙈 Dismiss', task.id)],
             });
         } else if (task.status === 'drafted') {
             blocks.push({
@@ -75,8 +167,6 @@ function reviewLaneBlocks(tasks) {
                 ],
             });
         }
-
-        blocks.push({ type: 'divider' });
     }
     return blocks;
 }
@@ -84,90 +174,50 @@ function reviewLaneBlocks(tasks) {
 /**
  * Rows where you are waiting on everyone else. The lead glyph is the review
  * decision when there is one, because "did a teammate reply" is the question
- * this lane exists to answer; CI moves into the meta line.
+ * this lane exists to answer; CI moves into a column.
  */
 function mineLaneBlocks(tasks) {
-    const blocks = [
-        { type: 'header', text: { type: 'plain_text', text: 'My PRs' } },
-    ];
-
+    const blocks = [header('My PRs')];
     if (tasks.length === 0) {
         blocks.push(section('_No open PRs of yours._'));
         return blocks;
     }
 
     for (const task of tasks) {
-        const glyph = DECISION_GLYPHS[task.review_decision] || ciGlyph(task);
-        const who = task.decision_by ? ` by *@${task.decision_by}*` : '';
-        // ponytail: total count, not an unread delta — the delta is what the DM
-        // carries. Storing an unread watermark per view is the upgrade if the
-        // total turns out to be useless at a glance.
+        const who = task.decision_by ? ` @${task.decision_by}` : '';
         const verdict = {
             approved: `approved${who}`,
             changes_requested: `changes requested${who}`,
-            commented: `commented on${who}`,
-        }[task.review_decision] || 'no review yet';
+            commented: `commented${who}`,
+        }[task.review_decision] || 'no review';
 
-        blocks.push(section([
-            `${glyph} *<${task.url}|${titleOf(task)}>*`,
-            `\`${task.repo}#${task.number}\` · ${verdict} · CI: ${ciGlyph(task)}`
-                + (task.seen_comments ? ` · 💬 ${task.seen_comments}` : ''),
-        ].join('\n')));
+        const mergeable = task.review_decision === 'approved'
+            && task.ci === 'green';
 
-        const elements = [linkButton('🔗 Open', task.url)];
-        if (task.review_decision === 'approved' && task.ci === 'green') {
-            elements.unshift({
-                ...button('pr_merge', '🚀 Merge', task.id, 'primary'),
-                confirm: {
-                    title: { type: 'plain_text', text: 'Merge this PR?' },
-                    text: {
-                        type: 'mrkdwn',
-                        text: `*${task.repo}#${task.number}*\n${titleOf(task)}`,
-                    },
-                    confirm: { type: 'plain_text', text: 'Merge' },
-                    deny: { type: 'plain_text', text: 'Cancel' },
-                    style: 'primary',
-                },
-            });
-        }
-        blocks.push({ type: 'actions', elements });
-        blocks.push({ type: 'divider' });
-    }
-
-    return blocks;
-}
-
-/**
- * A teammate's PR. Nobody has asked you for anything, so there is no nudge and
- * no auto-review — just visibility, and the option to pull one in yourself.
- */
-function teamLaneBlocks(tasks) {
-    const blocks = [
-        { type: 'header', text: { type: 'plain_text', text: 'Team PRs' } },
-    ];
-
-    if (tasks.length === 0) {
-        blocks.push(section('_No open PRs from your team._'));
-        return blocks;
-    }
-
-    for (const task of tasks) {
-        blocks.push(section([
-            `${ciGlyph(task)} *<${task.url}|${titleOf(task)}>*`,
-            `\`${task.repo}#${task.number}\` · by *@${task.author || 'unknown'}*`
-                + (task.review_state === 'requested' ? ' · review requested' : ''),
-        ].join('\n')));
-        blocks.push({
-            type: 'actions',
-            elements: [
-                button('pr_review_now', '🔍 Review now', task.id),
-                linkButton('🔗 Open', task.url),
-                button('pr_dismiss', '🙈 Dismiss', task.id),
+        blocks.push(row(task, {
+            glyph: DECISION_GLYPHS[task.review_decision] || ciGlyph(task),
+            columns: [
+                verdict,
+                `CI ${ciGlyph(task)}`,
+                task.seen_comments ? `💬 ${task.seen_comments}` : '',
             ],
-        });
-        blocks.push({ type: 'divider' });
+            accessory: mergeable
+                ? {
+                    ...button('pr_merge', '🚀 Merge', task.id, 'primary'),
+                    confirm: {
+                        title: { type: 'plain_text', text: 'Merge this PR?' },
+                        text: {
+                            type: 'mrkdwn',
+                            text: `*${task.repo}#${task.number}*\n${titleOf(task)}`,
+                        },
+                        confirm: { type: 'plain_text', text: 'Merge' },
+                        deny: { type: 'plain_text', text: 'Cancel' },
+                        style: 'primary',
+                    },
+                }
+                : linkButton('🔗 Open', task.url),
+        }));
     }
-
     return blocks;
 }
 
@@ -177,28 +227,28 @@ function buildPrBoardBlocks(prTasks = []) {
     const team = prTasks.filter(task => task.lane === 'team');
 
     const blocks = [
-        {
-            type: 'header',
-            text: { type: 'plain_text', text: 'PR Review Board' },
-        },
+        header('PR Review Board'),
         {
             // Re-sweeps GitHub on the spot rather than waiting for the next
             // monitor cycle, then repaints. value is unused but Slack wants one.
             type: 'actions',
-            elements: [
-                button('pr_refresh', '🔄 Refresh now', 'refresh'),
-            ],
+            elements: [button('pr_refresh', '🔄 Refresh now', 'refresh')],
         },
     ];
 
+    // Needs-your-review stays first: it is the only lane where someone is
+    // blocked on you. Team PRs sit above your own, which are the least urgent
+    // thing on the board.
     if (review.length === 0) {
         blocks.push(section('_No pull requests need your review._'));
     } else {
         blocks.push(...reviewLaneBlocks(review));
     }
 
-    blocks.push(...mineLaneBlocks(mine));
+    blocks.push({ type: 'divider' });
     blocks.push(...teamLaneBlocks(team));
+    blocks.push({ type: 'divider' });
+    blocks.push(...mineLaneBlocks(mine));
 
     return blocks;
 }
@@ -238,6 +288,7 @@ function buildMineChangeText({ task, decision, decisionBy, decisionChanged, newC
 }
 
 module.exports = {
+    ageOf,
     buildMineChangeText,
     buildPrBoardBlocks,
     buildPrDraftResultBlocks,

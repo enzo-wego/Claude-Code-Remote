@@ -44,11 +44,20 @@ describe('buildPrBoardBlocks', () => {
         expect(text).toContain('🟡');
         expect(text).toContain('🔴');
         expect(text).toContain('requested');
-        expect(text).toContain('needs_review');
         expect(text).toContain('reviewing on your Mac');
 
-        // Task-scoped controls only — the board-level 🔄 Refresh lives in its
-        // own actions block and is asserted separately.
+        // The primary action is a row accessory; only secondary controls get
+        // their own actions block. Board-level 🔄 Refresh is asserted separately.
+        const accessories = blocks
+            .filter(block => block.accessory)
+            .map(block => ({
+                actionId: block.accessory.action_id,
+                value: block.accessory.value,
+            }));
+        expect(accessories).toEqual([
+            { actionId: 'pr_review_now', value: '1' },
+        ]);
+
         const actionSets = blocks
             .filter(block => block.type === 'actions')
             .map(block => block.elements.map(element => ({
@@ -57,10 +66,7 @@ describe('buildPrBoardBlocks', () => {
             })))
             .filter(set => !set.some(el => el.actionId === 'pr_refresh'));
         expect(actionSets).toEqual([
-            [
-                { actionId: 'pr_review_now', value: '1' },
-                { actionId: 'pr_dismiss', value: '1' },
-            ],
+            [{ actionId: 'pr_dismiss', value: '1' }],
             [
                 { actionId: 'pr_post', value: '3' },
                 { actionId: 'pr_edit', value: '3' },

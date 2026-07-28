@@ -161,19 +161,25 @@ describe('lane precedence', () => {
 });
 
 describe('board renders three lanes', () => {
-    test('team rows get Review now / Open / Dismiss and no merge button', () => {
-        const text = JSON.stringify(buildPrBoardBlocks([
+    test('team rows offer Review/Dismiss/Open via one overflow, never merge', () => {
+        const blocks = buildPrBoardBlocks([
             {
                 id: 7, lane: 'team', repo: 'wego/wego-docs', number: 800,
                 url: 'u', title: 'Shared repo, our team', author: 'lei-wego',
                 ci: 'green', status: 'detected',
             },
-        ]));
+        ]);
+        const text = JSON.stringify(blocks);
         expect(text).toContain('Team PRs');
         expect(text).toContain('@lei-wego');
-        expect(text).toContain('pr_review_now');
-        expect(text).toContain('pr_dismiss');
         expect(text).not.toContain('pr_merge');
+
+        // One block for the whole row: the actions live in its accessory.
+        const menu = blocks.find(b => b.accessory?.type === 'overflow').accessory;
+        expect(menu.action_id).toBe('pr_menu');
+        expect(menu.options.map(o => o.value)).toEqual([
+            'pr_review_now:7', 'pr_dismiss:7', 'pr_open:7',
+        ]);
     });
 
     test('empty lanes each say so instead of vanishing', () => {

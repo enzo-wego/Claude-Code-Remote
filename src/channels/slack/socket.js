@@ -2018,6 +2018,45 @@ ${formatted}`,
         // interaction for it, so ack it or Bolt logs an unhandled request.
         this.app.action('pr_open', async ({ ack }) => { await ack(); });
 
+        // Overflow menu on table rows. The selected option's value carries the
+        // action id, so this dispatches into the same handlers as the buttons.
+        this.app.action('pr_menu', async ({ ack, body, action }) => {
+            await ack();
+            const userId = body.user && body.user.id;
+            if (this.config.ownerUserId
+                && userId !== this.config.ownerUserId) {
+                return;
+            }
+            const [actionId, taskId] = String(
+                action.selected_option?.value || ''
+            ).split(':');
+            if (!actionId || !taskId) return;
+            if (actionId === 'pr_open') return;   // the option's url did the work
+
+            try {
+                const reply = await handlePrAction({
+                    actionId,
+                    value: taskId,
+                    prTasks: this.prTasks,
+                    jobs: this.jobs,
+                });
+                const dm = await this.app.client.conversations.open({
+                    users: userId || this.config.ownerUserId,
+                });
+                await this.app.client.chat.postMessage({
+                    channel: dm.channel.id,
+                    text: reply,
+                    unfurl_links: false,
+                    unfurl_media: false,
+                });
+                await this._publishHome(userId || this.config.ownerUserId);
+            } catch (err) {
+                this.logger.error(
+                    `PR menu action ${actionId} failed: ${err.message}`
+                );
+            }
+        });
+
         const prActionIds = [
             'pr_review_now',
             'pr_post',

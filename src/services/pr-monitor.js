@@ -95,6 +95,12 @@ function reviewQueries(teams = []) {
     ];
 }
 
+/** GitHub ISO timestamp → epoch ms, or null. */
+function epoch(iso) {
+    const ms = Date.parse(iso || '');
+    return Number.isFinite(ms) ? ms : null;
+}
+
 function parsePrUrl(htmlUrl) {
     const match = String(htmlUrl || '')
         .match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
@@ -167,6 +173,7 @@ async function fetchPrState({ repo, number, token, viewerLogin, viewerTeams = []
         // Free with this call — the watermark for "did anyone reply".
         comments: Number(pull.comments || 0) + Number(pull.review_comments || 0),
         draft: Boolean(pull.draft),
+        createdAt: epoch(pull.created_at),
         // A PR that left GitHub's queue should leave the board too.
         closed: pull.state === 'closed',
         merged: Boolean(pull.merged_at),
@@ -312,6 +319,7 @@ async function sweepReviewRequests(prTasks, token, {
                 reviewState: 'requested',
                 origin: 'github-sweep',
                 lane: 'review',
+                prCreatedAt: epoch(item.created_at),
             }));
         }
     }
@@ -338,6 +346,7 @@ async function sweepMyPrs(prTasks, token, { org = '' } = {}) {
             author: item.user?.login || null,
             origin: 'github-mine',
             lane: 'mine',
+            prCreatedAt: epoch(item.created_at),
         }));
     }
     return seeded;
@@ -374,6 +383,7 @@ async function sweepTeamPrs(prTasks, token, { members = [], viewerLogin, org = '
             author: item.user?.login || null,
             origin: 'github-team',
             lane: 'team',
+            prCreatedAt: epoch(item.created_at),
         }));
     }
     return { seeded, dropped };
@@ -414,6 +424,7 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
                 reviewState: state.reviewState,
                 origin: task.origin,
                 lane,
+                prCreatedAt: state.createdAt,
             });
         }
     }
@@ -465,6 +476,7 @@ async function refreshMine(prTasks, token, viewerLogin) {
             ci: state.ci,
             origin: task.origin,
             lane: 'mine',
+            prCreatedAt: state.createdAt,
         });
 
         const newComments = Math.max(0, humanComments - (task.seen_comments || 0));

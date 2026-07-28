@@ -39,6 +39,9 @@ class PrTasks {
         this._addColumn('review_decision', 'TEXT');
         this._addColumn('decision_by', 'TEXT');
         this._addColumn('seen_comments', 'INTEGER');
+        // When GitHub says the PR was opened — not when we first saw it. Drives
+        // the age column and the oldest-first ordering of the team lane.
+        this._addColumn('pr_created_at', 'INTEGER');
 
         db.exec(
             'CREATE INDEX IF NOT EXISTS idx_pr_status ON pr_tasks(status)'
@@ -50,16 +53,19 @@ class PrTasks {
             insert: db.prepare(`
                 INSERT INTO pr_tasks (
                     repo, number, url, title, author, ci, review_state,
-                    origin, lane, created_at, updated_at
+                    origin, lane, pr_created_at, created_at, updated_at
                 )
                 VALUES (
                     @repo, @number, @url, @title, @author, @ci,
-                    @review_state, @origin, @lane, @now, @now
+                    @review_state, @origin, @lane, @pr_created_at, @now, @now
                 )
                 ON CONFLICT(repo, number) DO UPDATE SET
                     url=excluded.url,
                     title=COALESCE(excluded.title, pr_tasks.title),
                     author=COALESCE(excluded.author, pr_tasks.author),
+                    pr_created_at=COALESCE(
+                        excluded.pr_created_at, pr_tasks.pr_created_at
+                    ),
                     ci=CASE
                         WHEN excluded.ci!='unknown' THEN excluded.ci
                         ELSE pr_tasks.ci
@@ -144,6 +150,7 @@ class PrTasks {
             review_state: task.reviewState || 'unknown',
             origin: task.origin || 'slack',
             lane: task.lane || 'review',
+            pr_created_at: task.prCreatedAt || null,
             now: Date.now(),
         });
         return this._s.byKey.get(task.repo, task.number);
