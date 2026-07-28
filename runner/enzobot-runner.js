@@ -121,12 +121,16 @@ async function executeJob(
             cwd: checkout,
         });
         herdr.startAgent(paneId, config.cliCommand);
-        const prompt = job.kind === 'apex_review'
+
+        // The prompt goes to a file and only a one-line pointer is submitted:
+        // herdr types multi-line text into the TUI without ever sending it.
+        const promptPath = path.join(directory, 'prompt.md');
+        fs.writeFileSync(promptPath, job.kind === 'apex_review'
             ? buildApexReviewPrompt(payload, resultPath)
-            : buildReviewPrompt(payload, resultPath, checkout);
+            : buildReviewPrompt(payload, resultPath, checkout));
         herdr.submitTask(
             paneId,
-            prompt
+            `Read ${promptPath} and follow it exactly.`
         );
         herdr.waitDone(paneId, config.jobTimeoutMs);
 

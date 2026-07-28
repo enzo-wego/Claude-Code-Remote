@@ -118,6 +118,29 @@ describe('executeJob', () => {
         }, herdr);
 
         expect(result.summary).toBe('1 blocking');
-        expect(herdr.submitTask.mock.calls[0][1]).toContain('/apex-review');
+
+        // The submitted text must be ONE line: herdr types multi-line text into
+        // the TUI without ever submitting it, which parked the pane at idle and
+        // burned all three attempts opening a fresh pane each time.
+        const submitted = herdr.submitTask.mock.calls[0][1];
+        expect(submitted).not.toContain('\n');
+        expect(submitted).toContain(path.join(jobsDir, '7', 'prompt.md'));
+
+        // The real instructions live in the file the pointer names.
+        const written = fs.readFileSync(
+            path.join(jobsDir, '7', 'prompt.md'),
+            'utf8'
+        );
+        expect(written).toContain('/apex-review');
+        expect(written).toContain('wego/payments#413');
+    });
+});
+
+describe('herdr submitTask guards', () => {
+    const { submitTask } = require('../../runner/herdr-exec');
+
+    test('refuses a multi-line prompt instead of typing it and hanging', () => {
+        expect(() => submitTask('w9:p2', 'line one\nline two'))
+            .toThrow(/single-line/);
     });
 });

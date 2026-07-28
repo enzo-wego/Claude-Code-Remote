@@ -111,16 +111,29 @@ function startAgent(paneId, cliCommand) {
     waitStatus(paneId, 'idle', 60_000);
 }
 
+/**
+ * Submit a task and require the agent to visibly start.
+ *
+ * `herdr pane run` types the text and submits it — but only for a SINGLE line.
+ * A multi-line string lands as literal newlines in the TUI's input box and is
+ * never sent, leaving the pane parked at `idle` with the prompt on screen.
+ * That was silent before: waitDone() accepts `idle`, so a never-submitted
+ * prompt read as "already finished", the missing result file failed the job,
+ * and the retry opened another pane — three panes, seconds apart, no review.
+ * So: keep the submitted text to one line, and refuse to proceed until the
+ * status actually leaves idle.
+ */
 function submitTask(paneId, prompt) {
-    herdr('pane', 'run', paneId, prompt);
-    // Best-effort: a very fast turn can pass through 'working' before this
-    // observes it. waitDone() and the result-file check are the real gates, so
-    // never fail the job just because the transition wasn't witnessed.
-    try {
-        waitStatus(paneId, 'working', 30_000, ['done']);
-    } catch {
-        // Turn already advanced; fall through to waitDone.
+    if (prompt.includes('\n')) {
+        throw new Error(
+            'submitTask needs a single-line prompt; multi-line text is typed but never submitted'
+        );
     }
+    herdr('pane', 'run', paneId, prompt);
+    // 'done' is accepted only because a very fast turn can pass through
+    // 'working' before this observes it. 'idle' must NOT be — that is exactly
+    // the "prompt never submitted" state this guard exists to catch.
+    waitStatus(paneId, 'working', 30_000, ['done']);
 }
 
 function waitDone(paneId, timeoutMs) {
