@@ -119,3 +119,39 @@ describe('survives a DB re-open (daily restart)', () => {
         expect(response.body.error).toMatch(/not open/);
     });
 });
+
+describe('terminal failure notification', () => {
+    const resFactory = () => {
+        const response = { code: 200, body: null };
+        response.status = code => { response.code = code; return response; };
+        response.json = body => { response.body = body; return response; };
+        return response;
+    };
+
+    /** Three attempts land as one DM, not three. */
+    test('onFail fires only when the queue gives up', async () => {
+        const jobs = new Jobs(new Database(':memory:'));
+        const onFail = jest.fn().mockResolvedValue();
+        const handlers = makeRunnerHandlers({ jobs, token: 'sekret', onFail });
+        const job = jobs.enqueue('apex_review', { repo: 'wego/payments', pr: 1 });
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            const leased = jobs.lease('mac');
+            expect(leased).not.toBeNull();
+            await handlers.fail(
+                {
+                    headers: { 'x-runner-token': 'sekret' },
+                    body: { job_id: job.id, lease_id: leased.lease_id, error: 'boom' },
+                },
+                resFactory()
+            );
+        }
+
+        expect(onFail).toHaveBeenCalledTimes(1);
+        expect(onFail.mock.calls[0][0]).toEqual(expect.objectContaining({
+            status: 'failed',
+            kind: 'apex_review',
+            attempts: 3,
+        }));
+    });
+});

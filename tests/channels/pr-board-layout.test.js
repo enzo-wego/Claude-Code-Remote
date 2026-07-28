@@ -199,3 +199,27 @@ describe('draft handling', () => {
         expect(tasks.getPref('show_drafts', 'false')).toBe('false');
     });
 });
+
+describe('a dead review returns the row to actionable', () => {
+    test('failDraft clears the job link and restores the Review now button', () => {
+        const tasks = createTasks();
+        const task = tasks.upsert({
+            repo: 'wego/payments-knowledge', number: 6, url: 'https://x/6',
+            title: 'use fresh refs', author: 'yanyi-wego', lane: 'review',
+            reviewState: 'requested', ci: 'green',
+        });
+
+        tasks.setDraftJob(task.id, 42);
+        expect(tasks.get(task.id).status).toBe('reviewing');
+        let json = JSON.stringify(buildPrBoardBlocks(tasks.listActive()));
+        expect(json).not.toContain('pr_review_now');
+
+        tasks.failDraft(task.id);
+
+        const reset = tasks.get(task.id);
+        expect(reset.status).toBe('detected');
+        expect(reset.draft_job_id).toBeNull();
+        json = JSON.stringify(buildPrBoardBlocks(tasks.listActive()));
+        expect(json).toContain('pr_review_now');
+    });
+});

@@ -1827,6 +1827,49 @@ ${formatted}`,
         }
     }
 
+    /**
+     * A job the queue has given up on. Until this existed a dead review was
+     * indistinguishable from one that was never started: the error sat in
+     * SQLite and the PR row stayed at 'reviewing' with no button, so the only
+     * way to find out was to SSH in and read the jobs table.
+     */
+    async _onJobFailed(job) {
+        try {
+            const payload = JSON.parse(job.payload_json || '{}');
+            const label = payload.repo && payload.pr
+                ? `${payload.repo}#${payload.pr}`
+                : `job ${job.id}`;
+
+            if (job.kind === 'apex_review') {
+                const task = this.prTasks.listActive().find(
+                    row => Number(row.draft_job_id) === Number(job.id)
+                );
+                if (task) this.prTasks.failDraft(task.id);
+            }
+
+            this.logger.error(
+                `job ${job.id} (${job.kind}) failed for ${label} after `
+                    + `${job.attempts} attempt(s): ${job.error}`
+            );
+
+            if (!this.config.ownerUserId) return;
+            const dm = await this.app.client.conversations.open({
+                users: this.config.ownerUserId,
+            });
+            await this.app.client.chat.postMessage({
+                channel: dm.channel.id,
+                unfurl_links: false,
+                unfurl_media: false,
+                text: `:x: \`${job.kind}\` gave up on *${label}* after `
+                    + `${job.attempts} attempt(s)\n`
+                    + '```' + String(job.error || 'no error recorded').slice(0, 800) + '```',
+            });
+            await this._publishHome(this.config.ownerUserId);
+        } catch (err) {
+            this.logger.error(`_onJobFailed failed for job ${job.id}: ${err.message}`);
+        }
+    }
+
     _setupListeners() {
         const mode = this.config.appMode || 'all';
 
@@ -6790,6 +6833,7 @@ ${formatted}`,
             jobs: () => this.jobs,
             token: process.env.RUNNER_TOKEN || '',
             onResult: (job) => this._onJobResult(job),
+            onFail: (job) => this._onJobFailed(job),
         });
         httpApp.post('/runner/lease', (req, res) => runnerHandlers.lease(req, res));
         httpApp.post('/runner/complete', (req, res) => runnerHandlers.complete(req, res));

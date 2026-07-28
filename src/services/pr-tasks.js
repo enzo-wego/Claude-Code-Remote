@@ -156,6 +156,13 @@ class PrTasks {
                 SET draft_job_id=?, status=?, updated_at=?
                 WHERE id=?
             `),
+            // A review that died leaves the row stuck at 'reviewing' with no
+            // button. Put it back where it was so it can be retried.
+            failDraft: db.prepare(`
+                UPDATE pr_tasks
+                SET draft_job_id=NULL, status='detected', updated_at=?
+                WHERE id=?
+            `),
         };
     }
 
@@ -233,6 +240,10 @@ class PrTasks {
 
     setDraftJob(id, jobId) {
         this._s.setDraftJob.run(jobId, 'reviewing', Date.now(), id);
+    }
+
+    failDraft(id) {
+        this._s.failDraft.run(Date.now(), id);
     }
 }
 

@@ -1,7 +1,7 @@
 /**
  * HTTP handlers the Mac runner calls. Auth: constant-time compare on
- * X-Runner-Token. onResult(jobRow) fires after a successful complete so
- * socket.js can DM the owner.
+ * X-Runner-Token. onResult(jobRow) fires after a successful complete and
+ * onFail(jobRow) after a terminal failure, so socket.js can DM the owner.
  */
 const crypto = require('crypto');
 
@@ -14,7 +14,7 @@ function tokenOk(req, token) {
         && crypto.timingSafeEqual(actual, expected);
 }
 
-function makeRunnerHandlers({ jobs, token, onResult }) {
+function makeRunnerHandlers({ jobs, token, onResult, onFail }) {
     // `jobs` may be a thunk. The daily restart closes the SQLite handle and
     // _initDb() builds a new Jobs instance; a handler that captured the old one
     // would keep running prepared statements bound to a closed connection.
@@ -50,9 +50,15 @@ function makeRunnerHandlers({ jobs, token, onResult }) {
 
         fail: guard(async (req, res) => {
             const { job_id, lease_id, error } = req.body || {};
-            return res.json({
-                ok: getJobs().fail(job_id, lease_id, error || 'unknown'),
-            });
+            const ok = getJobs().fail(job_id, lease_id, error || 'unknown');
+            // Speak up only once the queue has given up. fail() re-queues while
+            // attempts remain, so notifying per attempt would fire three times
+            // for one dead job.
+            if (ok && onFail) {
+                const row = getJobs().get(job_id);
+                if (row && row.status === 'failed') await onFail(row);
+            }
+            return res.json({ ok });
         }),
 
         enqueue: guard(async (req, res) => {
