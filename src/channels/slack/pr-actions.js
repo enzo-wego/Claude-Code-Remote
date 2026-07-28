@@ -44,6 +44,20 @@ async function handlePrAction({
                 : `:information_source: Review for #${task.number} is already queued for posting.`;
         }
 
+        case 'pr_merge': {
+            // Merged from the Mac like every other write, so it runs under a
+            // token that actually has push rights — the VPS token may not.
+            const queued = jobs.enqueue('merge_pr', {
+                repo: task.repo,
+                pr: task.number,
+            }, {
+                dedupeKey: `merge_pr:${task.repo}#${task.number}`,
+            });
+            return queued
+                ? `:rocket: Merging ${task.repo}#${task.number} from your Mac…`
+                : `:information_source: ${task.repo}#${task.number} is already queued to merge.`;
+        }
+
         case 'pr_edit':
             return ':pencil2: Reply here with the changes you want, then tap Post.';
 

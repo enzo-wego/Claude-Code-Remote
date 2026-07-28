@@ -13,9 +13,12 @@ const SlackSocketHandler = require('./src/channels/slack/socket');
 const { runDailySummary, parseChannelsConfig } = require('./src/services/daily-summary');
 const {
     refreshAll,
+    refreshMine,
+    sweepMyPrs,
     sweepReviewRequests,
 } = require('./src/services/pr-monitor');
 const { handlePrAction } = require('./src/channels/slack/pr-actions');
+const { buildMineChangeText } = require('./src/channels/slack/pr-board');
 const { SsoPrewarm } = require('./src/services/sso-prewarm');
 const { BqHealthMonitor } = require('./src/services/bq-health');
 const { CredentialHealthMonitor } = require('./src/services/credential-health');
@@ -272,10 +275,15 @@ async function runPrMonitor() {
     // Discover PRs awaiting review from GitHub itself, so the board is not
     // limited to PRs that happened to be pasted into Slack. Never let a failed
     // sweep (rate limit, transient 5xx) skip the refresh below.
+    // Team review requests never match `review-requested:@me`, so the sweep
+    // needs one query per team the owner belongs to.
+    const teams = await handler._githubViewerTeams();
+
     try {
         const seeded = await sweepReviewRequests(
             handler.prTasks,
-            config.githubToken
+            config.githubToken,
+            { teams }
         );
         if (seeded.length) {
             logger.info(`PR sweep: ${seeded.length} PR(s) awaiting your review`);
@@ -284,12 +292,31 @@ async function runPrMonitor() {
         logger.warn(`PR sweep failed: ${err.message}`);
     }
 
+    try {
+        const mine = await sweepMyPrs(handler.prTasks, config.githubToken);
+        if (mine.length) {
+            logger.info(`PR sweep: ${mine.length} open PR(s) of yours`);
+        }
+    } catch (err) {
+        logger.warn(`My-PR sweep failed: ${err.message}`);
+    }
+
     const ready = await refreshAll(
         handler.prTasks,
         config.githubToken,
-        viewerLogin
+        viewerLogin,
+        teams
     );
     let dmChannel = null;
+    const openDm = async () => {
+        if (!dmChannel) {
+            const dm = await handler.app.client.conversations.open({
+                users: config.ownerUserId,
+            });
+            dmChannel = dm.channel.id;
+        }
+        return dmChannel;
+    };
 
     for (const task of ready) {
         let autoReview = '';
@@ -303,24 +330,43 @@ async function runPrMonitor() {
         }
 
         if (config.ownerUserId) {
-            if (!dmChannel) {
-                const dm = await handler.app.client.conversations.open({
-                    users: config.ownerUserId,
-                });
-                dmChannel = dm.channel.id;
-            }
             const lines = [
                 `:large_green_circle: *${task.repo}#${task.number} is review-ready*`,
                 'CI is green and your review is still requested.',
             ];
             if (autoReview) lines.push(autoReview);
             await handler.app.client.chat.postMessage({
-                channel: dmChannel,
+                channel: await openDm(),
                 text: lines.join('\n'),
                 unfurl_links: false,
                 unfurl_media: false,
             });
         }
+    }
+
+    // Your own PRs: speak only when a teammate actually moved something.
+    try {
+        const changed = await refreshMine(
+            handler.prTasks,
+            config.githubToken,
+            viewerLogin
+        );
+        for (const change of changed) {
+            logger.info(
+                `My PR ${change.task.repo}#${change.task.number}: `
+                + `${change.decision || 'no decision'}`
+                + (change.newComments ? ` · +${change.newComments} comment(s)` : '')
+            );
+            if (!config.ownerUserId) continue;
+            await handler.app.client.chat.postMessage({
+                channel: await openDm(),
+                text: buildMineChangeText(change),
+                unfurl_links: false,
+                unfurl_media: false,
+            });
+        }
+    } catch (err) {
+        logger.warn(`My-PR refresh failed: ${err.message}`);
     }
 
     if (config.ownerUserId) {

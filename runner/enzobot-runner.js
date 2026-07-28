@@ -84,6 +84,29 @@ async function executeJob(
         };
     }
 
+    if (job.kind === 'merge_pr') {
+        // gh prompts for a strategy when none is given, which would hang a
+        // non-interactive run — so always pass one.
+        const method = { merge: '--merge', rebase: '--rebase' }[payload.method]
+            || '--squash';
+        execFileSync('gh', [
+            'pr',
+            'merge',
+            String(payload.pr),
+            '--repo',
+            payload.repo,
+            method,
+        ], {
+            encoding: 'utf8',
+            timeout: 120_000,
+        });
+        return {
+            merged: true,
+            method: method.replace('--', ''),
+            url: `https://github.com/${payload.repo}/pull/${payload.pr}`,
+        };
+    }
+
     if (job.kind === 'review' || job.kind === 'apex_review') {
         const directory = path.join(config.jobsDir, String(job.id));
         fs.mkdirSync(directory, { recursive: true });

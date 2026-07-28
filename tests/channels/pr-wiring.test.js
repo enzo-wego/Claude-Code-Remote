@@ -53,6 +53,13 @@ describe('PR board socket wiring', () => {
                 ok: true,
                 json: async () => ({ login: 'enzo' }),
             })
+            // /user/teams — needed so team review requests are not missed.
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => ([
+                    { slug: 'payments-geeks', organization: { login: 'wego' } },
+                ]),
+            })
             .mockResolvedValueOnce({
                 ok: true,
                 json: async () => ({
@@ -86,6 +93,49 @@ describe('PR board socket wiring', () => {
             }),
         ]);
         expect(handler._publishHome).toHaveBeenCalledWith('UOWNER');
+    });
+
+    test('detects a PR routed to my team, with nobody named individually', async () => {
+        const handler = makeHandler();
+        jest.spyOn(global, 'fetch')
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({ login: 'enzo' }),
+            })
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => ([
+                    { slug: 'payments-geeks', organization: { login: 'wego' } },
+                ]),
+            })
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({
+                    title: 'Team-routed change',
+                    user: { login: 'alice' },
+                    head: { sha: 'abc123' },
+                    requested_reviewers: [],
+                    requested_teams: [{ slug: 'payments-geeks' }],
+                }),
+            })
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({
+                    check_runs: [{ status: 'completed', conclusion: 'success' }],
+                }),
+            });
+
+        await handler._detectPrsFromMessage({
+            text: 'eyes please https://github.com/wego/payments/pull/999',
+        });
+
+        expect(handler.prTasks.listActive()).toEqual([
+            expect.objectContaining({
+                number: 999,
+                review_state: 'requested',
+                lane: 'review',
+            }),
+        ]);
     });
 
     test('apex completion marks the linked PR drafted and DMs PR actions', async () => {

@@ -22,6 +22,8 @@ function extractPrUrls(text) {
 
 function needsMyReview({
     requestedReviewers = [],
+    requestedTeams = [],
+    myTeams = [],
     me,
     codeowner = false,
     author = null,
@@ -31,7 +33,13 @@ function needsMyReview({
     // rather than resting on that quirk, and it closes the hole for the
     // codeowner path, which would otherwise match your own PRs.
     if (author && me && author === me) return false;
-    return requestedReviewers.includes(me) || Boolean(codeowner);
+    if (requestedReviewers.includes(me) || Boolean(codeowner)) return true;
+
+    // A review aimed at a team you belong to is still aimed at you, and it
+    // never shows up in requested_reviewers. Compare on slug: requested_teams
+    // entries carry one, but not reliably their org.
+    const mySlugs = new Set(myTeams.map(team => String(team).split('/').pop()));
+    return requestedTeams.some(slug => mySlugs.has(slug));
 }
 
 module.exports = { extractPrUrls, needsMyReview };

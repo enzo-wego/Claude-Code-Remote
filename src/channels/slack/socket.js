@@ -28,7 +28,10 @@ const { extractPrUrls, needsMyReview } = require('../../services/pr-detect');
 const {
     fetchPrState,
     fetchViewerLogin,
+    fetchViewerTeams,
     refreshAll,
+    refreshMine,
+    sweepMyPrs,
     sweepReviewRequests,
 } = require('../../services/pr-monitor');
 const { runDailySummary, parseChannelsConfig } = require('../../services/daily-summary');
@@ -1636,14 +1639,33 @@ ${formatted}`,
         await this.app.client.views.publish({ user_id: userId, view });
     }
 
+    _githubToken() {
+        return this.config.githubToken || process.env.GITHUB_TOKEN || '';
+    }
+
     async _githubViewerLogin() {
         if (!this._githubViewerLoginPromise) {
-            const token = this.config.githubToken
-                || process.env.GITHUB_TOKEN
-                || '';
-            this._githubViewerLoginPromise = fetchViewerLogin(token);
+            this._githubViewerLoginPromise = fetchViewerLogin(this._githubToken());
         }
         return this._githubViewerLoginPromise;
+    }
+
+    /**
+     * Teams the owner belongs to, cached for the process lifetime. Needed
+     * because a review request aimed at a team never appears in
+     * requested_reviewers, and `review-requested:@me` does not match it either.
+     */
+    async _githubViewerTeams() {
+        if (!this._githubViewerTeamsPromise) {
+            this._githubViewerTeamsPromise = fetchViewerTeams(this._githubToken())
+                .catch(err => {
+                    this.logger.warn(
+                        `GitHub team lookup failed (team review requests will be missed): ${err.message}`
+                    );
+                    return [];
+                });
+        }
+        return this._githubViewerTeamsPromise;
     }
 
     async _detectPrsFromMessage(event) {
@@ -1663,6 +1685,7 @@ ${formatted}`,
         }
 
         const me = await this._githubViewerLogin();
+        const myTeams = await this._githubViewerTeams();
         const detected = [];
         for (const pull of urls) {
             try {
@@ -1670,9 +1693,13 @@ ${formatted}`,
                     repo: pull.repo,
                     number: pull.number,
                     token,
+                    viewerLogin: me,
+                    viewerTeams: myTeams,
                 });
                 if (!needsMyReview({
                     requestedReviewers: state.requestedReviewers,
+                    requestedTeams: state.requestedTeams,
+                    myTeams,
                     me,
                     codeowner: state.codeowner,
                     author: state.author,
@@ -1686,6 +1713,7 @@ ${formatted}`,
                     ci: state.ci,
                     reviewState: state.reviewState,
                     origin: 'slack',
+                    lane: 'review',
                 }));
             } catch (err) {
                 this.logger.warn(
@@ -1733,6 +1761,17 @@ ${formatted}`,
                     unfurl_links: false,
                     unfurl_media: false,
                 });
+                await this._publishHome(this.config.ownerUserId);
+            } else if (job.kind === 'merge_pr') {
+                const result = JSON.parse(job.result_json || '{}');
+                await this.app.client.chat.postMessage({
+                    channel: dm.channel.id,
+                    unfurl_links: false,
+                    unfurl_media: false,
+                    text: `:rocket: Merged (${result.method || 'squash'}): ${result.url || ''}`.trim(),
+                });
+                // The next sweep sees state=closed and retires the row, but
+                // repaint now so the button cannot be pressed twice.
                 await this._publishHome(this.config.ownerUserId);
             } else if (job.kind === 'post_review') {
                 const result = JSON.parse(job.result_json || '{}');
@@ -1953,12 +1992,17 @@ ${formatted}`,
             });
         }
 
+        // 🔗 Open is a plain URL button — Slack still dispatches an
+        // interaction for it, so ack it or Bolt logs an unhandled request.
+        this.app.action('pr_open', async ({ ack }) => { await ack(); });
+
         const prActionIds = [
             'pr_review_now',
             'pr_post',
             'pr_edit',
             'pr_discard',
             'pr_dismiss',
+            'pr_merge',
         ];
         for (const actionId of prActionIds) {
             this.app.action(actionId, async ({ ack, body, action }) => {
@@ -2016,8 +2060,11 @@ ${formatted}`,
                 }
                 const viewerLogin = await this._githubViewerLogin()
                     .catch(() => null);
-                await sweepReviewRequests(this.prTasks, token);
-                await refreshAll(this.prTasks, token, viewerLogin);
+                const teams = await this._githubViewerTeams();
+                await sweepReviewRequests(this.prTasks, token, { teams });
+                await sweepMyPrs(this.prTasks, token);
+                await refreshAll(this.prTasks, token, viewerLogin, teams);
+                await refreshMine(this.prTasks, token, viewerLogin);
             } catch (err) {
                 this.logger.error(`pr_refresh failed: ${err.message}`);
             }
