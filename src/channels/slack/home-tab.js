@@ -37,7 +37,7 @@ function buildHomeView(state) {
             type: 'context',
             elements: [{ type: 'mrkdwn', text: 'Repaints each time you open this tab' }],
         },
-        ...buildPrBoardBlocks(state.prTasks || []),
+        ...buildPrBoardBlocks(state.prTasks || [], { refreshing: state.refreshing }),
         {
             type: 'section',
             text: { type: 'mrkdwn', text: `*Service*  up ${fmtDuration(state.uptimeSec * 1000)} · Socket Mode connected` },

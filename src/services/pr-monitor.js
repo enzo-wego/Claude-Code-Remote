@@ -95,6 +95,25 @@ function reviewQueries(teams = []) {
     ];
 }
 
+/**
+ * Run `worker` over `items` with a bounded number in flight.
+ *
+ * The detail passes are the slow part of a cycle — one PR at a time meant a
+ * manual Refresh took 25s on 13 PRs, most of it waiting on round trips. Five at
+ * a time cuts that to a few seconds and stays far inside the rate limit.
+ */
+async function mapLimit(items, limit, worker) {
+    const queue = [...items];
+    const runners = Array.from({ length: Math.min(limit, queue.length) }, async () => {
+        while (queue.length) {
+            await worker(queue.shift());
+        }
+    });
+    await Promise.all(runners);
+}
+
+const DETAIL_CONCURRENCY = 5;
+
 /** GitHub ISO timestamp → epoch ms, or null. */
 function epoch(iso) {
     const ms = Date.parse(iso || '');
@@ -400,7 +419,7 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
     );
 
     for (const lane of ['review', 'team']) {
-        for (const task of prTasks.listActive(lane)) {
+        await mapLimit(prTasks.listActive(lane), DETAIL_CONCURRENCY, async task => {
             const state = await fetchPrState({
                 repo: task.repo,
                 number: task.number,
@@ -412,7 +431,7 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
                 // Merged or closed on GitHub — the review is moot, so retire
                 // the card instead of leaving stale work on the board.
                 prTasks.setStatus(task.id, 'closed');
-                continue;
+                return;
             }
             prTasks.upsert({
                 repo: task.repo,
@@ -426,7 +445,7 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
                 lane,
                 prCreatedAt: state.createdAt,
             });
-        }
+        });
     }
 
     return prTasks.reviewReady()
@@ -440,7 +459,7 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
 async function refreshMine(prTasks, token, viewerLogin) {
     const changed = [];
 
-    for (const task of prTasks.listActive('mine')) {
+    await mapLimit(prTasks.listActive('mine'), DETAIL_CONCURRENCY, async task => {
         const state = await fetchPrState({
             repo: task.repo,
             number: task.number,
@@ -449,7 +468,7 @@ async function refreshMine(prTasks, token, viewerLogin) {
         });
         if (state.closed) {
             prTasks.setStatus(task.id, 'closed');
-            continue;
+            return;
         }
 
         const [{ decision, decisionBy }, humanComments] = await Promise.all([
@@ -492,8 +511,8 @@ async function refreshMine(prTasks, token, viewerLogin) {
         // already seen, or the first sweep would DM every open PR at once.
         const isFirstSighting = task.seen_comments === null
             || task.seen_comments === undefined;
-        if (isFirstSighting) continue;
-        if (!decisionChanged && newComments === 0) continue;
+        if (isFirstSighting) return;
+        if (!decisionChanged && newComments === 0) return;
 
         changed.push({
             task: prTasks.get(task.id),
@@ -502,12 +521,13 @@ async function refreshMine(prTasks, token, viewerLogin) {
             decisionChanged,
             newComments,
         });
-    }
+    });
 
     return changed;
 }
 
 module.exports = {
+    mapLimit,
     fetchHumanCommentCount,
     fetchPrState,
     fetchReviewDecision,

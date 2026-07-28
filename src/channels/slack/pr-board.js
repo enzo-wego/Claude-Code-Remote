@@ -221,11 +221,12 @@ function mineLaneBlocks(tasks) {
     return blocks;
 }
 
-function buildPrBoardBlocks(prTasks = []) {
+function buildPrBoardBlocks(prTasks = [], { now = Date.now(), refreshing = false } = {}) {
     const review = prTasks.filter(task => (task.lane || 'review') === 'review');
     const mine = prTasks.filter(task => task.lane === 'mine');
     const team = prTasks.filter(task => task.lane === 'team');
 
+    const seconds = Math.floor(now / 1000);
     const blocks = [
         header('PR Review Board'),
         {
@@ -233,6 +234,18 @@ function buildPrBoardBlocks(prTasks = []) {
             // monitor cycle, then repaints. value is unused but Slack wants one.
             type: 'actions',
             elements: [button('pr_refresh', '🔄 Refresh now', 'refresh')],
+        },
+        {
+            // Without this there is no way to tell a fresh board from a stale
+            // one, which made "did Dismiss work?" unanswerable by looking.
+            // Slack renders <!date> in the viewer's own timezone.
+            type: 'context',
+            elements: [{
+                type: 'mrkdwn',
+                text: refreshing
+                    ? ':hourglass_flowing_sand: _refreshing from GitHub…_'
+                    : `_updated <!date^${seconds}^{date_short_pretty} {time}|just now>_`,
+            }],
         },
     ];
 

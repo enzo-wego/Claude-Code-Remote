@@ -1635,10 +1635,26 @@ ${formatted}`,
         }
     }
 
-    async _publishHome(userId = this.config.ownerUserId) {
+    async _publishHome(userId = this.config.ownerUserId, { refreshing = false } = {}) {
         if (!userId) return;
-        const view = buildHomeView(this._collectHomeState(userId));
-        await this.app.client.views.publish({ user_id: userId, view });
+        const state = this._collectHomeState(userId);
+        state.refreshing = refreshing;
+        const view = buildHomeView(state);
+        try {
+            await this.app.client.views.publish({ user_id: userId, view });
+            // Logged because a silent publish makes "is the board stale?"
+            // impossible to answer — Slack has no API to read a published view.
+            this.logger.debug(
+                `home published: user=${userId} blocks=${view.blocks.length}`
+                + ` prs=${(state.prTasks || []).length}`
+                + (refreshing ? ' (refreshing)' : '')
+            );
+        } catch (err) {
+            this.logger.error(
+                `home publish FAILED for ${userId}: ${err.data?.error || err.message}`
+            );
+            throw err;
+        }
     }
 
     _githubToken() {
@@ -2110,15 +2126,21 @@ ${formatted}`,
                 && userId !== this.config.ownerUserId) {
                 return;
             }
+            const target = userId || this.config.ownerUserId;
             try {
                 const token = this.config.githubToken
                     || process.env.GITHUB_TOKEN
                     || '';
                 if (!token) {
                     this.logger.warn('pr_refresh: no GitHub token configured');
-                    await this._publishHome(userId);
+                    await this._publishHome(target);
                     return;
                 }
+                // A full refresh is ~10s of round trips, so say so immediately
+                // rather than leaving the tap looking ignored.
+                await this._publishHome(target, { refreshing: true })
+                    .catch(() => {});
+
                 const viewerLogin = await this._githubViewerLogin()
                     .catch(() => null);
                 const teams = await this._githubViewerTeams();
@@ -2133,14 +2155,18 @@ ${formatted}`,
                         members, viewerLogin, org,
                     });
                 }
+                // The sweeps settle which PRs exist; publish that before the
+                // slower per-PR detail pass so the row set updates early.
+                await this._publishHome(target, { refreshing: true })
+                    .catch(() => {});
+
                 await refreshAll(this.prTasks, token, viewerLogin, teams);
                 await refreshMine(this.prTasks, token, viewerLogin);
             } catch (err) {
                 this.logger.error(`pr_refresh failed: ${err.message}`);
             }
             // Repaint regardless, so a failed sweep still shows current rows.
-            await this._publishHome(userId || this.config.ownerUserId)
-                .catch(() => {});
+            await this._publishHome(target).catch(() => {});
         });
 
         // Entity: App Home status board. Repaint whenever the user opens the tab.

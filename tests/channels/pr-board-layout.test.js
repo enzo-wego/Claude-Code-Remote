@@ -120,3 +120,50 @@ describe('Dismiss makes a row disappear and stay gone', () => {
         expect(onBoard(tasks)).toBe(false);
     });
 });
+
+describe('freshness line', () => {
+    const at = Date.parse('2026-07-28T14:35:00Z');
+
+    test('shows when the board was published, in the viewer timezone', () => {
+        const ctx = buildPrBoardBlocks([], { now: at })
+            .find(b => b.type === 'context');
+        // <!date^…> renders in each viewer's own timezone, so no hardcoded offset.
+        expect(ctx.elements[0].text).toContain(`<!date^${Math.floor(at / 1000)}^`);
+        expect(ctx.elements[0].text).toContain('updated');
+    });
+
+    test('says so while a manual refresh is in flight', () => {
+        const ctx = buildPrBoardBlocks([], { now: at, refreshing: true })
+            .find(b => b.type === 'context');
+        expect(ctx.elements[0].text).toContain('refreshing from GitHub');
+    });
+});
+
+describe('bounded concurrency', () => {
+    const { mapLimit } = require('../../src/services/pr-monitor');
+
+    test('covers every item and never exceeds the limit', async () => {
+        const items = Array.from({ length: 23 }, (_, i) => i);
+        const seen = [];
+        let inFlight = 0;
+        let peak = 0;
+
+        await mapLimit(items, 5, async item => {
+            inFlight += 1;
+            peak = Math.max(peak, inFlight);
+            await new Promise(resolve => setTimeout(resolve, 1));
+            seen.push(item);
+            inFlight -= 1;
+        });
+
+        expect(seen.sort((a, b) => a - b)).toEqual(items);
+        expect(peak).toBeLessThanOrEqual(5);
+        expect(peak).toBeGreaterThan(1);
+    });
+
+    test('an empty list starts no runners', async () => {
+        let called = false;
+        await mapLimit([], 5, async () => { called = true; });
+        expect(called).toBe(false);
+    });
+});
