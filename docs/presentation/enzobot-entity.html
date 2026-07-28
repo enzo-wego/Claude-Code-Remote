@@ -373,6 +373,50 @@ become Claims (provenance <code>DERIVED_FROM</code>, scoped <code>APPLIES_TO</co
 declares a complexity budget (quota, max jobs, evidence required), the 06:00 report passes a
 grounding evaluator, and the nightly ratchet measures/improves the Entity itself.</p>
 
+<h3>Plan details — what we do · what you get · how we verify</h3>
+
+<h3 style="margin-top:2rem">🅑 Plan B — Companion + agenda + morning brief <span class="tag done">plan ready · 11 TDD tasks</span></h3>
+<div class="scroll"><table>
+  <tr><td>Build</td><td>Agenda store + CLI (open loops, done-stays-done) · Slack-as-you / GitHub / Jira collectors + aggregator with per-source graceful degradation · Block Kit brief builder + poster · ✅💤▶ button handlers · <b>companion session routing</b> (owner DM → one durable session, resident + keepalive respawn via <code>--resume</code>) · companion home (persona CLAUDE.md + chief-of-staff skill) · scheduler + <code>POST /pulse</code>. Ships dark behind <code>COMPANION_ENABLED</code>.</td></tr>
+  <tr><td>Achieve</td><td>One continuous DM conversation (no more per-message amnesia — replying to any bot post continues the same mind) · a daily ranked brief with reasons and tap-to-triage · every open loop tracked until <em>you</em> close it · ▶ bridges any item into a working conversation.</td></tr>
+  <tr><td>Verify</td><td><b>Automated:</b> jest per task (~15 tests: agenda CRUD + snooze/sticky-done, collector normalizers on fixtures, brief blocks, button handlers, companion key helpers). <b>Dry:</b> <code>POST /pulse?dry_run=1</code> returns candidates JSON, no DM. <b>Live:</b> DM the bot twice → SQLite shows ONE <code>enzobot-companion</code> row; trigger pulse → brief arrives; tap 💤 → item vanishes from <code>agenda-cli list</code>; <code>npm run restart</code> → next reply continues the same conversation.</td></tr>
+</table></div>
+
+<h3>🅓 Plan D — Mac execution plane + auto-review <span class="tag done">plan ready · 9 tasks</span></h3>
+<div class="scroll"><table>
+  <tr><td>Build</td><td>Jobs queue with lease semantics (TTL, retries, 3-attempt cap, dedupe) · token-authed <code>/runner/lease|complete|fail</code> + <code>/jobs</code> · result→DM with 📤 Post / 🗑 Discard · jobs CLI · review prompt (git-worktree isolation, draft-only, file-based result) · herdr pane lifecycle wrapper (own <code>enzobot</code> workspace only) · dependency-free launchd runner daemon · install guide · auto-enqueue sweep on review-requested PRs.</td></tr>
+  <tr><td>Achieve</td><td>Heavy jobs run on your Mac in <b>watchable</b> herdr panes · review requests arrive already drafted · posting happens from your own <code>gh</code> auth behind one tap — <b>zero write credentials on the VPS</b> · lid closed = jobs wait, lid open = drains in seconds.</td></tr>
+  <tr><td>Verify</td><td><b>Automated:</b> jest for lease semantics (expired lease reclaim, wrong-lease rejected, terminal fail), endpoint auth, result blocks, runner job routing (mocked herdr). <b>Live smoke:</b> pane spawns, Claude answers READY, tail readable. <b>End-to-end checklist:</b> enqueue a real PR → runner leases in ~10s → review-N tab appears in herdr → draft DM with buttons → tap 📤 → review posted as you → confirmation DM. <b>Lid test:</b> close lid, enqueue, wait, open → job drains.</td></tr>
+</table></div>
+
+<h3>🅔 Plan E — Night work cycle + Home board <span class="tag v1">to write next</span></h3>
+<div class="scroll"><table>
+  <tr><td>Build</td><td>22:00 planning pulse (analyze since yesterday 22:00 → typed night plan with <b>complexity budget</b>: quota estimate, max jobs, evidence required → DM with Approve/Edit/Skip) · approval → batch enqueue to the jobs queue · midnight easy-task whitelist (runs without confirm) · 06:00 report pulse with <b>grounding evaluator</b> (every claim must cite its artifact or graph path) · nightly <b>ratchet</b> (measure → one bounded directive/config change → keep-or-revert, code changes become PR suggestions) · full Home board (Overview / Jobs / Agenda / Tonight / Rules with actions).</td></tr>
+  <tr><td>Achieve</td><td>You approve one plan at 22:00 and wake at 06:00 to finished work + your day already planned · quota burns overnight instead of competing with your daytime · the agent measurably improves itself with a full audit trail · the Home tab becomes the Entity's control panel.</td></tr>
+  <tr><td>Verify</td><td><b>Automated:</b> jest for plan builder, budget estimator, report grounding (a claim without evidence is rejected in test), ratchet supersede/revert path. <b>Staged:</b> trigger the 22:00 pulse manually → approve → jobs appear in queue; trigger 06:00 → report cites artifacts/paths. <b>Live week:</b> draft edit-distance and interrupt precision trend downward/upward respectively — the ratchet's own metrics are the acceptance test.</td></tr>
+</table></div>
+
+<h3>⚙ Enable — go live <span class="tag v1">after B + D</span></h3>
+<div class="scroll"><table>
+  <tr><td>Build</td><td>VPS: read-scoped GitHub PAT + Jira token in <code>.env</code> · <code>setup-companion-home</code> · <code>COMPANION_ENABLED=true</code>, <code>RUNNER_TOKEN</code> · Mac: <code>~/.enzobot-runner.json</code> + launchd load · night-power choice (<code>pmset</code>/Amphetamine/none).</td></tr>
+  <tr><td>Achieve</td><td>Everything above running for real, on your accounts, on both machines.</td></tr>
+  <tr><td>Verify</td><td>First live brief arrives on schedule · button round-trip works from your phone · one real PR reviewed end-to-end · <code>tail -f /tmp/enzobot-runner.log</code> shows healthy polling · Home tab reflects it all.</td></tr>
+</table></div>
+
+<h3>🅐 Plan A — Directives + MCP (agent-mem, Go) <span class="tag v1">to write</span></h3>
+<div class="scroll"><table>
+  <tr><td>Build</td><td><code>directives</code> as Claims: <code>kind persona|rule</code>, <code>DERIVED_FROM</code> episode (provenance), <code>APPLIES_TO</code> entities (scoped injection), <code>SUPERSEDES</code> (versioning, old rules stay addressable), <code>source taught|inferred</code> + confidence · <code>GET/POST/PATCH /api/directives</code> · session-start injection gains "Who you are" + "Standing rules" (scoped) · thin MCP shim exposing <code>graph_search / graph_resolve / mem_search / directive_*</code> as first-class tools.</td></tr>
+  <tr><td>Achieve</td><td>One identity everywhere: teach a rule once in the DM, every session on every machine (Claude/Codex/Gemini) obeys it · a readable audit trail of who the agent is becoming · memory becomes tools the companion reaches for mid-thought instead of curl.</td></tr>
+  <tr><td>Verify</td><td><b>Automated:</b> Go tests for CRUD, injection rendering, scope filtering, supersede chains. <b>Live:</b> add a rule via the companion → open a fresh session on the Mac → "Standing rules" block contains it; supersede it → gone from injection, still queryable; call <code>graph_resolve</code> as an MCP tool from a live session.</td></tr>
+</table></div>
+
+<h3>🅒 Plan C — Interrupts + one-mind glue <span class="tag v1">to write</span></h3>
+<div class="scroll"><table>
+  <tr><td>Build</td><td>Tier-1 heuristics in the existing message listener (mentions you / watched topic / own-PR state change / incident channels) · Tier-2 cheap classifier ("does Enzo need this before his next brief?") · DM ping with permalink + one-line why + per-hour cap · lifecycle whispers (session start/stop one-liners into the companion) · introspection skill (companion reads its own live panes: tmux <code>capture-pane</code> on VPS, herdr <code>pane read</code> on Mac).</td></tr>
+  <tr><td>Achieve</td><td>It speaks the moment something matters — ~99% of noise killed before it reaches you · the companion always knows what its hands are doing · "how's the incident going?" answered from the live pane, mid-task.</td></tr>
+  <tr><td>Verify</td><td><b>Automated:</b> jest for Tier-1 on fixture events (pass/kill matrix) · classifier evaluated against a labeled sample of real channel messages (precision target ≥80% before enabling pings). <b>Live:</b> make your own PR go CI-red → ping within ~1 min with the why · ask "what are you doing?" during a live Mac job → answer quotes the pane.</td></tr>
+</table></div>
+
 <p class="muted">Repo docs are the source of truth: spec + plans under <code>docs/superpowers/</code>,
 this page under <code>docs/presentation/enzobot-entity.html</code>. Conversations above are
 illustrative; phrasing and rankings will be the model's own.</p>
