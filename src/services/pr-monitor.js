@@ -467,7 +467,13 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
                     reviewDecision: decision,
                     decisionBy,
                 });
-            } catch (_) { /* keep the previous decision */ }
+            } catch (err) {
+                // Keep the previous decision, but say so — a swallowed failure
+                // here looks exactly like "nobody has reviewed it".
+                console.warn(
+                    `PR decision fetch failed for ${task.repo}#${task.number}: ${err.message}`
+                );
+            }
         });
     }
 
