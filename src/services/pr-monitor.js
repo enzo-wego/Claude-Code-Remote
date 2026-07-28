@@ -143,6 +143,17 @@ async function fetchPrState({ repo, number, token, viewerLogin, viewerTeams = []
 }
 
 /**
+ * Review bots (CodeRabbit, the Codex connector, …) comment on essentially every
+ * PR, so counting them as reviewers makes "someone replied" fire constantly and
+ * mean nothing. They are excluded everywhere: the question this lane answers is
+ * whether a *person* has weighed in.
+ */
+function isBot(user) {
+    if (!user) return false;
+    return user.type === 'Bot' || /\[bot\]$/i.test(user.login || '');
+}
+
+/**
  * Who has weighed in, and how. GitHub's REST pull payload has no review
  * decision field, so derive it the way GitHub does: only APPROVED and
  * CHANGES_REQUESTED are decisive, latest one per reviewer wins, and your own
@@ -159,6 +170,7 @@ async function fetchReviewDecision({ repo, number, token, viewerLogin }) {
     for (const review of Array.isArray(reviews) ? reviews : []) {
         const who = review.user?.login;
         if (!who || (viewerLogin && who === viewerLogin)) continue;
+        if (isBot(review.user)) continue;
         const state = String(review.state || '').toUpperCase();
         if (state === 'APPROVED' || state === 'CHANGES_REQUESTED') {
             latest.set(who, state);
@@ -176,6 +188,39 @@ async function fetchReviewDecision({ repo, number, token, viewerLogin }) {
     if (approval) return { decision: 'approved', decisionBy: approval[0] };
     if (commented) return { decision: 'commented', decisionBy: commented };
     return { decision: null, decisionBy: null };
+}
+
+/**
+ * Comments written by actual people, excluding your own.
+ *
+ * The `comments` / `review_comments` totals on the pull payload are free but
+ * count bots, and on these repos bots outnumber humans roughly 10:1 — a
+ * watermark built on them would fire on every CodeRabbit pass. Two extra calls
+ * buys a signal that means what it says.
+ */
+async function fetchHumanCommentCount({ repo, number, token, viewerLogin }) {
+    const [issueComments, reviewComments] = await Promise.all([
+        githubJson(
+            `${GITHUB_API}/repos/${repo}/issues/${number}/comments?per_page=100`,
+            token
+        ),
+        githubJson(
+            `${GITHUB_API}/repos/${repo}/pulls/${number}/comments?per_page=100`,
+            token
+        ),
+    ]);
+
+    const humans = comment => {
+        const who = comment.user?.login;
+        if (!who) return false;
+        if (viewerLogin && who === viewerLogin) return false;
+        return !isBot(comment.user);
+    };
+
+    return [
+        ...(Array.isArray(issueComments) ? issueComments : []),
+        ...(Array.isArray(reviewComments) ? reviewComments : []),
+    ].filter(humans).length;
 }
 
 async function fetchViewerLogin(token) {
@@ -316,12 +361,20 @@ async function refreshMine(prTasks, token, viewerLogin) {
             continue;
         }
 
-        const { decision, decisionBy } = await fetchReviewDecision({
-            repo: task.repo,
-            number: task.number,
-            token,
-            viewerLogin,
-        });
+        const [{ decision, decisionBy }, humanComments] = await Promise.all([
+            fetchReviewDecision({
+                repo: task.repo,
+                number: task.number,
+                token,
+                viewerLogin,
+            }),
+            fetchHumanCommentCount({
+                repo: task.repo,
+                number: task.number,
+                token,
+                viewerLogin,
+            }),
+        ]);
 
         prTasks.upsert({
             repo: task.repo,
@@ -334,16 +387,13 @@ async function refreshMine(prTasks, token, viewerLogin) {
             lane: 'mine',
         });
 
-        // ponytail: comment count includes your own replies, so a self-reply
-        // reads as activity. Upgrade path if that grates: page
-        // /issues/{n}/comments and filter by author.
-        const newComments = Math.max(0, state.comments - (task.seen_comments || 0));
+        const newComments = Math.max(0, humanComments - (task.seen_comments || 0));
         const decisionChanged = (decision || null) !== (task.review_decision || null);
 
         prTasks.setMineState(task.id, {
             reviewDecision: decision,
             decisionBy,
-            seenComments: state.comments,
+            seenComments: humanComments,
         });
 
         // A first sighting is not news — only report movement on rows we had
@@ -366,6 +416,7 @@ async function refreshMine(prTasks, token, viewerLogin) {
 }
 
 module.exports = {
+    fetchHumanCommentCount,
     fetchPrState,
     fetchReviewDecision,
     fetchViewerLogin,

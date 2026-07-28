@@ -2,6 +2,7 @@ const Database = require('better-sqlite3');
 const PrTasks = require('../../src/services/pr-tasks');
 const {
     fetchPrState,
+    fetchHumanCommentCount,
     fetchReviewDecision,
     refreshMine,
     reviewQueries,
@@ -180,11 +181,17 @@ describe('sweepMyPrs', () => {
 describe('refreshMine', () => {
     afterEach(() => { jest.restoreAllMocks(); });
 
-    function mockCycle(spy, { pull, reviews }) {
+    // pull → check-runs → reviews → issue comments → review comments
+    function mockCycle(spy, { pull, reviews, issueComments = [], reviewComments = [] }) {
         jsonOnce(spy, pull);
         jsonOnce(spy, { check_runs: [{ status: 'completed', conclusion: 'success' }] });
         jsonOnce(spy, reviews);
+        jsonOnce(spy, issueComments);
+        jsonOnce(spy, reviewComments);
     }
+
+    const human = login => ({ user: { login, type: 'User' } });
+    const bot = login => ({ user: { login, type: 'Bot' } });
 
     const basePull = {
         state: 'open',
@@ -201,8 +208,9 @@ describe('refreshMine', () => {
         const tasks = createTasks();
         const task = tasks.upsert({ repo: 'a/b', number: 1, url: 'u', lane: 'mine' });
         mockCycle(jest.spyOn(global, 'fetch'), {
-            pull: { ...basePull, comments: 4 },
-            reviews: [{ user: { login: 'sarah' }, state: 'APPROVED' }],
+            pull: basePull,
+            reviews: [{ user: { login: 'sarah', type: 'User' }, state: 'APPROVED' }],
+            issueComments: [human('sarah'), human('minh'), human('sarah'), human('minh')],
         });
 
         const changed = await refreshMine(tasks, 'token', 'enzo');
@@ -223,7 +231,7 @@ describe('refreshMine', () => {
         const spy = jest.spyOn(global, 'fetch');
         mockCycle(spy, {
             pull: basePull,
-            reviews: [{ user: { login: 'sarah' }, state: 'APPROVED' }],
+            reviews: [{ user: { login: 'sarah', type: 'User' }, state: 'APPROVED' }],
         });
         const first = await refreshMine(tasks, 'token', 'enzo');
         expect(first).toHaveLength(1);
@@ -233,7 +241,7 @@ describe('refreshMine', () => {
         // Same state next cycle — silence.
         mockCycle(spy, {
             pull: basePull,
-            reviews: [{ user: { login: 'sarah' }, state: 'APPROVED' }],
+            reviews: [{ user: { login: 'sarah', type: 'User' }, state: 'APPROVED' }],
         });
         expect(await refreshMine(tasks, 'token', 'enzo')).toHaveLength(0);
     });
@@ -244,8 +252,10 @@ describe('refreshMine', () => {
         tasks.setMineState(task.id, { seenComments: 2 });
 
         mockCycle(jest.spyOn(global, 'fetch'), {
-            pull: { ...basePull, comments: 3, review_comments: 2 },
+            pull: basePull,
             reviews: [],
+            issueComments: [human('sarah'), human('minh'), human('sarah')],
+            reviewComments: [human('minh'), human('sarah')],
         });
 
         const changed = await refreshMine(tasks, 'token', 'enzo');
@@ -337,5 +347,54 @@ describe('sweepReviewRequests own-PR guard', () => {
 
         expect(seeded).toHaveLength(1);
         expect(tasks.listActive('review')).toHaveLength(1);
+    });
+});
+
+describe('bots are not teammates', () => {
+    afterEach(() => { jest.restoreAllMocks(); });
+
+    test('a bot approval is not a review decision', async () => {
+        jsonOnce(jest.spyOn(global, 'fetch'), [
+            { user: { login: 'coderabbitai[bot]', type: 'Bot' }, state: 'APPROVED' },
+        ]);
+        expect(await fetchReviewDecision({
+            repo: 'a/b', number: 1, token: 't', viewerLogin: 'enzo',
+        })).toEqual({ decision: null, decisionBy: null });
+    });
+
+    test('a [bot] login is caught even without type: Bot', async () => {
+        jsonOnce(jest.spyOn(global, 'fetch'), [
+            { user: { login: 'chatgpt-codex-connector[bot]' }, state: 'COMMENTED' },
+        ]);
+        expect(await fetchReviewDecision({
+            repo: 'a/b', number: 1, token: 't', viewerLogin: 'enzo',
+        })).toEqual({ decision: null, decisionBy: null });
+    });
+
+    test('a human still gets through alongside bots', async () => {
+        jsonOnce(jest.spyOn(global, 'fetch'), [
+            { user: { login: 'coderabbitai[bot]', type: 'Bot' }, state: 'CHANGES_REQUESTED' },
+            { user: { login: 'sarah', type: 'User' }, state: 'APPROVED' },
+        ]);
+        expect(await fetchReviewDecision({
+            repo: 'a/b', number: 1, token: 't', viewerLogin: 'enzo',
+        })).toEqual({ decision: 'approved', decisionBy: 'sarah' });
+    });
+
+    test('comment count ignores bots and your own replies', async () => {
+        const spy = jest.spyOn(global, 'fetch');
+        jsonOnce(spy, [
+            { user: { login: 'coderabbitai[bot]', type: 'Bot' } },
+            { user: { login: 'enzo', type: 'User' } },
+            { user: { login: 'sarah', type: 'User' } },
+        ]);
+        jsonOnce(spy, [
+            { user: { login: 'chatgpt-codex-connector[bot]', type: 'Bot' } },
+            { user: { login: 'minh', type: 'User' } },
+        ]);
+
+        expect(await fetchHumanCommentCount({
+            repo: 'a/b', number: 1, token: 't', viewerLogin: 'enzo',
+        })).toBe(2);
     });
 });
