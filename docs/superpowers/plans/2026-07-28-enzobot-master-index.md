@@ -10,7 +10,7 @@ this file first, then the individual plan it points to. Execute plans in the ord
 
 | # | Plan file | Repo(s) touched | Depends on |
 |---|-----------|-----------------|------------|
-| **1** | **`2026-07-28-enzobot-plan-h-home-task-board.md` (Plan H)** | Claude-Code-Remote | Plan B tasks 1,3,4,5,6 (agenda + collectors) |
+| **1** | **`2026-07-28-enzobot-plan-h-pr-board.md` (Plan H — PR review board)** | Claude-Code-Remote (+ Mac runner) | Plan D slice (queue+runner) + Plan B GitHub collector |
 | 2 | `2026-07-18-enzobot-companion-v1.md` (Plan B) | Claude-Code-Remote | — |
 | 3 | `2026-07-23-enzobot-plan-d-mac-runner.md` (Plan D) | Claude-Code-Remote (+ Mac runner dir) | B |
 | 4 | `2026-07-28-enzobot-plan-e-night-cycle.md` (Plan E) | Claude-Code-Remote | B, D |
@@ -18,14 +18,15 @@ this file first, then the individual plan it points to. Execute plans in the ord
 | 6 | `2026-07-28-enzobot-plan-a-directives.md` (Plan A) | **agent-mem** (Go) | — (parallelizable) |
 | 7 | `2026-07-28-enzobot-plan-c-interrupts.md` (Plan C) | Claude-Code-Remote | B |
 
-**Plan H is the new Step 1 (human-in-the-loop task board).** It builds the shared task board
-on the Home tab — you and EnzoBot co-define tasks, you accept/reject its suggestions and
-manually add/status your own — BEFORE any autonomy. It reuses Plan B's agenda store + collectors
-(build those five tasks as part of H), and validates that EnzoBot picks the right work before
-Plans D/E ever act unattended. When Plan B's companion/brief later lands, it reads/writes the
-SAME agenda table, so the board and the brief stay in sync automatically.
+**Plan H is the new Step 1 — a PR REVIEW BOARD** (owner refocus 2026-07-28). Three stages:
+S1 detect PRs needing your review (from Slack messages + GitHub review-requested), S2 monitor
+CI/review state, S3 run `/apex-review` on your Mac herdr → draft review → you tap 📤 Post
+(posts as you; apex-review never auto-posts, leash intact). It reuses Plan D's jobs queue +
+runner (build that slice first) and Plan B's GitHub collector, and proves EnzoBot picks & reviews
+the right PRs before broader autonomy. Later plans read the same `pr_tasks` store.
 
-**Provider APIs:** Plan H adds **none** — pure HTTP collectors + SQLite + Block Kit.
+**Provider APIs:** Plan H adds **none** — detection/monitor is GitHub REST; the review is
+Claude Code (`/apex-review`) in a herdr pane on the Mac.
 
 Plan A is in a **different repository** (`agent-mem`, Go). It has no code dependency on B/D/E
 and can be executed in parallel by a separate worker. Everything else is in this repo
