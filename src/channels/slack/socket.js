@@ -14,6 +14,7 @@ const fs = require('fs');
 const axios = require('axios');
 const Logger = require('../../core/logger');
 const Jobs = require('../../services/jobs');
+const PrTasks = require('../../services/pr-tasks');
 const AlertMonitor = require('./alert-monitor');
 const DelayAlertMonitor = require('./delay-alert-monitor');
 const { AccessControl } = require('./access-control');
@@ -433,6 +434,7 @@ class SlackSocketHandler {
         }
 
         this.jobs = new Jobs(this.db);
+        this.prTasks = new PrTasks(this.db);
     }
 
     _saveSession(session) {
