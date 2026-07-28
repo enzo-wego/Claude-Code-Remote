@@ -2061,7 +2061,7 @@ ${formatted}`,
                 const viewerLogin = await this._githubViewerLogin()
                     .catch(() => null);
                 const teams = await this._githubViewerTeams();
-                await sweepReviewRequests(this.prTasks, token, { teams });
+                await sweepReviewRequests(this.prTasks, token, { teams, viewerLogin });
                 await sweepMyPrs(this.prTasks, token);
                 await refreshAll(this.prTasks, token, viewerLogin, teams);
                 await refreshMine(this.prTasks, token, viewerLogin);

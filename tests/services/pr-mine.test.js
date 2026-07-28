@@ -6,6 +6,7 @@ const {
     refreshMine,
     reviewQueries,
     sweepMyPrs,
+    sweepReviewRequests,
 } = require('../../src/services/pr-monitor');
 const { needsMyReview } = require('../../src/services/pr-detect');
 const { buildMineChangeText } = require('../../src/channels/slack/pr-board');
@@ -289,5 +290,52 @@ describe('buildMineChangeText', () => {
             newComments: 1,
         });
         expect(text).toContain('1 new comment on');
+    });
+});
+
+describe('sweepReviewRequests own-PR guard', () => {
+    afterEach(() => { jest.restoreAllMocks(); });
+
+    test('a team-requested PR you authored goes nowhere near the review lane', async () => {
+        const tasks = createTasks();
+        // team-review-requested: can return your own PR — review-requested:@me
+        // never could, so this guard only became necessary with team queries.
+        jsonOnce(jest.spyOn(global, 'fetch'), {
+            items: [{
+                html_url: 'https://github.com/wego/payments/pull/2206',
+                title: 'PAY-2208: Train tax product codes',
+                user: { login: 'enzo' },
+            }],
+        });
+
+        const seeded = await sweepReviewRequests(tasks, 'token', {
+            teams: ['wego/payments-geeks'],
+            viewerLogin: 'enzo',
+        });
+
+        expect(seeded).toHaveLength(0);
+        expect(tasks.listActive()).toHaveLength(0);
+        expect(tasks.reviewReady()).toHaveLength(0);
+    });
+
+    test("a teammate's team-requested PR is still seeded", async () => {
+        const tasks = createTasks();
+        const spy = jest.spyOn(global, 'fetch');
+        jsonOnce(spy, { items: [] });                       // review-requested:@me
+        jsonOnce(spy, {                                     // team-review-requested
+            items: [{
+                html_url: 'https://github.com/wego/payments/pull/2207',
+                title: 'Someone else work',
+                user: { login: 'alice' },
+            }],
+        });
+
+        const seeded = await sweepReviewRequests(tasks, 'token', {
+            teams: ['wego/payments-geeks'],
+            viewerLogin: 'enzo',
+        });
+
+        expect(seeded).toHaveLength(1);
+        expect(tasks.listActive('review')).toHaveLength(1);
     });
 });

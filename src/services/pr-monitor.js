@@ -196,7 +196,7 @@ async function fetchViewerLogin(token) {
  * upsert() never touches `status`, so a PR the owner already dismissed or
  * finished stays retired instead of reappearing each sweep.
  */
-async function sweepReviewRequests(prTasks, token, { teams = [] } = {}) {
+async function sweepReviewRequests(prTasks, token, { teams = [], viewerLogin } = {}) {
     const seeded = [];
     const seen = new Set();
 
@@ -214,6 +214,12 @@ async function sweepReviewRequests(prTasks, token, { teams = [] } = {}) {
         for (const item of items) {
             const pull = parsePrUrl(item.html_url);
             if (!pull) continue;
+            const author = item.user?.login || null;
+            // `review-requested:@me` can never return your own PR, but
+            // `team-review-requested:` can — you are allowed to ask your own
+            // team to review your work. Without this the review lane would
+            // pick up your PRs and auto-review could fire on them.
+            if (viewerLogin && author === viewerLogin) continue;
             const key = `${pull.repo.toLowerCase()}#${pull.number}`;
             if (seen.has(key)) continue;
             seen.add(key);
@@ -221,7 +227,7 @@ async function sweepReviewRequests(prTasks, token, { teams = [] } = {}) {
                 ...pull,
                 url: item.html_url,
                 title: item.title || null,
-                author: item.user?.login || null,
+                author,
                 reviewState: 'requested',
                 origin: 'github-sweep',
                 lane: 'review',

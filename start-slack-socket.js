@@ -283,7 +283,7 @@ async function runPrMonitor() {
         const seeded = await sweepReviewRequests(
             handler.prTasks,
             config.githubToken,
-            { teams }
+            { teams, viewerLogin }
         );
         if (seeded.length) {
             logger.info(`PR sweep: ${seeded.length} PR(s) awaiting your review`);
