@@ -37,6 +37,18 @@ function buildApexReviewPrompt(payload, resultPath) {
         // A real GitHub approval must not hinge on grepping "LGTM" out of prose.
         `Write exactly one word to ${resultPath}.verdict — "approve" if there are`,
         'zero blocking findings, otherwise "comment". No punctuation, no explanation.',
+        '',
+        `Also write ${resultPath}.review.json so findings can be posted inline:`,
+        '  {"body": "<markdown for the review-level summary>",',
+        '   "comments": [{"path": "pkg/x/y.go", "line": 113, "start_line": 106,',
+        '                 "body": "<the finding, markdown>"}]}',
+        'Rules for that file:',
+        '- `line` is a line number in the NEW file, and it MUST be one the PR diff',
+        '  touches — GitHub rejects the whole review otherwise. If a finding is about',
+        '  code the PR did not change, leave it out of `comments` and write it into',
+        '  `body` instead. Omit `start_line` unless the finding spans a range.',
+        '- Every finding appears exactly once: inline or in the body, never both.',
+        '- `body` always carries the verdict line.',
         'Then print RESULT_READY.',
         'Do NOT post anything to GitHub. Draft only.',
     ].join('\n');

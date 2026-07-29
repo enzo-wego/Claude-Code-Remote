@@ -267,3 +267,116 @@ describe('approve vs comment', () => {
         }
     });
 });
+
+describe('inline review comments', () => {
+    // A real patch: hunk starts at new-file line 106, so 106..110 are
+    // commentable and anything outside is not.
+    const PATCH = [
+        '@@ -100,4 +106,5 @@ func handle() {',
+        ' 	ctx := r.Context()',
+        '+	defer recoverPanic(ctx)',
+        ' 	if err != nil {',
+        '-		log.Print(err)',
+        '+		log.Error(ctx, err)',
+        ' 	}',
+    ].join('\n');
+
+    const post = async (comments, method = 'comment') => {
+        const jobsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'inline-'));
+        const calls = [];
+        const gh = jest.fn((bin, args) => {
+            calls.push(args);
+            if (args[0] === 'api' && args.includes('--paginate')) {
+                return JSON.stringify([
+                    { filename: 'pkg/http/rest/automation_handlers.go', patch: PATCH },
+                ]);
+            }
+            return '';
+        });
+        const result = await executeJob(
+            {
+                id: 21,
+                kind: 'post_review',
+                payload_json: JSON.stringify({
+                    repo: 'wego/payments', pr: 2210, method,
+                    body_md: 'fallback body',
+                    review: { body: '**LGTM**', comments },
+                }),
+            },
+            { jobsDir, repoMap: {} },
+            {},
+            { execFileSync: gh }
+        );
+        const postCall = calls.find(a => a.includes('--method'));
+        const sent = JSON.parse(fs.readFileSync(
+            path.join(jobsDir, '21', 'review.json'), 'utf8'
+        ));
+        return { result, postCall, sent };
+    };
+
+    test('anchors findings on lines the diff touches', async () => {
+        const { result, postCall, sent } = await post([
+            { path: 'pkg/http/rest/automation_handlers.go', line: 107, body: 'panic swallowed' },
+            { path: 'pkg/http/rest/automation_handlers.go', line: 110, start_line: 108, body: 'range finding' },
+        ]);
+
+        expect(postCall).toContain('repos/wego/payments/pulls/2210/reviews');
+        expect(sent.event).toBe('COMMENT');
+        expect(sent.comments).toHaveLength(2);
+        expect(sent.comments[0]).toEqual(expect.objectContaining({
+            path: 'pkg/http/rest/automation_handlers.go', line: 107, side: 'RIGHT',
+        }));
+        expect(sent.comments[1]).toEqual(expect.objectContaining({
+            start_line: 108, start_side: 'RIGHT', line: 110,
+        }));
+        expect(result.inline_comments).toBe(2);
+        expect(result.body_only).toBe(0);
+    });
+
+    /** The whole review 422s if one anchor is out of range, so they move. */
+    test('findings outside the diff move into the body, never dropped', async () => {
+        const { result, sent } = await post([
+            { path: 'pkg/http/rest/automation_handlers.go', line: 107, body: 'in range' },
+            { path: 'pkg/http/rest/automation_handlers.go', line: 900, body: 'untouched code' },
+            { path: 'pkg/other/never_in_diff.go', line: 12, body: 'file not in PR' },
+        ]);
+
+        expect(sent.comments).toHaveLength(1);
+        expect(result.inline_comments).toBe(1);
+        expect(result.body_only).toBe(2);
+        expect(sent.body).toContain('Not anchorable');
+        expect(sent.body).toContain('automation_handlers.go:900');
+        expect(sent.body).toContain('untouched code');
+        expect(sent.body).toContain('never_in_diff.go:12');
+    });
+
+    test('approving carries the inline comments in the same review', async () => {
+        const { sent, result } = await post(
+            [{ path: 'pkg/http/rest/automation_handlers.go', line: 108, body: 'nit' }],
+            'approve'
+        );
+        expect(sent.event).toBe('APPROVE');
+        expect(sent.comments).toHaveLength(1);
+        expect(result.approved).toBe(true);
+    });
+
+    test('no structured findings falls back to one review-level comment', async () => {
+        const jobsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fallback-'));
+        const gh = jest.fn().mockReturnValue('');
+        const result = await executeJob(
+            {
+                id: 22,
+                kind: 'post_review',
+                payload_json: JSON.stringify({
+                    repo: 'wego/payments', pr: 2210,
+                    body_md: 'plain review', review: null,
+                }),
+            },
+            { jobsDir, repoMap: {} },
+            {},
+            { execFileSync: gh }
+        );
+        expect(gh.mock.calls[0][1]).toEqual(expect.arrayContaining(['pr', 'review', '--comment']));
+        expect(result.inline_comments).toBe(0);
+    });
+});

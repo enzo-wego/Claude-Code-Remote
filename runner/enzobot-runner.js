@@ -46,6 +46,80 @@ function repoPath(config, repo) {
 }
 
 /**
+ * Line numbers in the new file that a PR's diff actually touches.
+ *
+ * GitHub only accepts an inline comment on a line inside a diff hunk, and it
+ * rejects the ENTIRE review — not just the offending comment — when one is out
+ * of range. So every anchor is checked against the real patch before posting.
+ */
+function commentableLines(patch) {
+    const lines = new Set();
+    let n = 0;
+    for (const row of String(patch || '').split('\n')) {
+        const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(row);
+        if (hunk) {
+            n = Number(hunk[1]);
+            continue;
+        }
+        if (row.startsWith('+') || row.startsWith(' ')) {
+            lines.add(n);
+            n += 1;
+        }
+        // '-' rows exist only on the left side; '\' is "no newline at EOF".
+    }
+    return lines;
+}
+
+/**
+ * Split findings into those GitHub will accept inline and those it will not.
+ * A finding is never dropped — an unanchorable one moves into the review body
+ * with its location written out, which is exactly what the old single-comment
+ * behaviour did for everything.
+ */
+function partitionComments(comments, filePatches) {
+    const inline = [];
+    const orphans = [];
+    for (const c of Array.isArray(comments) ? comments : []) {
+        const allowed = filePatches.get(c.path);
+        const endOk = allowed && allowed.has(Number(c.line));
+        const startOk = c.start_line === undefined
+            || c.start_line === null
+            || (allowed && allowed.has(Number(c.start_line)));
+        if (!endOk || !startOk) {
+            orphans.push(c);
+            continue;
+        }
+        const entry = {
+            path: c.path,
+            line: Number(c.line),
+            side: 'RIGHT',
+            body: String(c.body || ''),
+        };
+        if (c.start_line !== undefined && c.start_line !== null
+            && Number(c.start_line) !== Number(c.line)) {
+            entry.start_line = Number(c.start_line);
+            entry.start_side = 'RIGHT';
+        }
+        inline.push(entry);
+    }
+    return { inline, orphans };
+}
+
+function orphanSection(orphans) {
+    if (!orphans.length) return '';
+    const rows = orphans.map(c => {
+        const at = c.start_line && Number(c.start_line) !== Number(c.line)
+            ? `${c.path}:${c.start_line}-${c.line}`
+            : `${c.path}:${c.line}`;
+        return `**\`${at}\`** — ${String(c.body || '').trim()}`;
+    });
+    return '\n\n## Not anchorable to the diff\n\n'
+        + '_These are about code this PR did not change, so GitHub cannot take '
+        + 'them inline._\n\n'
+        + rows.join('\n\n');
+}
+
+/**
  * Read the machine-readable verdict the review skill writes. Fails closed:
  * a missing, empty or unexpected file yields 'comment', never 'approve'.
  */
@@ -55,6 +129,21 @@ function readVerdict(verdictPath) {
         return raw === 'approve' ? 'approve' : 'comment';
     } catch {
         return 'comment';
+    }
+}
+
+/**
+ * Structured findings, if the review produced any. Unreadable or malformed
+ * JSON degrades to null so the post falls back to a single review-level
+ * comment rather than failing — a bad findings file must not lose the review.
+ */
+function readReviewJson(reviewPath) {
+    try {
+        const parsed = JSON.parse(fs.readFileSync(reviewPath, 'utf8'));
+        if (!parsed || !Array.isArray(parsed.comments)) return null;
+        return { body: String(parsed.body || ''), comments: parsed.comments };
+    } catch {
+        return null;
     }
 }
 
@@ -88,17 +177,64 @@ async function executeJob(
             'post-body.md'
         );
         fs.mkdirSync(path.dirname(bodyFile), { recursive: true });
-        fs.writeFileSync(bodyFile, payload.body_md || '');
         // Approving is a vote that counts toward someone's merge, so it happens
         // only on an explicit 'approve' from the caller — never by default.
-        const method = payload.method === 'approve' ? '--approve' : '--comment';
+        const approving = payload.method === 'approve';
+        const url = `https://github.com/${payload.repo}/pull/${payload.pr}`;
+        const structured = payload.review && Array.isArray(payload.review.comments)
+            && payload.review.comments.length > 0;
+
+        if (structured) {
+            // One review carrying many line-anchored comments. `gh pr review`
+            // cannot do this — it only ever posts a single review-level body.
+            const filesJson = execFileSync('gh', [
+                'api',
+                '--paginate',
+                `repos/${payload.repo}/pulls/${payload.pr}/files`,
+            ], { encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024 });
+
+            const patches = new Map();
+            for (const file of JSON.parse(filesJson)) {
+                patches.set(file.filename, commentableLines(file.patch));
+            }
+            const { inline, orphans } = partitionComments(
+                payload.review.comments, patches
+            );
+
+            const reviewFile = path.join(
+                path.dirname(bodyFile), 'review.json'
+            );
+            fs.writeFileSync(reviewFile, JSON.stringify({
+                event: approving ? 'APPROVE' : 'COMMENT',
+                body: (payload.review.body || payload.body_md || '')
+                    + orphanSection(orphans),
+                comments: inline,
+            }));
+
+            execFileSync('gh', [
+                'api',
+                '--method', 'POST',
+                `repos/${payload.repo}/pulls/${payload.pr}/reviews`,
+                '--input', reviewFile,
+            ], { encoding: 'utf8', timeout: 60_000 });
+
+            return {
+                posted: true,
+                approved: approving,
+                inline_comments: inline.length,
+                body_only: orphans.length,
+                review_url: url,
+            };
+        }
+
+        fs.writeFileSync(bodyFile, payload.body_md || '');
         execFileSync('gh', [
             'pr',
             'review',
             String(payload.pr),
             '--repo',
             payload.repo,
-            method,
+            approving ? '--approve' : '--comment',
             '--body-file',
             bodyFile,
         ], {
@@ -107,8 +243,9 @@ async function executeJob(
         });
         return {
             posted: true,
-            approved: method === '--approve',
-            review_url: `https://github.com/${payload.repo}/pull/${payload.pr}`,
+            approved: approving,
+            inline_comments: 0,
+            review_url: url,
         };
     }
 
@@ -172,6 +309,9 @@ async function executeJob(
             // Anything but a clean, explicit "approve" means comment. A missing
             // or garbled verdict file must never be read as approval.
             verdict: readVerdict(resultPath + '.verdict'),
+            // Optional: line-anchored findings. Absent or unparseable means the
+            // post falls back to one review-level comment, as before.
+            review: readReviewJson(resultPath + '.review.json'),
             pane_id: paneId,
         };
     }

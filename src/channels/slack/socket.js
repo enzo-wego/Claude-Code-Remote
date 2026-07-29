@@ -1818,6 +1818,10 @@ ${formatted}`,
                     unfurl_links: false,
                     unfurl_media: false,
                     text: (result.approved ? ':white_check_mark: Approved' : ':outbox_tray: Review posted')
+                        + (result.inline_comments
+                            ? ` — ${result.inline_comments} inline`
+                                + (result.body_only ? ` · ${result.body_only} in the summary` : '')
+                            : '')
                         + (result.review_url ? `: ${result.review_url}` : '.'),
                 });
             }

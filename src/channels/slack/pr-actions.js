@@ -41,6 +41,9 @@ async function handlePrAction({
                 pr: task.number,
                 body_md: result.body_md || '',
                 method: approving ? 'approve' : 'comment',
+                // Line-anchored findings when the review produced them; absent
+                // means the Mac posts one review-level comment as before.
+                review: result.review || null,
             }, {
                 dedupeKey: `post_review:${task.repo}#${task.number}`,
             });
