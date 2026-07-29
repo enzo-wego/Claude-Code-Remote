@@ -145,3 +145,77 @@ describe('draft buttons reflect the verdict', () => {
         expect(postBtn(draft(undefined)).text.text).toBe('📤 Post');
     });
 });
+
+describe('the draft DM carries the reviewer report', () => {
+    const { buildPrDraftResultBlocks } = require('../../src/channels/slack/pr-board');
+    const task = { id: 1, repo: 'wego/payments', number: 2210, url: 'u', title: 't', lane: 'team' };
+
+    const REPORT = [
+        '*Apex Review — PR #2210*',
+        '',
+        '```',
+        'Stage                  Status    Evidence',
+        'Worktree @ HEAD        invoked   isolated, throwaway branch',
+        'deep-review            invoked   9 traces + refutation gate',
+        '```',
+        '',
+        'Verdict is comment, not approve.',
+    ].join('\n');
+
+    test('renders the report and keeps the stage table fence intact', () => {
+        const blocks = buildPrDraftResultBlocks(task, {
+            result_json: JSON.stringify({
+                body_md: 'x'.repeat(5433), summary: 's', verdict: 'comment',
+                report: REPORT,
+                review: { comments: [{ path: 'a.go', line: 2 }, { path: 'b.go', line: 9 }] },
+            }),
+        });
+
+        expect(blocks[0].type).toBe('header');
+        expect(blocks[0].text.text).toBe('Apex Review — wego/payments#2210');
+
+        const text = blocks.filter(b => b.type === 'section')
+            .map(b => b.text.text).join('\n\n');
+        expect(text).toContain('deep-review');
+        // An odd number of fences would mean a table split across blocks.
+        expect((text.match(/```/g) || []).length % 2).toBe(0);
+
+        const ctx = blocks.find(b => b.type === 'context').elements[0].text;
+        expect(ctx).toContain('verdict *comment*');
+        expect(ctx).toContain('2 findings anchored inline');
+        expect(ctx).toContain('5433 chars');
+    });
+
+    test('every section stays under the Slack 3000-char cap', () => {
+        const long = Array.from({ length: 40 },
+            (_, i) => `Paragraph ${i} ` + 'y'.repeat(300)).join('\n\n');
+        const blocks = buildPrDraftResultBlocks(task, {
+            result_json: JSON.stringify({ body_md: '', report: long }),
+        });
+        const sections = blocks.filter(b => b.type === 'section');
+        expect(sections.length).toBeGreaterThan(1);
+        for (const s of sections) expect(s.text.text.length).toBeLessThanOrEqual(3000);
+        // Nothing may be lost in the split.
+        expect(sections.map(s => s.text.text).join('\n\n')).toContain('Paragraph 39');
+    });
+
+    test('a fenced block longer than the cap is never split mid-fence', () => {
+        const report = 'intro\n\n```\n'
+            + Array.from({ length: 60 }, (_, i) => `row ${i} ` + 'z'.repeat(60)).join('\n')
+            + '\n```\n\noutro';
+        const blocks = buildPrDraftResultBlocks(task, {
+            result_json: JSON.stringify({ body_md: '', report }),
+        });
+        for (const s of blocks.filter(b => b.type === 'section')) {
+            expect((s.text.text.match(/```/g) || []).length % 2).toBe(0);
+        }
+    });
+
+    test('no report falls back to the old summary + preview', () => {
+        const blocks = buildPrDraftResultBlocks(task, {
+            result_json: JSON.stringify({ body_md: 'REVIEW BODY', summary: '0 blocking' }),
+        });
+        expect(blocks.some(b => b.type === 'header')).toBe(false);
+        expect(JSON.stringify(blocks)).toContain('REVIEW BODY');
+    });
+});

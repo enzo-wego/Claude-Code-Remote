@@ -132,6 +132,15 @@ function readVerdict(verdictPath) {
     }
 }
 
+function readTextOrNull(filePath) {
+    try {
+        const text = fs.readFileSync(filePath, 'utf8').trim();
+        return text || null;
+    } catch {
+        return null;
+    }
+}
+
 /**
  * Structured findings, if the review produced any. Unreadable or malformed
  * JSON degrades to null so the post falls back to a single review-level
@@ -312,6 +321,9 @@ async function executeJob(
             // Optional: line-anchored findings. Absent or unparseable means the
             // post falls back to one review-level comment, as before.
             review: readReviewJson(resultPath + '.review.json'),
+            // The reviewer's own report — stage table, reasoning, recommendation.
+            // Distinct from body_md, which is what GitHub receives.
+            report: readTextOrNull(resultPath + '.report.md'),
             pane_id: paneId,
         };
     }

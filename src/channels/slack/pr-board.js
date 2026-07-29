@@ -252,6 +252,64 @@ function buildPrBoardBlocks(prTasks = []) {
     return blocks;
 }
 
+// Slack rejects a section whose text exceeds 3000 characters.
+const SLACK_TEXT_MAX = 2900;
+
+/**
+ * Split a long report across section blocks.
+ *
+ * Breaks on blank lines, and never inside a ``` fence — a fence split across
+ * two blocks renders as literal backticks in both, which is how the stage
+ * table would have arrived as a wall of pipes.
+ */
+function chunkForSlack(text, max = SLACK_TEXT_MAX) {
+    const paragraphs = String(text || '').trim().split(/\n{2,}/);
+    const chunks = [];
+    let current = '';
+    let insideFence = false;
+
+    for (const paragraph of paragraphs) {
+        const joined = current ? `${current}\n\n${paragraph}` : paragraph;
+        if (joined.length > max && current && !insideFence) {
+            chunks.push(current);
+            current = paragraph;
+        } else {
+            current = joined;
+        }
+        if ((paragraph.match(/```/g) || []).length % 2 === 1) {
+            insideFence = !insideFence;
+        }
+    }
+    if (current.trim()) chunks.push(current);
+
+    // A single paragraph over the cap still has to break somewhere; lines are
+    // the least bad seam. A fence that spans the seam is closed on the way out
+    // and reopened on the way in, so neither half renders as loose backticks —
+    // which matters because the stage table is exactly that shape.
+    return chunks.flatMap(chunk => {
+        if (chunk.length <= max) return [chunk];
+
+        const out = [];
+        let buffer = [];
+        let fenced = false;
+
+        const flush = () => {
+            if (!buffer.length) return;
+            out.push((fenced ? [...buffer, '```'] : buffer).join('\n'));
+            buffer = fenced ? ['```'] : [];
+        };
+
+        for (const line of chunk.split('\n')) {
+            const projected = buffer.join('\n').length + line.length + 5;
+            if (buffer.length && projected > max) flush();
+            buffer.push(line);
+            if (line.trim().startsWith('```')) fenced = !fenced;
+        }
+        if (buffer.join('\n').trim() !== '```') flush();
+        return out;
+    });
+}
+
 function buildPrDraftResultBlocks(task, jobRow) {
     const result = JSON.parse(jobRow.result_json || '{}');
     const preview = (result.body_md || '').slice(0, 2500);
@@ -277,19 +335,44 @@ function buildPrDraftResultBlocks(task, jobRow) {
         }
         : button('pr_post', '📤 Post', task.id, 'primary');
 
+    const actions = {
+        type: 'actions',
+        elements: [
+            post,
+            button('pr_edit', '✏️ Edit', task.id),
+            button('pr_discard', '🗑 Discard', task.id, 'danger'),
+        ],
+    };
+
+    // The reviewer's own report when there is one. It carries the reasoning and
+    // the recommendation, which a truncated dump of the GitHub body never did —
+    // that body is written for the PR author, not for the person deciding.
+    if (result.report) {
+        const inline = result.review && Array.isArray(result.review.comments)
+            ? result.review.comments.length
+            : 0;
+        return [
+            header(`Apex Review — ${task.repo}#${task.number}`),
+            ...chunkForSlack(result.report).map(chunk => section(chunk)),
+            {
+                type: 'context',
+                elements: [{
+                    type: 'mrkdwn',
+                    text: `verdict *${result.verdict || 'comment'}*`
+                        + ` · ${inline} finding${inline === 1 ? '' : 's'} anchored inline`
+                        + ` · ${(result.body_md || '').length} chars to the PR body`,
+                }],
+            },
+            actions,
+        ];
+    }
+
     return [
         section(
             `*Apex review draft ready:* <${task.url}|${titleOf(task)}>\n_${result.summary || ''}_`
         ),
         section('```' + preview + '```'),
-        {
-            type: 'actions',
-            elements: [
-                post,
-                button('pr_edit', '✏️ Edit', task.id),
-                button('pr_discard', '🗑 Discard', task.id, 'danger'),
-            ],
-        },
+        actions,
     ];
 }
 
