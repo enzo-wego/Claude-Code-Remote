@@ -34,6 +34,25 @@ function paneStatus(paneId) {
     return info.result?.pane?.agent_status || 'unknown';
 }
 
+/** Synchronous sleep — everything here drives herdr through execFileSync. */
+function sleepMs(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Poll until the pane reports one of `accepted`, returning whether it did.
+ * Unlike waitStatus() this never throws and never blocks in herdr, so it is
+ * safe to call in a retry loop where a timeout is an expected outcome.
+ */
+function pollStatus(paneId, accepted, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        if (accepted.includes(paneStatus(paneId))) return true;
+        if (Date.now() >= deadline) return false;
+        sleepMs(500);
+    }
+}
+
 /**
  * Wait until a pane reaches `status`.
  *
@@ -132,11 +151,32 @@ function submitTask(paneId, prompt) {
         );
     }
     herdr('pane', 'run', paneId, prompt);
-    herdr('pane', 'send-keys', paneId, 'Enter');
-    // 'done' is accepted only because a very fast turn can pass through
-    // 'working' before this observes it. 'idle' must NOT be — that is exactly
-    // the "prompt never submitted" state this guard exists to catch.
-    waitStatus(paneId, 'working', 30_000, ['done']);
+
+    // `pane run` returns as soon as the text is dispatched, before the TUI has
+    // ingested it — an Enter sent right behind it is swallowed and the prompt
+    // sits on screen at session:0m forever. Proven both ways on a live pane:
+    // immediate Enter did nothing three times running, the same Enter against
+    // settled text moved the pane to `working` in seconds.
+    //
+    // So wait for the text to actually appear, then submit, then confirm the
+    // agent started. A lost Enter has no other symptom.
+    const marker = prompt.slice(-40);
+    const typedBy = Date.now() + 15_000;
+    while (Date.now() < typedBy) {
+        if (String(readTail(paneId, 15)).includes(marker)) break;
+        sleepMs(300);
+    }
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+        herdr('pane', 'send-keys', paneId, 'Enter');
+        // 'done' counts only because a very fast turn can pass through
+        // 'working' unobserved. 'idle' must NOT — that is the swallowed-Enter
+        // state this whole guard exists to catch.
+        if (pollStatus(paneId, ['working', 'done'], 10_000)) return;
+    }
+    throw new Error(
+        `prompt was typed into ${paneId} but Enter never submitted it`
+    );
 }
 
 function waitDone(paneId, timeoutMs) {
