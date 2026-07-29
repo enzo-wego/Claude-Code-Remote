@@ -84,3 +84,50 @@ describe('handlePrAction', () => {
         expect(reply).toContain('Dismissed');
     });
 });
+
+describe('approve only when earned', () => {
+    const draftedWith = (lane, verdict) => {
+        const db = new Database(':memory:');
+        const jobs = new Jobs(db);
+        const prTasks = new PrTasks(db);
+        const task = prTasks.upsert({
+            repo: 'wego/payments', number: 2210,
+            url: 'https://github.com/wego/payments/pull/2210',
+            title: 'PAY-2225: counters', lane,
+        });
+        const job = jobs.enqueue('apex_review', { repo: 'wego/payments', pr: 2210 });
+        const leased = jobs.lease('mac');
+        jobs.complete(job.id, leased.lease_id, { body_md: 'LGTM', verdict });
+        prTasks.setDraftJob(task.id, job.id);
+        return { jobs, prTasks, task };
+    };
+
+    const methodAfterPost = async (lane, verdict) => {
+        const { jobs, prTasks, task } = draftedWith(lane, verdict);
+        const reply = await handlePrAction({
+            actionId: 'pr_post', value: String(task.id), prTasks, jobs,
+        });
+        const posted = jobs.recent(10).find(j => j.kind === 'post_review');
+        return { method: JSON.parse(posted.payload_json).method, reply };
+    };
+
+    test('a clean verdict on a teammate PR files an approval', async () => {
+        const { method, reply } = await methodAfterPost('team', 'approve');
+        expect(method).toBe('approve');
+        expect(reply).toContain('Approving');
+    });
+
+    test('blocking findings stay a comment', async () => {
+        expect((await methodAfterPost('team', 'comment')).method).toBe('comment');
+    });
+
+    test('your own PR never self-approves, however clean', async () => {
+        const { method } = await methodAfterPost('mine', 'approve');
+        expect(method).toBe('comment');
+    });
+
+    test('a draft with no verdict at all stays a comment', async () => {
+        const { method } = await methodAfterPost('team', undefined);
+        expect(method).toBe('comment');
+    });
+});

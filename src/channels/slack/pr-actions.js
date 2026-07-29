@@ -33,17 +33,24 @@ async function handlePrAction({
                 return `:warning: Draft for ${task.repo}#${task.number} is not available.`;
             }
             const result = JSON.parse(draft.result_json);
+            // GitHub refuses to let you approve your own PR, so the `mine` lane
+            // always files a comment however clean the verdict was.
+            const approving = result.verdict === 'approve' && task.lane !== 'mine';
             const queued = jobs.enqueue('post_review', {
                 repo: task.repo,
                 pr: task.number,
                 body_md: result.body_md || '',
+                method: approving ? 'approve' : 'comment',
             }, {
                 dedupeKey: `post_review:${task.repo}#${task.number}`,
             });
             prTasks.setStatus(task.id, 'posted');
-            return queued
-                ? `:outbox_tray: Review for #${task.number} queued for posting from your Mac.`
-                : `:information_source: Review for #${task.number} is already queued for posting.`;
+            if (!queued) {
+                return `:information_source: Review for #${task.number} is already queued for posting.`;
+            }
+            return approving
+                ? `:white_check_mark: Approving #${task.number} from your Mac…`
+                : `:outbox_tray: Review for #${task.number} queued for posting from your Mac.`;
         }
 
         case 'pr_merge': {

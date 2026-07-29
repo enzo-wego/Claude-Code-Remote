@@ -33,7 +33,11 @@ function buildApexReviewPrompt(payload, resultPath) {
         "From apex-review's findings, keep only must-fix + high-confidence items.",
         `Write the final review as GitHub-flavored markdown to: ${resultPath}`,
         '(verdict line, then ## Blocking / ## Suggestions / ## Nits — omit empty sections).',
-        `Write a one-line summary (counts) to ${resultPath}.summary. Then print RESULT_READY.`,
+        `Write a one-line summary (counts) to ${resultPath}.summary.`,
+        // A real GitHub approval must not hinge on grepping "LGTM" out of prose.
+        `Write exactly one word to ${resultPath}.verdict — "approve" if there are`,
+        'zero blocking findings, otherwise "comment". No punctuation, no explanation.',
+        'Then print RESULT_READY.',
         'Do NOT post anything to GitHub. Draft only.',
     ].join('\n');
 }

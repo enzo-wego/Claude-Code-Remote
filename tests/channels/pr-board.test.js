@@ -113,3 +113,35 @@ describe('board scope', () => {
         expect(text).toContain('Needs my review');
     });
 });
+
+describe('draft buttons reflect the verdict', () => {
+    const { buildPrDraftResultBlocks } = require('../../src/channels/slack/pr-board');
+    const draft = (verdict, lane = 'team') => buildPrDraftResultBlocks(
+        { id: 1, repo: 'wego/payments', number: 2210, url: 'u', title: 't', lane },
+        { result_json: JSON.stringify({ body_md: 'LGTM', summary: '0 blocking', verdict }) }
+    );
+    const postBtn = blocks => blocks
+        .find(b => b.type === 'actions').elements
+        .find(e => e.action_id === 'pr_post');
+
+    test('a clean verdict offers Approve, behind a confirm dialog', () => {
+        const btn = postBtn(draft('approve'));
+        expect(btn.text.text).toBe('✅ Approve');
+        expect(btn.confirm.title.text).toBe('Approve this PR?');
+        expect(btn.confirm.text.text).toContain('counts toward its merge');
+    });
+
+    test('blocking findings offer Post, with no confirm', () => {
+        const btn = postBtn(draft('comment'));
+        expect(btn.text.text).toBe('📤 Post');
+        expect(btn.confirm).toBeUndefined();
+    });
+
+    test('your own PR is never offered Approve', () => {
+        expect(postBtn(draft('approve', 'mine')).text.text).toBe('📤 Post');
+    });
+
+    test('a draft predating the verdict field falls back to Post', () => {
+        expect(postBtn(draft(undefined)).text.text).toBe('📤 Post');
+    });
+});

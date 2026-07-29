@@ -1817,9 +1817,8 @@ ${formatted}`,
                     channel: dm.channel.id,
                     unfurl_links: false,
                     unfurl_media: false,
-                    text: result.review_url
-                        ? `:white_check_mark: Review posted: ${result.review_url}`
-                        : ':white_check_mark: Review posted.',
+                    text: (result.approved ? ':white_check_mark: Approved' : ':outbox_tray: Review posted')
+                        + (result.review_url ? `: ${result.review_url}` : '.'),
                 });
             }
         } catch (err) {

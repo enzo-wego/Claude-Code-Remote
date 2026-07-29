@@ -190,3 +190,80 @@ describe('tab naming', () => {
             .toBe('wego-docs-pr793');
     });
 });
+
+describe('approve vs comment', () => {
+    const ghArgsFor = async (method) => {
+        const jobsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'post-'));
+        const gh = jest.fn().mockReturnValue('');
+        const result = await executeJob(
+            {
+                id: 11,
+                kind: 'post_review',
+                payload_json: JSON.stringify({
+                    repo: 'wego/payments', pr: 2210, body_md: 'LGTM', method,
+                }),
+            },
+            { jobsDir, repoMap: {} },
+            {},
+            { execFileSync: gh }
+        );
+        return { args: gh.mock.calls[0][1], result };
+    };
+
+    test('method=approve files a GitHub approval', async () => {
+        const { args, result } = await ghArgsFor('approve');
+        expect(args).toContain('--approve');
+        expect(args).not.toContain('--comment');
+        expect(result.approved).toBe(true);
+    });
+
+    test('anything else stays a comment', async () => {
+        for (const method of ['comment', undefined, 'APPROVE ', 'yes']) {
+            const { args, result } = await ghArgsFor(method);
+            expect(args).toContain('--comment');
+            expect(args).not.toContain('--approve');
+            expect(result.approved).toBe(false);
+        }
+    });
+
+    /** A missing or garbled verdict file must never read as approval. */
+    test('verdict file is read strictly', async () => {
+        const jobsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verdict-'));
+        const cases = [
+            ['approve\n', 'approve'],
+            ['APPROVE', 'approve'],
+            ['comment', 'comment'],
+            ['approve, with suggestions', 'comment'],
+            ['', 'comment'],
+            [null, 'comment'],
+        ];
+
+        for (const [written, expected] of cases) {
+            const dir = path.join(jobsDir, '12');
+            const herdr = {
+                ensureWorkspace: jest.fn().mockReturnValue('wN'),
+                createJobPane: jest.fn().mockReturnValue({ paneId: 'wN:p3' }),
+                startAgent: jest.fn(),
+                submitTask: jest.fn(),
+                waitDone: jest.fn(() => {
+                    fs.writeFileSync(path.join(dir, 'result.md'), 'body');
+                    if (written !== null) {
+                        fs.writeFileSync(path.join(dir, 'result.md.verdict'), written);
+                    }
+                }),
+                readTail: jest.fn().mockReturnValue(''),
+            };
+            fs.rmSync(dir, { recursive: true, force: true });
+            const out = await executeJob(
+                {
+                    id: 12,
+                    kind: 'apex_review',
+                    payload_json: JSON.stringify({ repo: 'wego/payments', pr: 1 }),
+                },
+                { jobsDir, repoRoot: '/tmp', repoMap: { 'wego/payments': '/tmp' }, cliCommand: 'claude' },
+                herdr
+            );
+            expect(out.verdict).toBe(expected);
+        }
+    });
+});

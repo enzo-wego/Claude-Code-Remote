@@ -46,6 +46,19 @@ function repoPath(config, repo) {
 }
 
 /**
+ * Read the machine-readable verdict the review skill writes. Fails closed:
+ * a missing, empty or unexpected file yields 'comment', never 'approve'.
+ */
+function readVerdict(verdictPath) {
+    try {
+        const raw = fs.readFileSync(verdictPath, 'utf8').trim().toLowerCase();
+        return raw === 'approve' ? 'approve' : 'comment';
+    } catch {
+        return 'comment';
+    }
+}
+
+/**
  * Tab label for a review pane. Every review shares the one `enzobot` workspace,
  * so the tab name is the only thing distinguishing them — and the Jira key is
  * how you recognise your own work. Falls back to the repo for PRs whose title
@@ -76,13 +89,16 @@ async function executeJob(
         );
         fs.mkdirSync(path.dirname(bodyFile), { recursive: true });
         fs.writeFileSync(bodyFile, payload.body_md || '');
+        // Approving is a vote that counts toward someone's merge, so it happens
+        // only on an explicit 'approve' from the caller — never by default.
+        const method = payload.method === 'approve' ? '--approve' : '--comment';
         execFileSync('gh', [
             'pr',
             'review',
             String(payload.pr),
             '--repo',
             payload.repo,
-            '--comment',
+            method,
             '--body-file',
             bodyFile,
         ], {
@@ -91,6 +107,7 @@ async function executeJob(
         });
         return {
             posted: true,
+            approved: method === '--approve',
             review_url: `https://github.com/${payload.repo}/pull/${payload.pr}`,
         };
     }
@@ -152,6 +169,9 @@ async function executeJob(
             summary: fs.existsSync(resultPath + '.summary')
                 ? fs.readFileSync(resultPath + '.summary', 'utf8').trim()
                 : 'review ready',
+            // Anything but a clean, explicit "approve" means comment. A missing
+            // or garbled verdict file must never be read as approval.
+            verdict: readVerdict(resultPath + '.verdict'),
             pane_id: paneId,
         };
     }

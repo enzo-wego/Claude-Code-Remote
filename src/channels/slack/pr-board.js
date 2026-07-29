@@ -255,6 +255,28 @@ function buildPrBoardBlocks(prTasks = []) {
 function buildPrDraftResultBlocks(task, jobRow) {
     const result = JSON.parse(jobRow.result_json || '{}');
     const preview = (result.body_md || '').slice(0, 2500);
+
+    // A clean verdict turns Post into Approve — but never on your own PR, which
+    // GitHub would reject anyway. The verdict is a word the skill writes to a
+    // file, not something grepped out of the review prose.
+    const approving = result.verdict === 'approve' && task.lane !== 'mine';
+    const post = approving
+        ? {
+            ...button('pr_post', '✅ Approve', task.id, 'primary'),
+            confirm: {
+                title: { type: 'plain_text', text: 'Approve this PR?' },
+                text: {
+                    type: 'mrkdwn',
+                    text: `This files a *GitHub approval* on *${task.repo}#${task.number}*`
+                        + ` in your name, and counts toward its merge requirements.`,
+                },
+                confirm: { type: 'plain_text', text: 'Approve' },
+                deny: { type: 'plain_text', text: 'Cancel' },
+                style: 'primary',
+            },
+        }
+        : button('pr_post', '📤 Post', task.id, 'primary');
+
     return [
         section(
             `*Apex review draft ready:* <${task.url}|${titleOf(task)}>\n_${result.summary || ''}_`
@@ -263,7 +285,7 @@ function buildPrDraftResultBlocks(task, jobRow) {
         {
             type: 'actions',
             elements: [
-                button('pr_post', '📤 Post', task.id, 'primary'),
+                post,
                 button('pr_edit', '✏️ Edit', task.id),
                 button('pr_discard', '🗑 Discard', task.id, 'danger'),
             ],
