@@ -166,8 +166,7 @@ describe('the draft DM carries the reviewer report', () => {
         const blocks = buildPrDraftResultBlocks(task, {
             result_json: JSON.stringify({
                 body_md: 'x'.repeat(5433), summary: 's', verdict: 'comment',
-                report: REPORT,
-                review: { comments: [{ path: 'a.go', line: 2 }, { path: 'b.go', line: 9 }] },
+                report: REPORT, pane_id: 'wN:p2',
             }),
         });
 
@@ -182,8 +181,13 @@ describe('the draft DM carries the reviewer report', () => {
 
         const ctx = blocks.find(b => b.type === 'context').elements[0].text;
         expect(ctx).toContain('verdict *comment*');
-        expect(ctx).toContain('2 findings anchored inline');
-        expect(ctx).toContain('5433 chars');
+        expect(ctx).toContain('reviewer still live');
+        expect(ctx).toContain('wN:p2');
+
+        // Exit ends the session; it is not a Discard that touches the PR.
+        const labels = blocks.find(b => b.type === 'actions')
+            .elements.map(e => e.text.text);
+        expect(labels).toEqual(['📤 Post', '✏️ Edit', '🚪 Exit']);
     });
 
     test('every section stays under the Slack 3000-char cap', () => {

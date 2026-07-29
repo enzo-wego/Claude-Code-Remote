@@ -1811,18 +1811,28 @@ ${formatted}`,
                 // The next sweep sees state=closed and retires the row, but
                 // repaint now so the button cannot be pressed twice.
                 await this._publishHome(this.config.ownerUserId);
-            } else if (job.kind === 'post_review') {
+            } else if (job.kind === 'pane_message') {
+                // The reviewer did the work; report what it said rather than
+                // claiming an outcome this side never observed.
                 const result = JSON.parse(job.result_json || '{}');
+                const payload = JSON.parse(job.payload_json || '{}');
+                const where = payload.repo && payload.pr
+                    ? `${payload.repo}#${payload.pr}`
+                    : 'the PR';
                 await this.app.client.chat.postMessage({
                     channel: dm.channel.id,
                     unfurl_links: false,
                     unfurl_media: false,
-                    text: (result.approved ? ':white_check_mark: Approved' : ':outbox_tray: Review posted')
-                        + (result.inline_comments
-                            ? ` — ${result.inline_comments} inline`
-                                + (result.body_only ? ` · ${result.body_only} in the summary` : '')
-                            : '')
-                        + (result.review_url ? `: ${result.review_url}` : '.'),
+                    text: `:white_check_mark: Reviewer finished on *${where}*`
+                        + (result.tail ? `\n\`\`\`${result.tail.slice(-1000)}\`\`\`` : ''),
+                });
+                await this._publishHome(this.config.ownerUserId);
+            } else if (job.kind === 'pane_close') {
+                await this.app.client.chat.postMessage({
+                    channel: dm.channel.id,
+                    unfurl_links: false,
+                    unfurl_media: false,
+                    text: ':door: Review session closed. Nothing was posted.',
                 });
             }
         } catch (err) {
@@ -2119,10 +2129,11 @@ ${formatted}`,
             }
         });
 
+        // pr_edit is not here: it opens a modal instead of acting directly, and
+        // the action it eventually takes (pr_revise) arrives as a view submission.
         const prActionIds = [
             'pr_review_now',
             'pr_post',
-            'pr_edit',
             'pr_discard',
             'pr_dismiss',
             'pr_merge',
@@ -2161,6 +2172,90 @@ ${formatted}`,
                 }
             });
         }
+
+        // Edit opens a modal rather than acting: the reviewer is still live in
+        // its pane holding the full context, so what it needs is instructions,
+        // not a rewritten body pasted back at it.
+        this.app.action('pr_edit', async ({ ack, body, action }) => {
+            await ack();
+            const userId = body.user && body.user.id;
+            if (this.config.ownerUserId && userId !== this.config.ownerUserId) {
+                return;
+            }
+            const task = this.prTasks.get(Number(action.value));
+            if (!task) return;
+            try {
+                await this.app.client.views.open({
+                    trigger_id: body.trigger_id,
+                    view: {
+                        type: 'modal',
+                        callback_id: 'pr_revise_modal',
+                        private_metadata: String(task.id),
+                        title: { type: 'plain_text', text: 'Revise review' },
+                        submit: { type: 'plain_text', text: 'Send & post' },
+                        close: { type: 'plain_text', text: 'Cancel' },
+                        blocks: [
+                            {
+                                type: 'section',
+                                text: {
+                                    type: 'mrkdwn',
+                                    text: `*${task.repo}#${task.number}*\n${task.title || ''}`,
+                                },
+                            },
+                            {
+                                type: 'input',
+                                block_id: 'revise',
+                                label: { type: 'plain_text', text: 'What should change?' },
+                                hint: {
+                                    type: 'plain_text',
+                                    text: 'Goes straight to the reviewer, which then posts the revised review.',
+                                },
+                                element: {
+                                    type: 'plain_text_input',
+                                    action_id: 'text',
+                                    multiline: true,
+                                    placeholder: {
+                                        type: 'plain_text',
+                                        text: 'e.g. drop the nit, keep suggestions 1 and 3, and shorten the body',
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                });
+            } catch (err) {
+                this.logger.error(`pr_edit modal failed: ${err.message}`);
+            }
+        });
+
+        this.app.view('pr_revise_modal', async ({ ack, body, view }) => {
+            await ack();
+            const userId = body.user && body.user.id;
+            if (this.config.ownerUserId && userId !== this.config.ownerUserId) {
+                return;
+            }
+            try {
+                const reply = await handlePrAction({
+                    actionId: 'pr_revise',
+                    value: view.private_metadata,
+                    prTasks: this.prTasks,
+                    jobs: this.jobs,
+                    instructions: view.state.values.revise.text.value || '',
+                });
+                const dm = await this.app.client.conversations.open({
+                    users: userId || this.config.ownerUserId,
+                });
+                await this.app.client.chat.postMessage({
+                    channel: dm.channel.id,
+                    text: reply,
+                    unfurl_links: false,
+                    unfurl_media: false,
+                });
+                await this._publishHome(userId || this.config.ownerUserId);
+            } catch (err) {
+                this.logger.error(`pr_revise failed: ${err.message}`);
+            }
+        });
 
         // Entity: on-demand board refresh. Re-sweeps GitHub and re-reads PR
         // state now instead of waiting for the next monitor cycle, then

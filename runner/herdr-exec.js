@@ -29,9 +29,19 @@ function herdrWithTimeout(timeoutMs, args) {
     }
 }
 
+/**
+ * Agent status, or 'gone' when the pane no longer exists — a review session
+ * the owner closed is a normal outcome, not an error to propagate.
+ */
 function paneStatus(paneId) {
-    const info = herdr('pane', 'get', paneId);
-    return info.result?.pane?.agent_status || 'unknown';
+    let info;
+    try {
+        info = herdr('pane', 'get', paneId);
+    } catch {
+        return 'gone';
+    }
+    if (!info.result?.pane) return 'gone';
+    return info.result.pane.agent_status || 'unknown';
 }
 
 /** Synchronous sleep — everything here drives herdr through execFileSync. */
@@ -217,5 +227,6 @@ module.exports = {
     waitDone,
     readTail,
     closePane,
+    paneStatus,
     WORKSPACE_LABEL,
 };

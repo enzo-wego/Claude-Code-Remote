@@ -340,7 +340,8 @@ function buildPrDraftResultBlocks(task, jobRow) {
         elements: [
             post,
             button('pr_edit', '✏️ Edit', task.id),
-            button('pr_discard', '🗑 Discard', task.id, 'danger'),
+            // Ends the reviewer's session; the PR is left untouched.
+            button('pr_discard', '🚪 Exit', task.id, 'danger'),
         ],
     };
 
@@ -348,9 +349,6 @@ function buildPrDraftResultBlocks(task, jobRow) {
     // the recommendation, which a truncated dump of the GitHub body never did —
     // that body is written for the PR author, not for the person deciding.
     if (result.report) {
-        const inline = result.review && Array.isArray(result.review.comments)
-            ? result.review.comments.length
-            : 0;
         return [
             header(`Apex Review — ${task.repo}#${task.number}`),
             ...chunkForSlack(result.report).map(chunk => section(chunk)),
@@ -359,8 +357,8 @@ function buildPrDraftResultBlocks(task, jobRow) {
                 elements: [{
                     type: 'mrkdwn',
                     text: `verdict *${result.verdict || 'comment'}*`
-                        + ` · ${inline} finding${inline === 1 ? '' : 's'} anchored inline`
-                        + ` · ${(result.body_md || '').length} chars to the PR body`,
+                        + ' · reviewer still live — Post sends it back to that session'
+                        + (result.pane_id ? ` (\`${result.pane_id}\`)` : ''),
                 }],
             },
             actions,

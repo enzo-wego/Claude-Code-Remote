@@ -42,51 +42,24 @@ describe('handlePrAction', () => {
         expect(reply).toContain('Reviewing #412');
     });
 
-    test('pr_post enqueues post_review from the completed draft', async () => {
-        const { jobs, prTasks, task } = setup();
-        const draft = jobs.enqueue('apex_review', {
-            repo: task.repo,
-            pr: task.number,
-            url: task.url,
-        });
-        const leased = jobs.lease('mac');
-        jobs.complete(leased.id, leased.lease_id, {
-            body_md: 'DRAFT REVIEW',
-            summary: '1 blocking',
-        });
-        prTasks.setDraftJob(task.id, draft.id);
-        prTasks.setStatus(task.id, 'drafted');
-
-        const reply = await handlePrAction({
-            actionId: 'pr_post',
-            value: String(task.id),
-            prTasks,
-            jobs,
-        });
-
-        const queued = jobs.lease('mac');
-        expect(queued.kind).toBe('post_review');
-        expect(JSON.parse(queued.payload_json).body_md).toBe('DRAFT REVIEW');
-        expect(prTasks.get(task.id).status).toBe('posted');
-        expect(reply).toContain('queued');
-    });
-
-    test.each(['pr_discard', 'pr_dismiss'])('%s dismisses the PR task', async (actionId) => {
+    
+    test('pr_dismiss removes the row from the board', async () => {
         const { jobs, prTasks, task } = setup();
         const reply = await handlePrAction({
-            actionId,
-            value: String(task.id),
-            prTasks,
-            jobs,
+            actionId: 'pr_dismiss', value: String(task.id), prTasks, jobs,
         });
-
         expect(prTasks.get(task.id).status).toBe('dismissed');
         expect(reply).toContain('Dismissed');
     });
 });
 
-describe('approve only when earned', () => {
-    const draftedWith = (lane, verdict) => {
+
+/**
+ * Post, Edit and Exit all talk to the reviewer still sitting in its pane rather
+ * than reconstructing its work on this side.
+ */
+describe('actions relay to the live review session', () => {
+    const drafted = (lane, verdict, paneId = 'wN:p2') => {
         const db = new Database(':memory:');
         const jobs = new Jobs(db);
         const prTasks = new PrTasks(db);
@@ -97,37 +70,70 @@ describe('approve only when earned', () => {
         });
         const job = jobs.enqueue('apex_review', { repo: 'wego/payments', pr: 2210 });
         const leased = jobs.lease('mac');
-        jobs.complete(job.id, leased.lease_id, { body_md: 'LGTM', verdict });
+        jobs.complete(job.id, leased.lease_id, {
+            body_md: 'LGTM', verdict, pane_id: paneId,
+        });
         prTasks.setDraftJob(task.id, job.id);
         return { jobs, prTasks, task };
     };
 
-    const methodAfterPost = async (lane, verdict) => {
-        const { jobs, prTasks, task } = draftedWith(lane, verdict);
+    const relayed = (jobs, kind = 'pane_message') =>
+        JSON.parse(jobs.recent(10).find(j => j.kind === kind).payload_json);
+
+    test('Post tells the reviewer to post as a comment', async () => {
+        const { jobs, prTasks, task } = drafted('team', 'comment');
         const reply = await handlePrAction({
             actionId: 'pr_post', value: String(task.id), prTasks, jobs,
         });
-        const posted = jobs.recent(10).find(j => j.kind === 'post_review');
-        return { method: JSON.parse(posted.payload_json).method, reply };
-    };
-
-    test('a clean verdict on a teammate PR files an approval', async () => {
-        const { method, reply } = await methodAfterPost('team', 'approve');
-        expect(method).toBe('approve');
-        expect(reply).toContain('Approving');
+        const sent = relayed(jobs);
+        expect(sent.pane_id).toBe('wN:p2');
+        expect(sent.text).toContain('COMMENT');
+        expect(sent.text).not.toContain('APPROVAL');
+        expect(reply).toContain('post');
     });
 
-    test('blocking findings stay a comment', async () => {
-        expect((await methodAfterPost('team', 'comment')).method).toBe('comment');
+    test('a clean verdict on a teammate PR asks for an approval', async () => {
+        const { jobs, prTasks, task } = drafted('team', 'approve');
+        await handlePrAction({ actionId: 'pr_post', value: String(task.id), prTasks, jobs });
+        expect(relayed(jobs).text).toContain('APPROVAL');
     });
 
-    test('your own PR never self-approves, however clean', async () => {
-        const { method } = await methodAfterPost('mine', 'approve');
-        expect(method).toBe('comment');
+    test('your own PR is never asked to self-approve', async () => {
+        const { jobs, prTasks, task } = drafted('mine', 'approve');
+        await handlePrAction({ actionId: 'pr_post', value: String(task.id), prTasks, jobs });
+        expect(relayed(jobs).text).toContain('COMMENT');
     });
 
-    test('a draft with no verdict at all stays a comment', async () => {
-        const { method } = await methodAfterPost('team', undefined);
-        expect(method).toBe('comment');
+    test('Edit forwards the instructions and asks for a repost', async () => {
+        const { jobs, prTasks, task } = drafted('team', 'comment');
+        await handlePrAction({
+            actionId: 'pr_revise', value: String(task.id), prTasks, jobs,
+            instructions: 'drop the nit, shorten the body',
+        });
+        const sent = relayed(jobs);
+        expect(sent.text).toContain('drop the nit, shorten the body');
+        expect(sent.text).toMatch(/post the revised review/i);
+    });
+
+    test('Exit closes the session, queues no post, and keeps the PR reviewable', async () => {
+        const { jobs, prTasks, task } = drafted('team', 'comment');
+        const reply = await handlePrAction({
+            actionId: 'pr_discard', value: String(task.id), prTasks, jobs,
+        });
+        expect(relayed(jobs, 'pane_close').pane_id).toBe('wN:p2');
+        expect(jobs.recent(10).some(j => j.kind === 'pane_message')).toBe(false);
+        const row = prTasks.get(task.id);
+        expect(row.status).toBe('detected');
+        expect(row.draft_job_id).toBeNull();
+        expect(reply).toContain('Nothing was posted');
+    });
+
+    test('a draft with no live pane refuses rather than pretending', async () => {
+        const { jobs, prTasks, task } = drafted('team', 'comment', null);
+        const reply = await handlePrAction({
+            actionId: 'pr_post', value: String(task.id), prTasks, jobs,
+        });
+        expect(reply).toContain('No live review session');
+        expect(jobs.recent(10).some(j => j.kind === 'pane_message')).toBe(false);
     });
 });
