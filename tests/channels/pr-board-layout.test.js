@@ -28,6 +28,7 @@ describe('section order', () => {
         const blocks = buildPrBoardBlocks([
             { id: 1, lane: 'mine', repo: 'a/b', number: 1, url: 'u', ci: 'green', status: 'detected' },
             { id: 2, lane: 'team', repo: 'a/c', number: 2, url: 'u', ci: 'green', status: 'detected', author: 'lei-wego' },
+            { id: 3, lane: 'review', repo: 'a/d', number: 3, url: 'u', ci: 'green', status: 'detected' },
         ]);
         expect(headers(blocks)).toEqual(['Needs my review', 'Team PRs', 'My PRs']);
     });

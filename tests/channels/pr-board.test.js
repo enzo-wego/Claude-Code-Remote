@@ -112,6 +112,21 @@ describe('board scope', () => {
         expect(text).not.toContain('home_refresh');
         expect(text).not.toContain('home_toggle_drafts');
         // But it still labels its own lanes.
+        expect(text).toContain('Team PRs');
+    });
+
+    test('an empty review lane renders nothing, not an empty-state line', () => {
+        const text = JSON.stringify(buildPrBoardBlocks([
+            { id: 1, lane: 'team', repo: 'a/b', number: 1, url: 'u', author: 'lei-wego' },
+        ]));
+        expect(text).not.toContain('Needs my review');
+        expect(text).not.toContain('Nothing is waiting on you');
+    });
+
+    test('but appears the moment a PR is actually waiting on you', () => {
+        const text = JSON.stringify(buildPrBoardBlocks([
+            { id: 1, lane: 'review', repo: 'a/b', number: 1, url: 'u', status: 'detected' },
+        ]));
         expect(text).toContain('Needs my review');
     });
 });

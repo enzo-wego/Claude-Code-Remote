@@ -52,8 +52,9 @@ function buildHomeView(state) {
         },
     ];
 
+    // No page title: Slack already prints "EnzoBot" in the tab chrome above
+    // this view, so a header block only pushed the board further down.
     const blocks = [
-        { type: 'header', text: { type: 'plain_text', text: '🧠 EnzoBot — live status' } },
         { type: 'actions', elements: controls },
         {
             type: 'context',

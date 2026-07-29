@@ -249,18 +249,19 @@ function buildPrBoardBlocks(prTasks = []) {
     const mine = prTasks.filter(task => task.lane === 'mine');
     const team = prTasks.filter(task => task.lane === 'team');
 
-    // Every lane gets its own header. Without one, the review lane's empty
-    // state read as a caption on the page title instead of as a section.
     // Needs-my-review stays first: it is the only lane where someone is blocked
     // on you. Team PRs sit above your own, the least urgent thing here.
-    const blocks = [header('Needs my review')];
-    if (review.length === 0) {
-        blocks.push(section('_Nothing is waiting on you._'));
-    } else {
-        blocks.push(...reviewLaneBlocks(review));
+    // An empty review lane renders nothing at all — a header plus "nothing is
+    // waiting on you" spent two lines saying the page had no news.
+    const blocks = [];
+    if (review.length) {
+        blocks.push(
+            header('Needs my review'),
+            ...reviewLaneBlocks(review),
+            { type: 'divider' }
+        );
     }
 
-    blocks.push({ type: 'divider' });
     blocks.push(...teamLaneBlocks(team));
     blocks.push({ type: 'divider' });
     blocks.push(...mineLaneBlocks(mine));

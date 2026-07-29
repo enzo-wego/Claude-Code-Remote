@@ -68,18 +68,19 @@ describe('page-level controls', () => {
         isOwner: true, uptimeSec: 60, sessions: [], now, ...extra,
     });
 
-    test('Refresh and the drafts toggle sit above every section', () => {
+    test('Refresh and the drafts toggle are the first thing on the page', () => {
         const view = owner();
         // Controls are page-scoped, not board-scoped: this page grows more
-        // sections and one Refresh must cover all of them.
-        expect(view.blocks[0].type).toBe('header');
-        const controls = view.blocks[1];
+        // sections and one Refresh must cover all of them. They lead the view —
+        // Slack's own tab chrome already names the app, so no title block.
+        const controls = view.blocks[0];
         expect(controls.type).toBe('actions');
         expect(controls.elements.map(e => e.action_id))
             .toEqual(['home_refresh', 'home_toggle_drafts']);
+        expect(JSON.stringify(view.blocks)).not.toContain('live status');
 
-        const firstSection = view.blocks.findIndex(b => b.type === 'header' && b.text.text === 'Needs my review');
-        expect(firstSection).toBeGreaterThan(1);
+        const firstLane = view.blocks.findIndex(b => b.type === 'header' && b.text.text === 'Team PRs');
+        expect(firstLane).toBeGreaterThan(0);
     });
 
     test('freshness line renders in the viewer timezone', () => {
@@ -94,11 +95,11 @@ describe('page-level controls', () => {
     });
 
     test('toggle label and value invert with the current state', () => {
-        const hidden = owner({ showDrafts: false }).blocks[1].elements[1];
+        const hidden = owner({ showDrafts: false }).blocks[0].elements[1];
         expect(hidden.text.text).toContain('Drafts: hidden');
         expect(hidden.value).toBe('show');
 
-        const shown = owner({ showDrafts: true }).blocks[1].elements[1];
+        const shown = owner({ showDrafts: true }).blocks[0].elements[1];
         expect(shown.text.text).toContain('Drafts: shown');
         expect(shown.value).toBe('hide');
     });
