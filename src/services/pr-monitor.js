@@ -255,29 +255,57 @@ async function fetchReviewDecision({ repo, number, token, viewerLogin }) {
  * watermark built on them would fire on every CodeRabbit pass. Two extra calls
  * buys a signal that means what it says.
  */
-async function fetchHumanCommentCount({ repo, number, token, viewerLogin }) {
-    const [issueComments, reviewComments] = await Promise.all([
-        githubJson(
-            `${GITHUB_API}/repos/${repo}/issues/${number}/comments?per_page=100`,
-            token
-        ),
-        githubJson(
-            `${GITHUB_API}/repos/${repo}/pulls/${number}/comments?per_page=100`,
-            token
-        ),
+/**
+ * Every human utterance on a PR, oldest first: issue comments, inline review
+ * comments and review submissions, merged into one timeline.
+ *
+ * Bots are excluded throughout — CodeRabbit comments on everything, and a
+ * timeline it dominates answers no question worth asking.
+ */
+async function fetchActivity({ repo, number, token, viewerLogin }) {
+    const [issueComments, reviewComments, reviews] = await Promise.all([
+        githubJson(`${GITHUB_API}/repos/${repo}/issues/${number}/comments?per_page=100`, token),
+        githubJson(`${GITHUB_API}/repos/${repo}/pulls/${number}/comments?per_page=100`, token),
+        githubJson(`${GITHUB_API}/repos/${repo}/pulls/${number}/reviews?per_page=100`, token),
     ]);
 
-    const humans = comment => {
-        const who = comment.user?.login;
-        if (!who) return false;
-        if (viewerLogin && who === viewerLogin) return false;
-        return !isBot(comment.user);
+    const events = [];
+    const add = (rows, stamp) => {
+        for (const row of Array.isArray(rows) ? rows : []) {
+            const who = row.user?.login;
+            if (!who || isBot(row.user)) continue;
+            events.push({ who, at: row[stamp] || '' });
+        }
     };
+    add(issueComments, 'created_at');
+    add(reviewComments, 'created_at');
+    add(reviews, 'submitted_at');
+    events.sort((a, b) => String(a.at).localeCompare(String(b.at)));
 
-    return [
-        ...(Array.isArray(issueComments) ? issueComments : []),
-        ...(Array.isArray(reviewComments) ? reviewComments : []),
-    ].filter(humans).length;
+    return {
+        // Who spoke last decides whose turn it is.
+        lastSpeaker: events.length ? events[events.length - 1].who : null,
+        // Comments by someone other than you — the "did a teammate reply"
+        // watermark, which must not count your own words.
+        othersComments: events.filter(e => !viewerLogin || e.who !== viewerLogin).length,
+    };
+}
+
+/**
+ * Whose move it is.
+ *
+ * The board exists to answer "does this need me", and that is decided by who
+ * spoke last, not by CI or by how the PR looks. If the author spoke last the
+ * ball is with the reviewers; if a reviewer spoke last it is back with the
+ * author. A PR nobody has said anything on is waiting for its first review.
+ *
+ * Returns 'done' | 'mine' | 'theirs'.
+ */
+function turnFor({ decision, author, lastSpeaker, viewerLogin }) {
+    if (decision === 'approved') return 'done';
+    const ballWithAuthor = Boolean(lastSpeaker) && lastSpeaker !== author;
+    const viewerIsAuthor = Boolean(viewerLogin) && viewerLogin === author;
+    return ballWithAuthor === viewerIsAuthor ? 'mine' : 'theirs';
 }
 
 async function fetchViewerLogin(token) {
@@ -458,15 +486,25 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
             // not take the whole sweep down with it (mapLimit rejects on first
             // throw), so keep whatever we recorded last time.
             try {
-                const { decision, decisionBy } = await fetchReviewDecision({
-                    repo: task.repo,
-                    number: task.number,
-                    token,
-                });
+                const [{ decision, decisionBy }, activity] = await Promise.all([
+                    fetchReviewDecision({
+                        repo: task.repo,
+                        number: task.number,
+                        token,
+                    }),
+                    fetchActivity({ repo: task.repo, number: task.number, token }),
+                ]);
                 prTasks.setDecision(task.id, {
                     reviewDecision: decision,
                     decisionBy,
                 });
+                // Whose move it is — the only thing the row's glyph now shows.
+                prTasks.setTurn(task.id, turnFor({
+                    decision,
+                    author: state.author,
+                    lastSpeaker: activity.lastSpeaker,
+                    viewerLogin,
+                }));
             } catch (err) {
                 // Keep the previous decision, but say so — a swallowed failure
                 // here looks exactly like "nobody has reviewed it".
@@ -500,20 +538,21 @@ async function refreshMine(prTasks, token, viewerLogin) {
             return;
         }
 
-        const [{ decision, decisionBy }, humanComments] = await Promise.all([
+        const [{ decision, decisionBy }, activity] = await Promise.all([
             fetchReviewDecision({
                 repo: task.repo,
                 number: task.number,
                 token,
                 viewerLogin,
             }),
-            fetchHumanCommentCount({
+            fetchActivity({
                 repo: task.repo,
                 number: task.number,
                 token,
                 viewerLogin,
             }),
         ]);
+        const humanComments = activity.othersComments;
 
         prTasks.upsert({
             repo: task.repo,
@@ -527,6 +566,12 @@ async function refreshMine(prTasks, token, viewerLogin) {
             prCreatedAt: state.createdAt,
             isDraft: state.draft,
         });
+        prTasks.setTurn(task.id, turnFor({
+            decision,
+            author: state.author,
+            lastSpeaker: activity.lastSpeaker,
+            viewerLogin,
+        }));
 
         const newComments = Math.max(0, humanComments - (task.seen_comments || 0));
         const decisionChanged = (decision || null) !== (task.review_decision || null);
@@ -558,7 +603,8 @@ async function refreshMine(prTasks, token, viewerLogin) {
 
 module.exports = {
     mapLimit,
-    fetchHumanCommentCount,
+    fetchActivity,
+    turnFor,
     fetchPrState,
     fetchReviewDecision,
     fetchTeamMembers,

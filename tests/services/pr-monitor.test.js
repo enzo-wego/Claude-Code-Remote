@@ -46,34 +46,33 @@ describe('refreshAll', () => {
             ci: 'pending',
             reviewState: 'requested',
         });
+        // Routed by URL: the decision and the activity timeline share a
+        // Promise.all, so their relative order is not a contract.
         const fetchMock = jest.spyOn(global, 'fetch')
-            .mockResolvedValueOnce({
-                ok: true,
-                json: async () => ({
-                    title: 'Fix tax rounding',
-                    user: { login: 'alice' },
-                    head: { sha: 'abc123' },
-                    requested_reviewers: [{ login: 'enzo' }],
-                }),
-            })
-            .mockResolvedValueOnce({
-                ok: true,
-                json: async () => ({
-                    check_runs: [
-                        { status: 'completed', conclusion: 'success' },
-                    ],
-                }),
-            })
-            .mockResolvedValueOnce({
-                ok: true,
-                json: async () => ([
-                    { user: { login: 'bob' }, state: 'APPROVED' },
-                ]),
+            .mockImplementation(async (url) => {
+                const body = /check-runs/.test(url)
+                    ? { check_runs: [{ status: 'completed', conclusion: 'success' }] }
+                    : /\/pulls\/\d+\/reviews/.test(url)
+                        ? [{
+                            user: { login: 'bob', type: 'User' },
+                            state: 'APPROVED',
+                            submitted_at: '2026-07-29T02:00:00Z',
+                        }]
+                        : /comments/.test(url) ? []
+                            : {
+                                title: 'Fix tax rounding',
+                                user: { login: 'alice' },
+                                head: { sha: 'abc123' },
+                                requested_reviewers: [{ login: 'enzo' }],
+                            };
+                return { ok: true, json: async () => body };
             });
 
         const ready = await refreshAll(tasks, 'token');
 
-        expect(fetchMock).toHaveBeenCalledTimes(3);
+        // pull + check-runs + reviews(decision) + the three the activity
+        // timeline needs: issue comments, inline comments, reviews.
+        expect(fetchMock).toHaveBeenCalledTimes(6);
         expect(tasks.get(task.id)).toEqual(expect.objectContaining({
             ci: 'green',
             review_state: 'requested',
@@ -81,6 +80,8 @@ describe('refreshAll', () => {
             author: 'alice',
             review_decision: 'approved',
             decision_by: 'bob',
+            // Approved outranks whoever spoke last.
+            turn: 'done',
         }));
         expect(ready.map(row => row.id)).toEqual([task.id]);
     });

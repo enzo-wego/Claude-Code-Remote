@@ -1,8 +1,14 @@
-const CI_GLYPHS = {
-    green: '🟢',
-    red: '🔴',
-    pending: '🟡',
-    unknown: '⚪',
+/**
+ * Three states, one question: whose move is it?
+ *
+ * The board used to lead with CI and review-decision glyphs — seven symbols
+ * describing the *state* of a PR, when the only thing being asked is whether it
+ * needs you. Who spoke last answers that; CI does not.
+ */
+const TURN_GLYPHS = {
+    mine: '🟡',    // waiting on you
+    theirs: '💬',  // waiting on the other side
+    done: '✅',    // approved, nothing owed
 };
 
 const DECISION_GLYPHS = {
@@ -57,8 +63,35 @@ function overflow(taskId, entries) {
     };
 }
 
-function ciGlyph(task) {
-    return CI_GLYPHS[task.ci] || CI_GLYPHS.unknown;
+/** Fall back to 'mine' when a row predates the turn column — better to be
+ *  asked about a PR that does not need you than to hide one that does. */
+function turnOf(task) {
+    return TURN_GLYPHS[task.turn] ? task.turn : 'mine';
+}
+
+function turnGlyph(task) {
+    return TURN_GLYPHS[turnOf(task)];
+}
+
+function turnLabel(task) {
+    const turn = turnOf(task);
+    if (turn === 'done') {
+        return `approved${task.decision_by ? ` @${task.decision_by}` : ''}`;
+    }
+    if (turn === 'mine') return 'your move';
+    // "Waiting on them" means different people either side: on your own PR the
+    // reviewers owe you a reply; on a teammate's, the author does.
+    return task.lane === 'mine'
+        ? 'waiting on reviewers'
+        : `waiting on @${task.author || 'the author'}`;
+}
+
+/** Rows that need you, first; then oldest, since age is the next best signal. */
+function byTurnThenAge(tasks) {
+    const rank = { mine: 0, theirs: 1, done: 2 };
+    return [...tasks].sort((a, b) =>
+        (rank[turnOf(a)] - rank[turnOf(b)])
+        || ((a.pr_created_at || 0) - (b.pr_created_at || 0)));
 }
 
 function truncate(text, max = TITLE_MAX) {
@@ -79,16 +112,6 @@ function ageOf(task, now = Date.now()) {
     const days = Math.floor(hours / 24);
     if (days < 14) return `${days}d`;
     return `${Math.floor(days / 7)}w`;
-}
-
-/** "approved @lei-wego", "changes requested @yanyi-wego", "no review". */
-function verdictOf(task) {
-    const who = task.decision_by ? ` @${task.decision_by}` : '';
-    return {
-        approved: `approved${who}`,
-        changes_requested: `changes requested${who}`,
-        commented: `commented${who}`,
-    }[task.review_decision] || 'no review';
 }
 
 function section(text, accessory) {
@@ -124,20 +147,14 @@ function teamLaneBlocks(tasks) {
         return blocks;
     }
 
-    const oldestFirst = [...tasks].sort(
-        (a, b) => (a.pr_created_at || 0) - (b.pr_created_at || 0)
-    );
-
-    for (const task of oldestFirst) {
-        // Approval leads the row when there is one: an approved PR is the one
-        // you can scroll past, and that reads faster than a CI colour.
+    // Your turn first, then oldest. Sorting purely by age buried the one row
+    // that actually needed you under a fortnight of other people's waiting.
+    for (const task of byTurnThenAge(tasks)) {
         blocks.push(row(task, {
-            glyph: DECISION_GLYPHS[task.review_decision] || ciGlyph(task),
+            glyph: turnGlyph(task),
             columns: [
                 `@${task.author || 'unknown'}`,
-                verdictOf(task),
-                `CI ${ciGlyph(task)}`,
-                task.review_state === 'requested' ? 'review requested' : '',
+                turnLabel(task),
             ],
             accessory: overflow(task.id, [
                 { actionId: 'pr_review_now', text: '🔍 Review now' },
@@ -156,9 +173,9 @@ function reviewLaneBlocks(tasks) {
         const actionable = task.status === 'detected'
             || task.status === 'needs_review';
         blocks.push(row(task, {
-            glyph: ciGlyph(task),
+            glyph: turnGlyph(task),
             columns: [
-                task.review_state || 'unknown',
+                turnLabel(task),
                 task.status === 'reviewing' ? '_reviewing on your Mac…_' : '',
             ],
             accessory: actionable
@@ -197,16 +214,15 @@ function mineLaneBlocks(tasks) {
         return blocks;
     }
 
-    for (const task of tasks) {
+    for (const task of byTurnThenAge(tasks)) {
         const mergeable = task.review_decision === 'approved'
             && task.ci === 'green';
 
         blocks.push(row(task, {
-            glyph: DECISION_GLYPHS[task.review_decision] || ciGlyph(task),
+            glyph: turnGlyph(task),
             columns: [
-                verdictOf(task),
-                `CI ${ciGlyph(task)}`,
-                task.seen_comments ? `💬 ${task.seen_comments}` : '',
+                turnLabel(task),
+                task.decision_by ? `@${task.decision_by}` : '',
             ],
             accessory: mergeable
                 ? {

@@ -68,28 +68,56 @@ describe('table row shape', () => {
         expect(line).toContain('3d');
     });
 
-    test('an approved team PR leads with the approval glyph, not CI', () => {
-        const blocks = buildPrBoardBlocks([{
-            id: 1, lane: 'team', repo: 'wego/payments-knowledge', number: 6,
-            url: 'u', title: 'use fresh refs', author: 'yanyi-wego',
-            ci: 'pending', status: 'detected',
-            review_decision: 'approved', decision_by: 'lei-wego',
-        }]);
-        const line = blocks.find(b => b.accessory).text.text;
+    /**
+     * One question, three answers. CI used to lead the row, which described the
+     * PR rather than saying whether it wanted anything from you.
+     */
+    const teamRow = (extra) => buildPrBoardBlocks([{
+        id: 1, lane: 'team', repo: 'wego/payments', number: 2199, url: 'u',
+        title: 't', author: 'lei-wego', ci: 'red', status: 'detected', ...extra,
+    }]).find(b => b.accessory).text.text;
+
+    test('approved reads as done, whatever CI says', () => {
+        const line = teamRow({ turn: 'done', review_decision: 'approved', decision_by: 'lei-wego' });
         expect(line.startsWith('✅')).toBe(true);
         expect(line).toContain('approved @lei-wego');
-        // CI is still visible, just demoted to a column.
-        expect(line).toContain('CI 🟡');
+        expect(line).not.toContain('🔴');
     });
 
-    test('a team PR nobody has reviewed still leads with CI', () => {
-        const blocks = buildPrBoardBlocks([{
-            id: 1, lane: 'team', repo: 'a/b', number: 1, url: 'u',
-            title: 't', author: 'lei-wego', ci: 'red', status: 'detected',
-        }]);
-        const line = blocks.find(b => b.accessory).text.text;
-        expect(line.startsWith('🔴')).toBe(true);
-        expect(line).toContain('no review');
+    test('a teammate PR waiting on its author is not your problem', () => {
+        const line = teamRow({ turn: 'theirs' });
+        expect(line.startsWith('💬')).toBe(true);
+        expect(line).toContain('waiting on @lei-wego');
+    });
+
+    test('a teammate PR whose author replied last is your move', () => {
+        const line = teamRow({ turn: 'mine' });
+        expect(line.startsWith('🟡')).toBe(true);
+        expect(line).toContain('your move');
+    });
+
+    test('on your own PR, "theirs" names the reviewers, not you', () => {
+        const line = buildPrBoardBlocks([{
+            id: 1, lane: 'mine', repo: 'wego/payments', number: 2206, url: 'u',
+            title: 't', author: 'enzo-wego', status: 'detected', turn: 'theirs',
+        }]).filter(b => b.type === 'section').map(b => b.text.text)
+            .find(t => t.includes('#2206'));
+        expect(line.startsWith('💬')).toBe(true);
+        expect(line).toContain('waiting on reviewers');
+    });
+
+    test('rows needing you sort above everything else', () => {
+        const mk = (number, turn, daysOld) => ({
+            id: number, lane: 'team', repo: 'wego/payments', number, url: 'u',
+            title: `pr-${number}`, author: 'lei-wego', status: 'detected',
+            turn, pr_created_at: Date.now() - daysOld * DAY,
+        });
+        // The oldest row is theirs; the newest needs you and must still win.
+        const text = JSON.stringify(buildPrBoardBlocks([
+            mk(100, 'theirs', 30), mk(200, 'done', 20), mk(300, 'mine', 1),
+        ]));
+        expect(text.indexOf('#300')).toBeLessThan(text.indexOf('#100'));
+        expect(text.indexOf('#100')).toBeLessThan(text.indexOf('#200'));
     });
 
     test('long titles are truncated so rows stay one line', () => {

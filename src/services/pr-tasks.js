@@ -46,6 +46,10 @@ class PrTasks {
         // were drafts — so they are recorded and filtered at render time rather
         // than dropped, letting the toggle show them without a re-sweep.
         this._addColumn('is_draft', 'INTEGER DEFAULT 0');
+        // Whose move it is: 'mine' | 'theirs' | 'done'. Decided by who spoke
+        // last, and the only thing the row's glyph shows — CI and review state
+        // described the PR, which was never the question being asked.
+        this._addColumn('turn', 'TEXT');
 
         // Board preferences (draft visibility, and whatever the page grows
         // next). One row per key; the board belongs to one owner.
@@ -146,6 +150,9 @@ class PrTasks {
                 SET review_decision=?, decision_by=?, updated_at=?
                 WHERE id=?
             `),
+            setTurn: db.prepare(
+                'UPDATE pr_tasks SET turn=?, updated_at=? WHERE id=?'
+            ),
             getPref: db.prepare('SELECT value FROM board_prefs WHERE key=?'),
             setPref: db.prepare(`
                 INSERT INTO board_prefs (key, value) VALUES (?, ?)
@@ -236,6 +243,10 @@ class PrTasks {
 
     setDecision(id, { reviewDecision = null, decisionBy = null }) {
         this._s.setDecision.run(reviewDecision, decisionBy, Date.now(), id);
+    }
+
+    setTurn(id, turn) {
+        this._s.setTurn.run(turn || null, Date.now(), id);
     }
 
     setDraftJob(id, jobId) {

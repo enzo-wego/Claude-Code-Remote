@@ -2,12 +2,13 @@ const Database = require('better-sqlite3');
 const PrTasks = require('../../src/services/pr-tasks');
 const {
     fetchPrState,
-    fetchHumanCommentCount,
+    fetchActivity,
     fetchReviewDecision,
     refreshMine,
     reviewQueries,
     sweepMyPrs,
     sweepReviewRequests,
+    turnFor,
 } = require('../../src/services/pr-monitor');
 const { needsMyReview } = require('../../src/services/pr-detect');
 const { buildMineChangeText } = require('../../src/channels/slack/pr-board');
@@ -181,13 +182,21 @@ describe('sweepMyPrs', () => {
 describe('refreshMine', () => {
     afterEach(() => { jest.restoreAllMocks(); });
 
-    // pull → check-runs → reviews → issue comments → review comments
+    /**
+     * Routed by URL rather than call order: the decision and the activity
+     * timeline are fetched inside one Promise.all, so their order is an
+     * implementation detail a test should not encode.
+     */
     function mockCycle(spy, { pull, reviews, issueComments = [], reviewComments = [] }) {
-        jsonOnce(spy, pull);
-        jsonOnce(spy, { check_runs: [{ status: 'completed', conclusion: 'success' }] });
-        jsonOnce(spy, reviews);
-        jsonOnce(spy, issueComments);
-        jsonOnce(spy, reviewComments);
+        spy.mockImplementation(async (url) => {
+            const body = /check-runs/.test(url)
+                ? { check_runs: [{ status: 'completed', conclusion: 'success' }] }
+                : /\/issues\/\d+\/comments/.test(url) ? issueComments
+                    : /\/pulls\/\d+\/comments/.test(url) ? reviewComments
+                        : /\/pulls\/\d+\/reviews/.test(url) ? reviews
+                            : pull;
+            return { ok: true, json: async () => body };
+        });
     }
 
     const human = login => ({ user: { login, type: 'User' } });
@@ -219,7 +228,9 @@ describe('refreshMine', () => {
         expect(tasks.get(task.id)).toEqual(expect.objectContaining({
             review_decision: 'approved',
             decision_by: 'sarah',
-            seen_comments: 4,
+            // 4 issue comments + sarah's review submission: a review is a reply.
+            seen_comments: 5,
+            turn: 'done',
         }));
     });
 
@@ -381,20 +392,74 @@ describe('bots are not teammates', () => {
         })).toEqual({ decision: 'approved', decisionBy: 'sarah' });
     });
 
-    test('comment count ignores bots and your own replies', async () => {
+    test('the timeline ignores bots, and the last speaker decides the turn', async () => {
         const spy = jest.spyOn(global, 'fetch');
-        jsonOnce(spy, [
-            { user: { login: 'coderabbitai[bot]', type: 'Bot' } },
-            { user: { login: 'enzo', type: 'User' } },
-            { user: { login: 'sarah', type: 'User' } },
-        ]);
-        jsonOnce(spy, [
-            { user: { login: 'chatgpt-codex-connector[bot]', type: 'Bot' } },
-            { user: { login: 'minh', type: 'User' } },
-        ]);
+        spy.mockImplementation(async (url) => {
+            const at = t => `2026-07-29T0${t}:00:00Z`;
+            const body = /\/issues\/\d+\/comments/.test(url)
+                ? [
+                    { user: { login: 'coderabbitai[bot]', type: 'Bot' }, created_at: at(9) },
+                    { user: { login: 'enzo', type: 'User' }, created_at: at(1) },
+                    { user: { login: 'sarah', type: 'User' }, created_at: at(2) },
+                ]
+                : /\/pulls\/\d+\/comments/.test(url)
+                    ? [
+                        { user: { login: 'chatgpt-codex-connector[bot]', type: 'Bot' }, created_at: at(8) },
+                        { user: { login: 'minh', type: 'User' }, created_at: at(3) },
+                    ]
+                    : [];
+            return { ok: true, json: async () => body };
+        });
 
-        expect(await fetchHumanCommentCount({
+        const activity = await fetchActivity({
             repo: 'a/b', number: 1, token: 't', viewerLogin: 'enzo',
-        })).toBe(2);
+        });
+
+        // Your own words are not a teammate replying, so they do not count.
+        expect(activity.othersComments).toBe(2);
+        // But they still count for *whose turn*, and the bots — who posted
+        // latest — must not be mistaken for the last human to speak.
+        expect(activity.lastSpeaker).toBe('minh');
+    });
+});
+
+/**
+ * Whose move it is — the only thing the board's glyph now answers.
+ * The rule is symmetric: whoever spoke last hands the ball to the other side.
+ */
+describe('turnFor', () => {
+    const me = 'enzo-wego';
+    const at = (author, lastSpeaker, extra = {}) =>
+        turnFor({ author, lastSpeaker, viewerLogin: me, ...extra });
+
+    test("a teammate's PR waiting on its author is not yours", () => {
+        expect(at('lei-wego', 'mike-wego')).toBe('theirs');
+    });
+
+    test("a teammate's PR whose author replied last is yours", () => {
+        expect(at('lei-wego', 'lei-wego')).toBe('mine');
+    });
+
+    test('a teammate PR nobody has spoken on needs its first review', () => {
+        expect(at('lei-wego', null)).toBe('mine');
+    });
+
+    test('your own PR with a reply waiting on you is yours', () => {
+        expect(at(me, 'mike-wego')).toBe('mine');
+    });
+
+    test('your own PR where you spoke last is waiting on them', () => {
+        expect(at(me, me)).toBe('theirs');
+        expect(at(me, null)).toBe('theirs');
+    });
+
+    test('approved settles it regardless of who spoke last', () => {
+        expect(at('lei-wego', 'lei-wego', { decision: 'approved' })).toBe('done');
+        expect(at(me, 'mike-wego', { decision: 'approved' })).toBe('done');
+    });
+
+    test('changes_requested is not done — someone still owes a move', () => {
+        expect(at('lei-wego', 'mike-wego', { decision: 'changes_requested' }))
+            .toBe('theirs');
     });
 });

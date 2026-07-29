@@ -40,10 +40,12 @@ describe('buildPrBoardBlocks', () => {
         const text = JSON.stringify(blocks);
         expect(text).toContain('Fix tax rounding');
         expect(text).toContain('wego/payments#412');
-        expect(text).toContain('🟢');
+        // Rows lead with whose move it is, not with CI. These fixtures carry no
+        // `turn`, which reads as needing you — the safe direction.
         expect(text).toContain('🟡');
-        expect(text).toContain('🔴');
-        expect(text).toContain('requested');
+        expect(text).toContain('your move');
+        expect(text).not.toContain('🟢');
+        expect(text).not.toContain('🔴');
         expect(text).toContain('reviewing on your Mac');
 
         // The primary action is a row accessory; only secondary controls get
