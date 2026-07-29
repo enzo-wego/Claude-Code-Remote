@@ -368,4 +368,11 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { executeJob, pollOnce };
+module.exports = {
+    executeJob,
+    pollOnce,
+    // Exported so the anchoring can be dry-run against a real PR diff before
+    // anything is posted — GitHub rejects the whole review on a bad anchor.
+    commentableLines,
+    partitionComments,
+};
