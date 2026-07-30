@@ -34,6 +34,21 @@ function processReply(task, job) {
         : `:information_source: Processing for #${task.number} is already queued.`;
 }
 
+/**
+ * The runner resumes with `claude --resume <key>` and nothing else. Codex uses
+ * `codex resume <id>`, so handing it a Codex key would launch Claude against an
+ * id it has never seen, quietly start a fresh conversation, and then compact
+ * that. Refuse where the reason can still be read, rather than opening a pane
+ * that looks like it worked.
+ */
+function unresumableReason(session) {
+    const cli = session && session.cli;
+    if (!cli || cli === 'claude') return null;
+    return `:warning: \`${session.label || session.key.slice(0, 8)}\` is a `
+        + `${cli} session, and the runner only knows how to resume Claude. `
+        + 'Record a Claude session for this PR, or process it by hand.';
+}
+
 async function handlePrAction({
     actionId,
     value,
@@ -90,6 +105,8 @@ async function handlePrAction({
             }
 
             const session = sessions[0] || null;
+            const refusal = unresumableReason(session);
+            if (refusal) return refusal;
             const job = enqueueProcess(task, session, jobs);
             if (job && session) agentSessions.touch(session.id);
             return processReply(task, job);
@@ -104,6 +121,8 @@ async function handlePrAction({
                 return ':warning: That session is no longer available for '
                     + `${task.repo}#${task.number}.`;
             }
+            const refusal = unresumableReason(session);
+            if (refusal) return refusal;
             const job = enqueueProcess(task, session, jobs);
             if (job) agentSessions.touch(sessionId);
             return processReply(task, job);

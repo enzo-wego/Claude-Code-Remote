@@ -2163,7 +2163,10 @@ ${formatted}`,
                     });
                     await this.app.client.chat.postMessage({
                         channel: dm.channel.id,
-                        text: reply,
+                        // Same shape as the pr_menu path: a handler may answer
+                        // with blocks instead of a line, and passing that object
+                        // as `text` fails at Slack rather than here.
+                        ...(typeof reply === 'string' ? { text: reply } : reply),
                         unfurl_links: false,
                         unfurl_media: false,
                     });

@@ -71,6 +71,52 @@ describe('pr_process', () => {
         };
     };
 
+    /**
+     * The runner only knows `claude --resume <key>`. Codex resumes with
+     * `codex resume <id>`, so a Codex key would launch Claude against an id it
+     * has never seen, start a fresh conversation, and compact that instead —
+     * the failure mode the whole session index exists to prevent.
+     */
+    test('refuses a session the runner cannot resume, and queues nothing', async () => {
+        const { jobs, prTasks, task } = setup();
+        const sessions = agentSessions([{
+            id: 9, key: '019fb0e1-f535-70a2-a5d6-6d9156855a5e',
+            cli: 'codex', label: 'PAY-2266 458', last_used_at: Date.now(),
+        }]);
+
+        const reply = await handlePrAction({
+            actionId: 'pr_process',
+            value: String(task.id),
+            prTasks,
+            jobs,
+            agentSessions: sessions,
+        });
+
+        expect(reply).toContain('codex session');
+        expect(jobs.lease('mac')).toBeFalsy();
+        expect(sessions.touch).not.toHaveBeenCalled();
+    });
+
+    test('refuses the same way when the session was chosen from the picker', async () => {
+        const { jobs, prTasks, task } = setup();
+        const sessions = agentSessions([{
+            id: 9, key: 'abcdef12', cli: 'codex', label: null,
+            created_at: Date.now(),
+        }]);
+
+        const reply = await handlePrAction({
+            actionId: 'pr_process_with',
+            value: `${task.id}:9`,
+            prTasks,
+            jobs,
+            agentSessions: sessions,
+        });
+
+        expect(reply).toContain('codex session');
+        expect(jobs.lease('mac')).toBeFalsy();
+        expect(sessions.touch).not.toHaveBeenCalled();
+    });
+
     test('starts fresh when the PR has no recorded session', async () => {
         const { jobs, prTasks, task } = setup();
         const sessions = agentSessions([]);
@@ -198,9 +244,12 @@ describe('pr_process', () => {
 
     test('the picker resumes exactly the chosen session and touches it', async () => {
         const { jobs, prTasks, task } = setup();
+        // Both resumable, so what this proves is that the *chosen* session wins
+        // rather than the first one. A Codex candidate here would be refused
+        // before it could be enqueued — see the two refusal tests above.
         const candidates = [
             { id: 71, key: 'aaaa-1111', cli: 'claude', label: 'feature dev' },
-            { id: 72, key: 'bbbb-2222', cli: 'codex', label: 'review fixes' },
+            { id: 72, key: 'bbbb-2222', cli: 'claude', label: 'review fixes' },
         ];
         const sessions = agentSessions(candidates);
 
@@ -219,7 +268,7 @@ describe('pr_process', () => {
             url: 'https://github.com/wego/payments/pull/412',
             title: 'Fix tax rounding',
             sessionKey: 'bbbb-2222',
-            cli: 'codex',
+            cli: 'claude',
             threads: null,
         });
         expect(sessions.touch).toHaveBeenCalledWith(72);
