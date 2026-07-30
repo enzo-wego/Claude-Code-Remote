@@ -26,7 +26,7 @@ function issueType(key) {
 }
 
 /** The canonical link for a key, so callers only have to pass the key. */
-function issueUrl(key, { jiraBase = process.env.JIRA_BASE_URL || 'https://wego.atlassian.net' } = {}) {
+function issueUrl(key, { jiraBase = process.env.JIRA_BASE_URL || 'https://wegomushi.atlassian.net' } = {}) {
     if (JIRA_KEY.test(key)) return `${jiraBase.replace(/\/$/, '')}/browse/${key}`;
     const gh = key.match(GH_ISSUE);
     return gh ? `https://github.com/${gh[1]}/issues/${gh[2]}` : null;

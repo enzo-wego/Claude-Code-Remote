@@ -94,7 +94,8 @@ class constructor, prepared statements cached on `this._s`. See
 
 Exported helpers: `issueType(key)` → `'jira' | 'gh_issue' | null`
 (`/^[A-Z][A-Z0-9]+-\d+$/` vs `owner/repo#123`), and `issueUrl(key, {jiraBase})`
-defaulting `jiraBase` to `process.env.JIRA_BASE_URL || 'https://wego.atlassian.net'`.
+defaulting `jiraBase` to `process.env.JIRA_BASE_URL || 'https://wegomushi.atlassian.net'`
+(the tenant is `wegomushi`, not `wego`).
 
 ## Tasks
 

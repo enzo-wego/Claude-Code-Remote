@@ -24,6 +24,14 @@ describe('issue keys', () => {
 
         expect(issueUrl('PAY-2266', { jiraBase: 'https://x.atlassian.net' }))
             .toBe('https://x.atlassian.net/browse/PAY-2266');
+
+        // The default host is the part that can be silently wrong — a derived
+        // link pointing at the wrong tenant 404s instead of failing loudly.
+        const saved = process.env.JIRA_BASE_URL;
+        delete process.env.JIRA_BASE_URL;
+        expect(issueUrl('PAY-2266'))
+            .toBe('https://wegomushi.atlassian.net/browse/PAY-2266');
+        if (saved !== undefined) process.env.JIRA_BASE_URL = saved;
         expect(issueUrl('wego/payments#12'))
             .toBe('https://github.com/wego/payments/issues/12');
         expect(issueUrl('nonsense')).toBeNull();
