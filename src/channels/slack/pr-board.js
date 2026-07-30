@@ -148,6 +148,22 @@ function teamLaneBlocks(tasks) {
     // Your turn first, then oldest. Sorting purely by age buried the one row
     // that actually needed you under a fortnight of other people's waiting.
     for (const task of byTurnThenAge(tasks)) {
+        const entries = [
+            { actionId: 'pr_review_now', text: '🔍 Review now' },
+            { actionId: 'pr_dismiss', text: '🙈 Dismiss' },
+        ];
+        if (task.slack_permalink) {
+            entries.push({
+                text: '💬 Slack thread',
+                actionId: 'pr_thread',
+                url: task.slack_permalink,
+            });
+        }
+        entries.push({
+            actionId: 'pr_open',
+            text: '🔗 Open on GitHub',
+            url: task.url,
+        });
         blocks.push(row(task, {
             glyph: turnGlyph(task),
             columns: [
@@ -155,11 +171,7 @@ function teamLaneBlocks(tasks) {
                 openThreadsLabel(task),
                 turnLabel(task),
             ],
-            accessory: overflow(task.id, [
-                { actionId: 'pr_review_now', text: '🔍 Review now' },
-                { actionId: 'pr_dismiss', text: '🙈 Dismiss' },
-                { actionId: 'pr_open', text: '🔗 Open on GitHub', url: task.url },
-            ]),
+            accessory: overflow(task.id, entries),
         }));
     }
     return blocks;
@@ -217,6 +229,22 @@ function mineLaneBlocks(tasks) {
     for (const task of byTurnThenAge(tasks)) {
         const mergeable = task.review_decision === 'approved'
             && task.ci === 'green';
+        const entries = [
+            { text: '⚙️ Process', actionId: 'pr_process' },
+            { text: '🗑 Dismiss', actionId: 'pr_dismiss' },
+        ];
+        if (task.slack_permalink) {
+            entries.push({
+                text: '💬 Slack thread',
+                actionId: 'pr_thread',
+                url: task.slack_permalink,
+            });
+        }
+        entries.push({
+            text: '🔗 Open on GitHub',
+            actionId: 'pr_open',
+            url: task.url,
+        });
 
         blocks.push(row(task, {
             glyph: turnGlyph(task),
@@ -239,15 +267,7 @@ function mineLaneBlocks(tasks) {
                         style: 'primary',
                     },
                 }
-                : overflow(task.id, [
-                    { text: '⚙️ Process', actionId: 'pr_process' },
-                    { text: '🗑 Dismiss', actionId: 'pr_dismiss' },
-                    {
-                        text: '🔗 Open on GitHub',
-                        actionId: 'pr_open',
-                        url: task.url,
-                    },
-                ]),
+                : overflow(task.id, entries),
         }));
     }
     return blocks;
@@ -420,5 +440,6 @@ module.exports = {
     buildMineChangeText,
     buildPrBoardBlocks,
     buildPrDraftResultBlocks,
+    titleOf,
     turnOf,
 };

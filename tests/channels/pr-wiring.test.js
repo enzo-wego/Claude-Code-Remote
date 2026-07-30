@@ -33,7 +33,12 @@ function makeHandler() {
                 }),
             },
             chat: {
-                postMessage: jest.fn().mockResolvedValue({}),
+                postMessage: jest.fn().mockResolvedValue({
+                    ts: '1712345678.000100',
+                }),
+                getPermalink: jest.fn().mockResolvedValue({
+                    permalink: 'https://slack.example/archives/DOWNER/p1712345678000100',
+                }),
             },
         },
     };
@@ -138,7 +143,7 @@ describe('PR board socket wiring', () => {
         ]);
     });
 
-    test('apex completion marks the linked PR drafted and DMs PR actions', async () => {
+    test('first PR message creates an anchor, threads the reply, and persists both links', async () => {
         const handler = makeHandler();
         const task = handler.prTasks.upsert({
             repo: 'wego/payments',
@@ -159,13 +164,118 @@ describe('PR board socket wiring', () => {
 
         await handler._onJobResult(handler.jobs.get(job.id));
 
-        expect(handler.prTasks.get(task.id).status).toBe('drafted');
-        const message = handler.app.client.chat.postMessage.mock.calls[0][0];
+        const stored = handler.prTasks.get(task.id);
+        expect(stored).toMatchObject({
+            status: 'drafted',
+            slack_ts: '1712345678.000100',
+            slack_permalink: 'https://slack.example/archives/DOWNER/p1712345678000100',
+        });
+        expect(handler.app.client.chat.postMessage).toHaveBeenCalledTimes(2);
+        const [anchor, message] = handler.app.client.chat.postMessage.mock.calls
+            .map(call => call[0]);
+        expect(anchor).toEqual({
+            channel: 'DOWNER',
+            text: '*<https://github.com/wego/payments/pull/412|wego/payments#412>* — wego/payments#412',
+            unfurl_links: false,
+            unfurl_media: false,
+        });
+        expect(handler.app.client.chat.getPermalink).toHaveBeenCalledWith({
+            channel: 'DOWNER',
+            message_ts: '1712345678.000100',
+        });
+        expect(message.thread_ts).toBe('1712345678.000100');
         const actionIds = message.blocks
             .find(block => block.type === 'actions')
             .elements
             .map(element => element.action_id);
         expect(actionIds).toEqual(['pr_post', 'pr_edit', 'pr_discard']);
         expect(handler._publishHome).toHaveBeenCalledWith('UOWNER');
+    });
+
+    test('a second message about the same PR reuses the thread without another anchor', async () => {
+        const handler = makeHandler();
+        const task = handler.prTasks.upsert({
+            repo: 'wego/payments',
+            number: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+        });
+        handler.prTasks.setSlackThread(
+            task.id,
+            '1712345678.000100',
+            'https://slack.example/archives/DOWNER/p1712345678000100'
+        );
+        const job = handler.jobs.enqueue('pane_message', {
+            repo: 'wego/payments',
+            pr: 412,
+        });
+        const leased = handler.jobs.lease('mac');
+        handler.jobs.complete(leased.id, leased.lease_id, {
+            tail: 'Review posted',
+        });
+
+        await handler._onJobResult(handler.jobs.get(job.id));
+
+        expect(handler.app.client.chat.postMessage).toHaveBeenCalledTimes(1);
+        expect(handler.app.client.chat.postMessage).toHaveBeenCalledWith(
+            expect.objectContaining({
+                thread_ts: '1712345678.000100',
+                text: expect.stringContaining('Reviewer finished'),
+            })
+        );
+        expect(handler.app.client.chat.getPermalink).not.toHaveBeenCalled();
+    });
+
+    test('a failed permalink lookup still persists the ts and delivers in-thread', async () => {
+        const handler = makeHandler();
+        const task = handler.prTasks.upsert({
+            repo: 'wego/payments',
+            number: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+        });
+        handler.app.client.chat.getPermalink.mockRejectedValueOnce(
+            new Error('permalink unavailable')
+        );
+        const job = handler.jobs.enqueue('pane_close', {
+            repo: 'wego/payments',
+            pr: 412,
+        });
+        const leased = handler.jobs.lease('mac');
+        handler.jobs.complete(leased.id, leased.lease_id, {});
+
+        await handler._onJobResult(handler.jobs.get(job.id));
+
+        expect(handler.prTasks.get(task.id)).toMatchObject({
+            slack_ts: '1712345678.000100',
+            slack_permalink: null,
+        });
+        expect(handler.app.client.chat.postMessage).toHaveBeenCalledTimes(2);
+        expect(handler.app.client.chat.postMessage.mock.calls[1][0])
+            .toEqual(expect.objectContaining({
+                thread_ts: '1712345678.000100',
+                text: ':door: Review session closed. Nothing was posted.',
+            }));
+        expect(handler.logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('permalink unavailable')
+        );
+    });
+
+    test('a job with no matching PR row is still delivered flat', async () => {
+        const handler = makeHandler();
+        const job = handler.jobs.enqueue('pane_message', {
+            repo: 'wego/payments',
+            pr: 999,
+        });
+        const leased = handler.jobs.lease('mac');
+        handler.jobs.complete(leased.id, leased.lease_id, {
+            tail: 'Review posted',
+        });
+
+        await handler._onJobResult(handler.jobs.get(job.id));
+
+        expect(handler.app.client.chat.postMessage).toHaveBeenCalledTimes(1);
+        const message = handler.app.client.chat.postMessage.mock.calls[0][0];
+        expect(message.text).toContain('wego/payments#999');
+        expect(message).not.toHaveProperty('thread_ts');
+        expect(handler.app.client.chat.getPermalink).not.toHaveBeenCalled();
     });
 });

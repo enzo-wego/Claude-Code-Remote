@@ -23,6 +23,7 @@ const { buildHomeView } = require('./home-tab');
 const { buildReviewResultBlocks, handleJobAction } = require('./job-results');
 const {
     buildPrDraftResultBlocks,
+    titleOf,
 } = require('./pr-board');
 const { handlePrAction } = require('./pr-actions');
 const { extractPrUrls, needsMyReview } = require('../../services/pr-detect');
@@ -1768,19 +1769,72 @@ ${formatted}`,
         return detected;
     }
 
+    /**
+     * The ts of this PR's DM thread, creating it on first use. The anchor is a
+     * header message rather than whichever notification happened to arrive
+     * first, so the permalink lands on something that says which PR this is.
+     */
+    async _prThreadTs(task, channel) {
+        if (task.slack_ts) return task.slack_ts;
+
+        const res = await this.app.client.chat.postMessage({
+            channel,
+            text: `*<${task.url}|${task.repo}#${task.number}>* — ${titleOf(task)}`,
+            unfurl_links: false,
+            unfurl_media: false,
+        });
+        let permalink = null;
+        try {
+            const link = await this.app.client.chat.getPermalink({
+                channel,
+                message_ts: res.ts,
+            });
+            permalink = link.permalink || null;
+        } catch (err) {
+            this.logger.warn(
+                `Slack permalink lookup failed for ${task.repo}#${task.number}: ${err.message}`
+            );
+        }
+        this.prTasks.setSlackThread(task.id, res.ts, permalink);
+        return res.ts;
+    }
+
+    /** Post a message about a PR into that PR's thread. */
+    async _postForPr(task, message) {
+        const dm = await this.app.client.conversations.open({
+            users: this.config.ownerUserId,
+        });
+        const threadTs = await this._prThreadTs(task, dm.channel.id);
+        return this.app.client.chat.postMessage({
+            channel: dm.channel.id,
+            ...message,
+            thread_ts: threadTs,
+            unfurl_links: false,
+            unfurl_media: false,
+        });
+    }
+
     async _onJobResult(job) {
         try {
             if (!this.config.ownerUserId) return;
-            const dm = await this.app.client.conversations.open({
-                users: this.config.ownerUserId,
-            });
-            if (job.kind === 'review') {
-                await this.app.client.chat.postMessage({
+            let dm;
+            const postFlat = async message => {
+                if (!dm) {
+                    dm = await this.app.client.conversations.open({
+                        users: this.config.ownerUserId,
+                    });
+                }
+                return this.app.client.chat.postMessage({
                     channel: dm.channel.id,
-                    text: 'Review draft ready',
-                    blocks: buildReviewResultBlocks(job),
+                    ...message,
                     unfurl_links: false,
                     unfurl_media: false,
+                });
+            };
+            if (job.kind === 'review') {
+                await postFlat({
+                    text: 'Review draft ready',
+                    blocks: buildReviewResultBlocks(job),
                 });
             } else if (job.kind === 'apex_review') {
                 const task = this.prTasks.listActive().find(
@@ -1794,22 +1848,23 @@ ${formatted}`,
                 }
                 this.prTasks.setStatus(task.id, 'drafted');
                 const drafted = this.prTasks.get(task.id);
-                await this.app.client.chat.postMessage({
-                    channel: dm.channel.id,
+                await this._postForPr(drafted, {
                     text: `Apex review draft ready for ${task.repo}#${task.number}`,
                     blocks: buildPrDraftResultBlocks(drafted, job),
-                    unfurl_links: false,
-                    unfurl_media: false,
                 });
                 await this._publishHome(this.config.ownerUserId);
             } else if (job.kind === 'merge_pr') {
                 const result = JSON.parse(job.result_json || '{}');
-                await this.app.client.chat.postMessage({
-                    channel: dm.channel.id,
-                    unfurl_links: false,
-                    unfurl_media: false,
+                const payload = JSON.parse(job.payload_json || '{}');
+                const task = payload.repo && payload.pr
+                    ? this.prTasks.byRepoNumber(payload.repo, payload.pr)
+                    : null;
+                const message = {
                     text: `:rocket: Merged (${result.method || 'squash'}): ${result.url || ''}`.trim(),
-                });
+                };
+                await (task
+                    ? this._postForPr(task, message)
+                    : postFlat(message));
                 // The next sweep sees state=closed and retires the row, but
                 // repaint now so the button cannot be pressed twice.
                 await this._publishHome(this.config.ownerUserId);
@@ -1821,21 +1876,28 @@ ${formatted}`,
                 const where = payload.repo && payload.pr
                     ? `${payload.repo}#${payload.pr}`
                     : 'the PR';
-                await this.app.client.chat.postMessage({
-                    channel: dm.channel.id,
-                    unfurl_links: false,
-                    unfurl_media: false,
+                const task = payload.repo && payload.pr
+                    ? this.prTasks.byRepoNumber(payload.repo, payload.pr)
+                    : null;
+                const message = {
                     text: `:white_check_mark: Reviewer finished on *${where}*`
                         + (result.tail ? `\n\`\`\`${result.tail.slice(-1000)}\`\`\`` : ''),
-                });
+                };
+                await (task
+                    ? this._postForPr(task, message)
+                    : postFlat(message));
                 await this._publishHome(this.config.ownerUserId);
             } else if (job.kind === 'pane_close') {
-                await this.app.client.chat.postMessage({
-                    channel: dm.channel.id,
-                    unfurl_links: false,
-                    unfurl_media: false,
+                const payload = JSON.parse(job.payload_json || '{}');
+                const task = payload.repo && payload.pr
+                    ? this.prTasks.byRepoNumber(payload.repo, payload.pr)
+                    : null;
+                const message = {
                     text: ':door: Review session closed. Nothing was posted.',
-                });
+                };
+                await (task
+                    ? this._postForPr(task, message)
+                    : postFlat(message));
             }
         } catch (err) {
             this.logger.error(`_onJobResult failed for job ${job.id}: ${err.message}`);
@@ -1868,17 +1930,27 @@ ${formatted}`,
             );
 
             if (!this.config.ownerUserId) return;
-            const dm = await this.app.client.conversations.open({
-                users: this.config.ownerUserId,
-            });
-            await this.app.client.chat.postMessage({
-                channel: dm.channel.id,
-                unfurl_links: false,
-                unfurl_media: false,
+            const task = payload.repo && payload.pr
+                ? this.prTasks.byRepoNumber(payload.repo, payload.pr)
+                : null;
+            const message = {
                 text: `:x: \`${job.kind}\` gave up on *${label}* after `
                     + `${job.attempts} attempt(s)\n`
                     + '```' + String(job.error || 'no error recorded').slice(0, 800) + '```',
-            });
+            };
+            if (task) {
+                await this._postForPr(task, message);
+            } else {
+                const dm = await this.app.client.conversations.open({
+                    users: this.config.ownerUserId,
+                });
+                await this.app.client.chat.postMessage({
+                    channel: dm.channel.id,
+                    ...message,
+                    unfurl_links: false,
+                    unfurl_media: false,
+                });
+            }
             await this._publishHome(this.config.ownerUserId);
         } catch (err) {
             this.logger.error(`_onJobFailed failed for job ${job.id}: ${err.message}`);
@@ -2105,9 +2177,12 @@ ${formatted}`,
                 action.selected_option?.value || ''
             ).split(':');
             if (!actionId || !taskId) return;
-            if (actionId === 'pr_open') return;   // the option's url did the work
+            // pr_thread and pr_open are both pure links: Slack has already
+            // opened the option's url by the time this fires.
+            if (actionId === 'pr_open' || actionId === 'pr_thread') return;
 
             try {
+                const task = this.prTasks.get(Number(taskId));
                 const reply = await handlePrAction({
                     actionId,
                     value: taskId,
@@ -2115,15 +2190,22 @@ ${formatted}`,
                     jobs: this.jobs,
                     agentSessions: this.agentSessions,
                 });
-                const dm = await this.app.client.conversations.open({
-                    users: userId || this.config.ownerUserId,
-                });
-                await this.app.client.chat.postMessage({
-                    channel: dm.channel.id,
+                const message = {
                     ...(typeof reply === 'string' ? { text: reply } : reply),
-                    unfurl_links: false,
-                    unfurl_media: false,
-                });
+                };
+                if (task) {
+                    await this._postForPr(task, message);
+                } else {
+                    const dm = await this.app.client.conversations.open({
+                        users: userId || this.config.ownerUserId,
+                    });
+                    await this.app.client.chat.postMessage({
+                        channel: dm.channel.id,
+                        ...message,
+                        unfurl_links: false,
+                        unfurl_media: false,
+                    });
+                }
                 await this._publishHome(userId || this.config.ownerUserId);
             } catch (err) {
                 this.logger.error(
@@ -2151,6 +2233,8 @@ ${formatted}`,
                     return;
                 }
                 try {
+                    const taskId = String(action.value).split(':')[0];
+                    const task = this.prTasks.get(Number(taskId));
                     const reply = await handlePrAction({
                         actionId,
                         value: action.value,
@@ -2158,18 +2242,25 @@ ${formatted}`,
                         jobs: this.jobs,
                         agentSessions: this.agentSessions,
                     });
-                    const dm = await this.app.client.conversations.open({
-                        users: userId || this.config.ownerUserId,
-                    });
-                    await this.app.client.chat.postMessage({
-                        channel: dm.channel.id,
+                    const message = {
                         // Same shape as the pr_menu path: a handler may answer
                         // with blocks instead of a line, and passing that object
                         // as `text` fails at Slack rather than here.
                         ...(typeof reply === 'string' ? { text: reply } : reply),
-                        unfurl_links: false,
-                        unfurl_media: false,
-                    });
+                    };
+                    if (task) {
+                        await this._postForPr(task, message);
+                    } else {
+                        const dm = await this.app.client.conversations.open({
+                            users: userId || this.config.ownerUserId,
+                        });
+                        await this.app.client.chat.postMessage({
+                            channel: dm.channel.id,
+                            ...message,
+                            unfurl_links: false,
+                            unfurl_media: false,
+                        });
+                    }
                     await this._publishHome(
                         userId || this.config.ownerUserId
                     );
@@ -2243,6 +2334,7 @@ ${formatted}`,
                 return;
             }
             try {
+                const task = this.prTasks.get(Number(view.private_metadata));
                 const reply = await handlePrAction({
                     actionId: 'pr_revise',
                     value: view.private_metadata,
@@ -2251,15 +2343,22 @@ ${formatted}`,
                     agentSessions: this.agentSessions,
                     instructions: view.state.values.revise.text.value || '',
                 });
-                const dm = await this.app.client.conversations.open({
-                    users: userId || this.config.ownerUserId,
-                });
-                await this.app.client.chat.postMessage({
-                    channel: dm.channel.id,
+                const message = {
                     text: reply,
-                    unfurl_links: false,
-                    unfurl_media: false,
-                });
+                };
+                if (task) {
+                    await this._postForPr(task, message);
+                } else {
+                    const dm = await this.app.client.conversations.open({
+                        users: userId || this.config.ownerUserId,
+                    });
+                    await this.app.client.chat.postMessage({
+                        channel: dm.channel.id,
+                        ...message,
+                        unfurl_links: false,
+                        unfurl_media: false,
+                    });
+                }
                 await this._publishHome(userId || this.config.ownerUserId);
             } catch (err) {
                 this.logger.error(`pr_revise failed: ${err.message}`);

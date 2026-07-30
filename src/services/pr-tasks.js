@@ -57,6 +57,12 @@ class PrTasks {
         // the coding session worth resuming was opened against the ticket,
         // before this row existed — see services/agent-sessions.js.
         this._addColumn('issue_id', 'INTEGER');
+        // The DM thread where every message about this PR lands, and the
+        // permalink to it. Both NULL until the bot first has something to say —
+        // a PR nobody has spoken about has no thread to link to, which is why
+        // the menu entry is conditional rather than always present.
+        this._addColumn('slack_ts', 'TEXT');
+        this._addColumn('slack_permalink', 'TEXT');
 
         // Board preferences (draft visibility, and whatever the page grows
         // next). One row per key; the board belongs to one owner.
@@ -166,6 +172,11 @@ class PrTasks {
             setIssue: db.prepare(
                 'UPDATE pr_tasks SET issue_id=?, updated_at=? WHERE id=?'
             ),
+            setSlackThread: db.prepare(`
+                UPDATE pr_tasks
+                SET slack_ts=?, slack_permalink=?, updated_at=?
+                WHERE id=?
+            `),
             getPref: db.prepare('SELECT value FROM board_prefs WHERE key=?'),
             setPref: db.prepare(`
                 INSERT INTO board_prefs (key, value) VALUES (?, ?)
@@ -219,6 +230,10 @@ class PrTasks {
         return this._s.get.get(id);
     }
 
+    byRepoNumber(repo, number) {
+        return this._s.byKey.get(repo, number);
+    }
+
     /** All active rows, or just one lane's. */
     listActive(lane) {
         return lane
@@ -268,6 +283,10 @@ class PrTasks {
 
     setIssue(id, issueId) {
         this._s.setIssue.run(issueId || null, Date.now(), id);
+    }
+
+    setSlackThread(id, ts, permalink) {
+        this._s.setSlackThread.run(ts, permalink, Date.now(), id);
     }
 
     setDraftJob(id, jobId) {

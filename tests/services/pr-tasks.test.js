@@ -45,4 +45,21 @@ describe('PrTasks', () => {
         tasks.setStatus(task.id, 'dismissed');
         expect(tasks.listActive()).toHaveLength(0);
     });
+
+    test('setSlackThread round-trips and fresh rows have no thread', () => {
+        const tasks = create();
+        const task = tasks.upsert({ repo: 'r', number: 3, url: 'u' });
+        expect(tasks.get(task.id)).toMatchObject({
+            slack_ts: null,
+            slack_permalink: null,
+        });
+
+        tasks.setSlackThread(task.id, '123.456', 'https://slack.example/thread');
+
+        expect(tasks.get(task.id)).toMatchObject({
+            slack_ts: '123.456',
+            slack_permalink: 'https://slack.example/thread',
+        });
+        expect(tasks.byRepoNumber('r', 3).id).toBe(task.id);
+    });
 });

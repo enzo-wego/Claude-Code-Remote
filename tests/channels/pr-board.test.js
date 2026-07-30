@@ -165,6 +165,35 @@ describe('My PR actions', () => {
                 url: 'https://github.com/wego/payments/pull/2210',
             },
         ]);
+        expect(menu.options.some(option =>
+            option.value.startsWith('pr_thread:')
+        )).toBe(false);
+    });
+
+    test('a row with a Slack permalink puts Thread immediately before Open', () => {
+        const blocks = buildPrBoardBlocks([ownPr({
+            ci: 'pending',
+            review_decision: 'commented',
+            slack_permalink: 'https://slack.example/archives/D/p123',
+        })]);
+        const menu = blocks.find(block => block.accessory?.type === 'overflow')
+            .accessory;
+
+        expect(menu.options.map(option => ({
+            value: option.value,
+            url: option.url,
+        }))).toEqual([
+            { value: 'pr_process:9', url: undefined },
+            { value: 'pr_dismiss:9', url: undefined },
+            {
+                value: 'pr_thread:9',
+                url: 'https://slack.example/archives/D/p123',
+            },
+            {
+                value: 'pr_open:9',
+                url: 'https://github.com/wego/payments/pull/2210',
+            },
+        ]);
     });
 
     test('an approved green row keeps Merge with its confirm and no overflow', () => {
@@ -181,6 +210,58 @@ describe('My PR actions', () => {
             deny: { type: 'plain_text', text: 'Cancel' },
         }));
         expect(blocks.some(block => block.accessory?.type === 'overflow')).toBe(false);
+    });
+});
+
+describe('Team PR actions', () => {
+    const teamPr = overrides => ({
+        id: 7,
+        lane: 'team',
+        repo: 'wego/tax',
+        number: 42,
+        url: 'https://github.com/wego/tax/pull/42',
+        title: 'Invoice cleanup',
+        author: 'alice',
+        ...overrides,
+    });
+
+    test('a row without a permalink keeps the three existing options', () => {
+        const blocks = buildPrBoardBlocks([teamPr({})]);
+        const menu = blocks.find(block => block.accessory?.type === 'overflow')
+            .accessory;
+
+        expect(menu.options.map(option => option.value)).toEqual([
+            'pr_review_now:7',
+            'pr_dismiss:7',
+            'pr_open:7',
+        ]);
+        expect(menu.options.some(option =>
+            option.value.startsWith('pr_thread:')
+        )).toBe(false);
+    });
+
+    test('a row with a Slack permalink puts Thread immediately before Open', () => {
+        const blocks = buildPrBoardBlocks([teamPr({
+            slack_permalink: 'https://slack.example/archives/D/p456',
+        })]);
+        const menu = blocks.find(block => block.accessory?.type === 'overflow')
+            .accessory;
+
+        expect(menu.options.map(option => ({
+            value: option.value,
+            url: option.url,
+        }))).toEqual([
+            { value: 'pr_review_now:7', url: undefined },
+            { value: 'pr_dismiss:7', url: undefined },
+            {
+                value: 'pr_thread:7',
+                url: 'https://slack.example/archives/D/p456',
+            },
+            {
+                value: 'pr_open:7',
+                url: 'https://github.com/wego/tax/pull/42',
+            },
+        ]);
     });
 });
 
