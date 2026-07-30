@@ -50,7 +50,17 @@ describe('refreshAll', () => {
         // Promise.all, so their relative order is not a contract.
         const fetchMock = jest.spyOn(global, 'fetch')
             .mockImplementation(async (url) => {
-                const body = /check-runs/.test(url)
+                const body = /graphql/.test(url)
+                    ? {
+                        data: {
+                            repository: {
+                                pullRequest: {
+                                    reviewThreads: { nodes: [] },
+                                },
+                            },
+                        },
+                    }
+                    : /check-runs/.test(url)
                     ? { check_runs: [{ status: 'completed', conclusion: 'success' }] }
                     : /\/pulls\/\d+\/reviews/.test(url)
                         ? [{
@@ -70,9 +80,9 @@ describe('refreshAll', () => {
 
         const ready = await refreshAll(tasks, 'token');
 
-        // pull + check-runs + reviews(decision) + the three the activity
-        // timeline needs: issue comments, inline comments, reviews.
-        expect(fetchMock).toHaveBeenCalledTimes(6);
+        // pull + check-runs + review threads + reviews(decision) + the three
+        // the activity timeline needs: issue comments, inline comments, reviews.
+        expect(fetchMock).toHaveBeenCalledTimes(7);
         expect(tasks.get(task.id)).toEqual(expect.objectContaining({
             ci: 'green',
             review_state: 'requested',
@@ -82,6 +92,7 @@ describe('refreshAll', () => {
             decision_by: 'bob',
             // Approved outranks whoever spoke last.
             turn: 'done',
+            open_threads: 0,
         }));
         expect(ready.map(row => row.id)).toEqual([task.id]);
     });
@@ -90,10 +101,24 @@ describe('refreshAll', () => {
 describe('closed PRs leave the board', () => {
     afterEach(() => { jest.restoreAllMocks(); });
 
-    function mockPull(pull) {
-        return jest.spyOn(global, 'fetch')
-            .mockResolvedValueOnce({ ok: true, json: async () => pull })
-            .mockResolvedValueOnce({
+    function mockPull(pull, { withThreads = false } = {}) {
+        const mock = jest.spyOn(global, 'fetch')
+            .mockResolvedValueOnce({ ok: true, json: async () => pull });
+        if (withThreads) {
+            mock.mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({
+                    data: {
+                        repository: {
+                            pullRequest: {
+                                reviewThreads: { nodes: [] },
+                            },
+                        },
+                    },
+                }),
+            });
+        }
+        return mock.mockResolvedValueOnce({
                 ok: true,
                 json: async () => ({
                     check_runs: [{ status: 'completed', conclusion: 'success' }],
@@ -129,7 +154,7 @@ describe('closed PRs leave the board', () => {
             user: { login: 'alice' },
             head: { sha: 'abc' },
             requested_reviewers: [{ login: 'enzo' }],
-        });
+        }, { withThreads: true });
         await refreshAll(tasks, 'token');
 
         expect(tasks.get(task.id).status).toBe('closed');

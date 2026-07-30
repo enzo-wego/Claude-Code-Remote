@@ -66,6 +66,7 @@ function overflow(taskId, entries) {
 /** Fall back to 'mine' when a row predates the turn column — better to be
  *  asked about a PR that does not need you than to hide one that does. */
 function turnOf(task) {
+    if (Number(task.open_threads) > 0) return 'mine';
     return TURN_GLYPHS[task.turn] ? task.turn : 'mine';
 }
 
@@ -84,6 +85,12 @@ function turnLabel(task) {
     return task.lane === 'mine'
         ? 'waiting on reviewers'
         : `waiting on @${task.author || 'the author'}`;
+}
+
+function openThreadsLabel(task) {
+    const count = Number(task.open_threads);
+    if (!Number.isFinite(count) || count <= 0) return '';
+    return `${count} thread${count === 1 ? '' : 's'} open`;
 }
 
 /** Rows that need you, first; then oldest, since age is the next best signal. */
@@ -154,6 +161,7 @@ function teamLaneBlocks(tasks) {
             glyph: turnGlyph(task),
             columns: [
                 `@${task.author || 'unknown'}`,
+                openThreadsLabel(task),
                 turnLabel(task),
             ],
             accessory: overflow(task.id, [
@@ -175,6 +183,7 @@ function reviewLaneBlocks(tasks) {
         blocks.push(row(task, {
             glyph: turnGlyph(task),
             columns: [
+                openThreadsLabel(task),
                 turnLabel(task),
                 task.status === 'reviewing' ? '_reviewing on your Mac…_' : '',
             ],
@@ -221,6 +230,7 @@ function mineLaneBlocks(tasks) {
         blocks.push(row(task, {
             glyph: turnGlyph(task),
             columns: [
+                openThreadsLabel(task),
                 turnLabel(task),
                 task.decision_by ? `@${task.decision_by}` : '',
             ],
@@ -411,4 +421,5 @@ module.exports = {
     buildMineChangeText,
     buildPrBoardBlocks,
     buildPrDraftResultBlocks,
+    turnOf,
 };

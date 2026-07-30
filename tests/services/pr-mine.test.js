@@ -189,7 +189,17 @@ describe('refreshMine', () => {
      */
     function mockCycle(spy, { pull, reviews, issueComments = [], reviewComments = [] }) {
         spy.mockImplementation(async (url) => {
-            const body = /check-runs/.test(url)
+            const body = /graphql/.test(url)
+                ? {
+                    data: {
+                        repository: {
+                            pullRequest: {
+                                reviewThreads: { nodes: [] },
+                            },
+                        },
+                    },
+                }
+                : /check-runs/.test(url)
                 ? { check_runs: [{ status: 'completed', conclusion: 'success' }] }
                 : /\/issues\/\d+\/comments/.test(url) ? issueComments
                     : /\/pulls\/\d+\/comments/.test(url) ? reviewComments
@@ -280,6 +290,15 @@ describe('refreshMine', () => {
         const task = tasks.upsert({ repo: 'a/b', number: 1, url: 'u', lane: 'mine' });
         const spy = jest.spyOn(global, 'fetch');
         jsonOnce(spy, { ...basePull, state: 'closed', merged_at: '2026-07-28T00:00:00Z' });
+        jsonOnce(spy, {
+            data: {
+                repository: {
+                    pullRequest: {
+                        reviewThreads: { nodes: [] },
+                    },
+                },
+            },
+        });
         jsonOnce(spy, { check_runs: [] });
 
         await refreshMine(tasks, 'token', 'enzo');

@@ -50,6 +50,9 @@ class PrTasks {
         // last, and the only thing the row's glyph shows — CI and review state
         // described the PR, which was never the question being asked.
         this._addColumn('turn', 'TEXT');
+        // Live, unresolved review threads where somebody else spoke last.
+        // NULL means the GraphQL lookup has not succeeded, not zero.
+        this._addColumn('open_threads', 'INTEGER');
         // The ticket this PR implements (issues.id). The link matters because
         // the coding session worth resuming was opened against the ticket,
         // before this row existed — see services/agent-sessions.js.
@@ -157,6 +160,9 @@ class PrTasks {
             setTurn: db.prepare(
                 'UPDATE pr_tasks SET turn=?, updated_at=? WHERE id=?'
             ),
+            setOpenThreads: db.prepare(
+                'UPDATE pr_tasks SET open_threads=?, updated_at=? WHERE id=?'
+            ),
             setIssue: db.prepare(
                 'UPDATE pr_tasks SET issue_id=?, updated_at=? WHERE id=?'
             ),
@@ -254,6 +260,10 @@ class PrTasks {
 
     setTurn(id, turn) {
         this._s.setTurn.run(turn || null, Date.now(), id);
+    }
+
+    setOpenThreads(id, count) {
+        this._s.setOpenThreads.run(count, Date.now(), id);
     }
 
     setIssue(id, issueId) {

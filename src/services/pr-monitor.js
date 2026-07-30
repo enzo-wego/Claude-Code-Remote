@@ -1,4 +1,27 @@
 const GITHUB_API = 'https://api.github.com';
+const GITHUB_GRAPHQL = `${GITHUB_API}/graphql`;
+const REVIEW_THREADS_QUERY = `
+    query($owner:String!, $name:String!, $number:Int!) {
+        repository(owner:$owner, name:$name) {
+            pullRequest(number:$number) {
+                reviewThreads(first:100) {
+                    nodes {
+                        isResolved
+                        isOutdated
+                        path
+                        line
+                        comments(last:1) {
+                            nodes {
+                                author { login }
+                                createdAt
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+`;
 
 const FAILURE_STATES = new Set([
     'action_required',
@@ -48,6 +71,79 @@ async function githubJson(url, token) {
         throw new Error(`GitHub ${response.status} for ${url}`);
     }
     return response.json();
+}
+
+/**
+ * Review threads are GraphQL-only: REST review comments do not expose whether
+ * their thread is resolved. Failure is reported as null so a caller never
+ * mistakes "could not tell" for "no open threads".
+ */
+async function fetchReviewThreads({ repo, number, token }) {
+    try {
+        const [owner, name, extra] = String(repo || '').split('/');
+        if (!owner || !name || extra) {
+            throw new Error(`invalid GitHub repo '${repo}'`);
+        }
+
+        const response = await fetch(GITHUB_GRAPHQL, {
+            method: 'POST',
+            headers: {
+                ...githubHeaders(token),
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                query: REVIEW_THREADS_QUERY,
+                variables: { owner, name, number: Number(number) },
+            }),
+        });
+        if (!response.ok) {
+            throw new Error(`GitHub GraphQL ${response.status}`);
+        }
+
+        const payload = await response.json();
+        if (Array.isArray(payload?.errors) && payload.errors.length) {
+            const messages = payload.errors
+                .map(error => error?.message)
+                .filter(Boolean)
+                .join('; ');
+            throw new Error(`GitHub GraphQL errors: ${messages || 'unknown'}`);
+        }
+
+        const nodes = payload?.data?.repository?.pullRequest
+            ?.reviewThreads?.nodes;
+        if (!Array.isArray(nodes)) {
+            throw new Error('GitHub GraphQL response had no review thread list');
+        }
+        if (nodes.length === 100) {
+            console.warn(
+                `${repo}#${number} returned 100 review threads; `
+                + 'the first page may be truncated'
+            );
+        }
+        return nodes;
+    } catch (err) {
+        console.warn(
+            `Review thread fetch failed for ${repo}#${number}: ${err.message}`
+        );
+        return null;
+    }
+}
+
+/** Threads that are live and whose last readable author was not the viewer. */
+function countOpenThreads(nodes, viewerLogin) {
+    if (!Array.isArray(nodes)) return 0;
+    const viewer = String(viewerLogin || '').toLowerCase();
+
+    return nodes.reduce((count, node) => {
+        if (node?.isResolved || node?.isOutdated) return count;
+        const comments = node?.comments?.nodes;
+        if (!Array.isArray(comments) || comments.length === 0) {
+            return count + 1;
+        }
+        const author = comments[comments.length - 1]?.author?.login;
+        if (!author) return count + 1;
+        return String(author).toLowerCase() === viewer ? count : count + 1;
+    }, 0);
 }
 
 /**
@@ -301,7 +397,14 @@ async function fetchActivity({ repo, number, token, viewerLogin }) {
  *
  * Returns 'done' | 'mine' | 'theirs'.
  */
-function turnFor({ decision, author, lastSpeaker, viewerLogin }) {
+function turnFor({
+    decision,
+    author,
+    lastSpeaker,
+    viewerLogin,
+    openThreads = 0,
+}) {
+    if (Number(openThreads) > 0) return 'mine';
     if (decision === 'approved') return 'done';
     const ballWithAuthor = Boolean(lastSpeaker) && lastSpeaker !== author;
     const viewerIsAuthor = Boolean(viewerLogin) && viewerLogin === author;
@@ -451,19 +554,30 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
 
     for (const lane of ['review', 'team']) {
         await mapLimit(prTasks.listActive(lane), DETAIL_CONCURRENCY, async task => {
-            const state = await fetchPrState({
-                repo: task.repo,
-                number: task.number,
-                token,
-                viewerLogin,
-                viewerTeams,
-            });
+            const [state, threadNodes] = await Promise.all([
+                fetchPrState({
+                    repo: task.repo,
+                    number: task.number,
+                    token,
+                    viewerLogin,
+                    viewerTeams,
+                }),
+                fetchReviewThreads({
+                    repo: task.repo,
+                    number: task.number,
+                    token,
+                }),
+            ]);
             if (state.closed) {
                 // Merged or closed on GitHub — the review is moot, so retire
                 // the card instead of leaving stale work on the board.
                 prTasks.setStatus(task.id, 'closed');
                 return;
             }
+            const openThreads = threadNodes === null
+                ? null
+                : countOpenThreads(threadNodes, viewerLogin);
+            prTasks.setOpenThreads(task.id, openThreads);
             prTasks.upsert({
                 repo: task.repo,
                 number: task.number,
@@ -504,6 +618,7 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
                     author: state.author,
                     lastSpeaker: activity.lastSpeaker,
                     viewerLogin,
+                    openThreads,
                 }));
             } catch (err) {
                 // Keep the previous decision, but say so — a swallowed failure
@@ -527,16 +642,27 @@ async function refreshMine(prTasks, token, viewerLogin) {
     const changed = [];
 
     await mapLimit(prTasks.listActive('mine'), DETAIL_CONCURRENCY, async task => {
-        const state = await fetchPrState({
-            repo: task.repo,
-            number: task.number,
-            token,
-            viewerLogin,
-        });
+        const [state, threadNodes] = await Promise.all([
+            fetchPrState({
+                repo: task.repo,
+                number: task.number,
+                token,
+                viewerLogin,
+            }),
+            fetchReviewThreads({
+                repo: task.repo,
+                number: task.number,
+                token,
+            }),
+        ]);
         if (state.closed) {
             prTasks.setStatus(task.id, 'closed');
             return;
         }
+        const openThreads = threadNodes === null
+            ? null
+            : countOpenThreads(threadNodes, viewerLogin);
+        prTasks.setOpenThreads(task.id, openThreads);
 
         const [{ decision, decisionBy }, activity] = await Promise.all([
             fetchReviewDecision({
@@ -571,6 +697,7 @@ async function refreshMine(prTasks, token, viewerLogin) {
             author: state.author,
             lastSpeaker: activity.lastSpeaker,
             viewerLogin,
+            openThreads,
         }));
 
         const newComments = Math.max(0, humanComments - (task.seen_comments || 0));
@@ -603,7 +730,9 @@ async function refreshMine(prTasks, token, viewerLogin) {
 
 module.exports = {
     mapLimit,
+    countOpenThreads,
     fetchActivity,
+    fetchReviewThreads,
     turnFor,
     fetchPrState,
     fetchReviewDecision,
