@@ -92,7 +92,10 @@ describe('refreshAll', () => {
             decision_by: 'bob',
             // Approved outranks whoever spoke last.
             turn: 'done',
-            open_threads: 0,
+            // This call passes no viewer, so there is nobody to be "somebody
+            // else" — the count is unknown, not zero. A real count through a
+            // sweep is asserted in pr-mine.test.js, which does pass one.
+            open_threads: null,
         }));
         expect(ready.map(row => row.id)).toEqual([task.id]);
     });

@@ -132,7 +132,13 @@ async function fetchReviewThreads({ repo, number, token }) {
 /** Threads that are live and whose last readable author was not the viewer. */
 function countOpenThreads(nodes, viewerLogin) {
     if (!Array.isArray(nodes)) return 0;
-    const viewer = String(viewerLogin || '').toLowerCase();
+    // Without a viewer login there is no "somebody else" to compare against, so
+    // every live thread would count as yours and the whole board would go
+    // yellow at once. Both callers reach the viewer lookup through a
+    // `.catch(() => null)`, so this is a live path, not a guard: an unknown
+    // count is right, an invented one is not.
+    if (!viewerLogin) return null;
+    const viewer = String(viewerLogin).toLowerCase();
 
     return nodes.reduce((count, node) => {
         if (node?.isResolved || node?.isOutdated) return count;

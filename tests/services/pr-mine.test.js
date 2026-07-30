@@ -187,14 +187,16 @@ describe('refreshMine', () => {
      * timeline are fetched inside one Promise.all, so their order is an
      * implementation detail a test should not encode.
      */
-    function mockCycle(spy, { pull, reviews, issueComments = [], reviewComments = [] }) {
+    function mockCycle(spy, {
+        pull, reviews, issueComments = [], reviewComments = [], threads = [],
+    }) {
         spy.mockImplementation(async (url) => {
             const body = /graphql/.test(url)
                 ? {
                     data: {
                         repository: {
                             pullRequest: {
-                                reviewThreads: { nodes: [] },
+                                reviewThreads: { nodes: threads },
                             },
                         },
                     },
@@ -222,6 +224,41 @@ describe('refreshMine', () => {
         comments: 0,
         review_comments: 0,
     };
+
+    /**
+     * The whole point of the feature, end to end: an approved PR that still has
+     * a bot thread waiting is not finished. Every other thread test works on the
+     * counter directly, so without this one nothing proves a sweep writes a real
+     * count through GraphQL — the case #458 was rendering wrong.
+     */
+    test('a live thread someone else spoke in last outranks the approval', async () => {
+        const tasks = createTasks();
+        const task = tasks.upsert({ repo: 'a/b', number: 1, url: 'u', lane: 'mine' });
+        const live = author => ({
+            isResolved: false,
+            isOutdated: false,
+            comments: { nodes: [{ author: { login: author } }] },
+        });
+        mockCycle(jest.spyOn(global, 'fetch'), {
+            pull: basePull,
+            reviews: [{ user: { login: 'sarah', type: 'User' }, state: 'APPROVED' }],
+            threads: [
+                live('coderabbitai'),
+                live('coderabbitai'),
+                { ...live('enzo') },                                  // you replied
+                { ...live('coderabbitai'), isResolved: true },         // resolved
+                { ...live('coderabbitai'), isOutdated: true },         // code moved
+            ],
+        });
+
+        await refreshMine(tasks, 'token', 'enzo');
+
+        expect(tasks.get(task.id)).toEqual(expect.objectContaining({
+            review_decision: 'approved',
+            open_threads: 2,
+            turn: 'mine',
+        }));
+    });
 
     test('first sighting records state but reports nothing', async () => {
         const tasks = createTasks();

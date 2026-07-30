@@ -105,6 +105,29 @@ describe('countOpenThreads', () => {
     test('always returns a number for a malformed collection', () => {
         expect(countOpenThreads(null, 'enzo-wego')).toBe(0);
     });
+
+    // Both callers resolve the viewer through a `.catch(() => null)`, so this
+    // arrives in production, not just in tests. Comparing against '' would make
+    // every live thread somebody else's and turn the entire board yellow.
+    test('an unknown viewer yields an unknown count, not every thread', () => {
+        const nodes = [
+            thread({ author: 'enzo-wego' }),
+            thread({ author: 'coderabbitai' }),
+        ];
+        expect(countOpenThreads(nodes, null)).toBeNull();
+        expect(countOpenThreads(nodes, '')).toBeNull();
+        expect(countOpenThreads(nodes, 'enzo-wego')).toBe(1);
+    });
+
+    test('an unknown count leaves the turn to the existing rules', () => {
+        expect(turnFor({
+            decision: 'approved',
+            author: 'enzo-wego',
+            lastSpeaker: 'reviewer',
+            viewerLogin: 'enzo-wego',
+            openThreads: null,
+        })).toBe('done');
+    });
 });
 
 describe('thread-aware turns', () => {
