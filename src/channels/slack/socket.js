@@ -1887,6 +1887,24 @@ ${formatted}`,
                     ? this._postForPr(task, message)
                     : postFlat(message));
                 await this._publishHome(this.config.ownerUserId);
+            } else if (job.kind === 'address_comments') {
+                const result = JSON.parse(job.result_json || '{}');
+                const payload = JSON.parse(job.payload_json || '{}');
+                const where = payload.repo && payload.pr
+                    ? `${payload.repo}#${payload.pr}`
+                    : 'the PR';
+                const task = payload.repo && payload.pr
+                    ? this.prTasks.byRepoNumber(payload.repo, payload.pr)
+                    : null;
+                const message = {
+                    text: `:white_check_mark: Finished addressing comments on *${where}*`
+                        + ` in pane \`${result.pane_id}\``
+                        + (result.tail ? `\n\`\`\`${result.tail.slice(-1000)}\`\`\`` : ''),
+                };
+                await (task
+                    ? this._postForPr(task, message)
+                    : postFlat(message));
+                await this._publishHome(this.config.ownerUserId);
             } else if (job.kind === 'pane_close') {
                 const payload = JSON.parse(job.payload_json || '{}');
                 const task = payload.repo && payload.pr
