@@ -1896,9 +1896,13 @@ ${formatted}`,
                 const task = payload.repo && payload.pr
                     ? this.prTasks.byRepoNumber(payload.repo, payload.pr)
                     : null;
+                const pane = result.pane_id
+                    ? ` in pane \`${result.pane_id}\``
+                    : '';
                 const message = {
-                    text: `:white_check_mark: Finished addressing comments on *${where}*`
-                        + ` in pane \`${result.pane_id}\``
+                    text: (result.reply_written
+                        ? `:white_check_mark: Finished addressing comments on *${where}*${pane}`
+                        : `:warning: Comment-addressing session on *${where}* stopped without writing its reply draft${pane}. The pane is still live and may be waiting on the owner.`)
                         + (result.tail ? `\n\`\`\`${result.tail.slice(-1000)}\`\`\`` : ''),
                 };
                 await (task

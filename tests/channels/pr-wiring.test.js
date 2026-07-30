@@ -247,6 +247,7 @@ describe('PR board socket wiring', () => {
         handler.jobs.complete(leased.id, leased.lease_id, {
             pane_id: 'pane-enzobot-412',
             tail: 'Addressed three review threads',
+            reply_written: true,
         });
 
         await handler._onJobResult(handler.jobs.get(job.id));
@@ -259,9 +260,50 @@ describe('PR board socket wiring', () => {
         expect(message.text).toContain('wego/payments#412');
         expect(message.text).toContain('pane-enzobot-412');
         expect(message.text).toContain('Addressed three review threads');
+        expect(message.text).toContain(':white_check_mark: Finished');
         expect(message).not.toHaveProperty('blocks');
         expect(handler.app.client.chat.getPermalink).not.toHaveBeenCalled();
         expect(handler._publishHome).toHaveBeenCalledWith('UOWNER');
+    });
+
+    test('address-comments without a reply draft warns in the PR thread', async () => {
+        const handler = makeHandler();
+        const task = handler.prTasks.upsert({
+            repo: 'wego/payments',
+            number: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+        });
+        handler.prTasks.setSlackThread(
+            task.id,
+            '1712345678.000100',
+            'https://slack.example/archives/DOWNER/p1712345678000100'
+        );
+        const job = handler.jobs.enqueue('address_comments', {
+            repo: 'wego/payments',
+            pr: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+            title: 'Fix tax rounding',
+        });
+        const leased = handler.jobs.lease('mac');
+        handler.jobs.complete(leased.id, leased.lease_id, {
+            pane_id: 'pane-enzobot-412',
+            tail: 'Say the word and I will draft the replies',
+            reply_written: false,
+        });
+
+        await handler._onJobResult(handler.jobs.get(job.id));
+
+        expect(handler.app.client.chat.postMessage).toHaveBeenCalledTimes(1);
+        const message = handler.app.client.chat.postMessage.mock.calls[0][0];
+        expect(message).toEqual(expect.objectContaining({
+            thread_ts: '1712345678.000100',
+        }));
+        expect(message.text).toContain(':warning:');
+        expect(message.text).toContain('stopped without writing its reply draft');
+        expect(message.text).toContain('pane is still live');
+        expect(message.text).toContain('may be waiting on the owner');
+        expect(message.text).toContain('pane-enzobot-412');
+        expect(message.text).not.toContain(':white_check_mark:');
     });
 
     test('a failed permalink lookup still persists the ts and delivers in-thread', async () => {
@@ -328,8 +370,8 @@ describe('PR board socket wiring', () => {
         });
         const leased = handler.jobs.lease('mac');
         handler.jobs.complete(leased.id, leased.lease_id, {
-            pane_id: 'pane-enzobot-999',
             tail: 'Addressed the remaining review thread',
+            reply_written: true,
         });
 
         await handler._onJobResult(handler.jobs.get(job.id));
@@ -337,8 +379,9 @@ describe('PR board socket wiring', () => {
         expect(handler.app.client.chat.postMessage).toHaveBeenCalledTimes(1);
         const message = handler.app.client.chat.postMessage.mock.calls[0][0];
         expect(message.text).toContain('wego/payments#999');
-        expect(message.text).toContain('pane-enzobot-999');
         expect(message.text).toContain('Addressed the remaining review thread');
+        expect(message.text).not.toContain('undefined');
+        expect(message.text).not.toContain('in pane');
         expect(message).not.toHaveProperty('thread_ts');
         expect(message).not.toHaveProperty('blocks');
         expect(handler.app.client.chat.getPermalink).not.toHaveBeenCalled();

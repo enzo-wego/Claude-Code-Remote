@@ -190,7 +190,56 @@ describe('address_comments', () => {
         expect(result).toEqual({
             pane_id: 'wN:p2',
             tail: 'fixed and verified',
+            reply_written: false,
         });
+    });
+
+    test('reports a non-empty reply draft as completion evidence', async () => {
+        const jobsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'comments-'));
+        const herdr = paneStub({
+            waitDone: jest.fn(() => {
+                fs.writeFileSync(
+                    path.join(jobsDir, '42', 'reply.md'),
+                    'Drafted replies for three review threads.'
+                );
+            }),
+        });
+
+        const result = await executeJob(
+            job(42, { sessionKey: null }),
+            config(jobsDir),
+            herdr
+        );
+
+        expect(result.reply_written).toBe(true);
+    });
+
+    test.each([
+        ['missing', null],
+        ['whitespace-only', ' \n\t'],
+    ])('reports a %s reply draft as incomplete without throwing', async (
+        _description,
+        contents
+    ) => {
+        const jobsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'comments-'));
+        const herdr = paneStub({
+            waitDone: jest.fn(() => {
+                if (contents !== null) {
+                    fs.writeFileSync(
+                        path.join(jobsDir, '43', 'reply.md'),
+                        contents
+                    );
+                }
+            }),
+        });
+
+        const result = await executeJob(
+            job(43, { sessionKey: null }),
+            config(jobsDir),
+            herdr
+        );
+
+        expect(result.reply_written).toBe(false);
     });
 });
 

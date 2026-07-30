@@ -193,6 +193,7 @@ async function executeJob(
         return {
             pane_id: paneId,
             tail: String(herdr.readTail(paneId, 40)).slice(-1200),
+            reply_written: readTextOrNull(replyPath) !== null,
         };
     }
 
