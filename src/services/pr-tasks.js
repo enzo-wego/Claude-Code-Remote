@@ -50,6 +50,10 @@ class PrTasks {
         // last, and the only thing the row's glyph shows — CI and review state
         // described the PR, which was never the question being asked.
         this._addColumn('turn', 'TEXT');
+        // The ticket this PR implements (issues.id). The link matters because
+        // the coding session worth resuming was opened against the ticket,
+        // before this row existed — see services/agent-sessions.js.
+        this._addColumn('issue_id', 'INTEGER');
 
         // Board preferences (draft visibility, and whatever the page grows
         // next). One row per key; the board belongs to one owner.
@@ -153,6 +157,9 @@ class PrTasks {
             setTurn: db.prepare(
                 'UPDATE pr_tasks SET turn=?, updated_at=? WHERE id=?'
             ),
+            setIssue: db.prepare(
+                'UPDATE pr_tasks SET issue_id=?, updated_at=? WHERE id=?'
+            ),
             getPref: db.prepare('SELECT value FROM board_prefs WHERE key=?'),
             setPref: db.prepare(`
                 INSERT INTO board_prefs (key, value) VALUES (?, ?)
@@ -247,6 +254,10 @@ class PrTasks {
 
     setTurn(id, turn) {
         this._s.setTurn.run(turn || null, Date.now(), id);
+    }
+
+    setIssue(id, issueId) {
+        this._s.setIssue.run(issueId || null, Date.now(), id);
     }
 
     setDraftJob(id, jobId) {
