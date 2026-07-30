@@ -58,4 +58,47 @@ function buildApexReviewPrompt(payload, resultPath) {
     ].join('\n');
 }
 
-module.exports = { buildReviewPrompt, buildApexReviewPrompt };
+function buildAddressCommentsPrompt(payload, replyPath) {
+    const [owner, name] = payload.repo.split('/');
+    const query = [
+        "gh api graphql -f query='",
+        `{ repository(owner:"${owner}", name:"${name}") {`,
+        `    pullRequest(number:${payload.pr}) {`,
+        '      reviewThreads(first:100) { nodes {',
+        '        isResolved isOutdated path line',
+        '        comments(last:10) { nodes { author { login } body createdAt url } } } } } } }\'',
+    ].join('\n');
+
+    return [
+        `Process the review feedback on ${payload.repo}#${payload.pr} (${payload.url}).`,
+        '',
+        'Fetch the current threads yourself now, from this authenticated session.',
+        'First identify your GitHub login with `gh api user --jq .login`, then run',
+        'this exact query:',
+        '',
+        '```sh',
+        query,
+        '```',
+        '',
+        'A thread is waiting on you only when isResolved and isOutdated are both',
+        'false and the last comment\'s author is not you. Ignore every other thread.',
+        '',
+        'For each thread waiting on you:',
+        '- Read the current code and enough surrounding context to verify the feedback.',
+        '- Make the warranted fixes without weakening tests, then run focused verification.',
+        `- Draft the reply you recommend for each thread in ${replyPath}. Include`,
+        '  the thread URL and what changed, or explain with evidence why no change is needed.',
+        '',
+        'Rules (non-negotiable):',
+        '- Do not post anything to GitHub and do not resolve any thread.',
+        '- Do not push any branch or commit.',
+        '- Report what you verified, changed, tested, and drafted. Stay in this session',
+        '  afterwards so the owner can use the existing relay to revise, post, or exit.',
+    ].join('\n');
+}
+
+module.exports = {
+    buildReviewPrompt,
+    buildApexReviewPrompt,
+    buildAddressCommentsPrompt,
+};

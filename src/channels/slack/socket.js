@@ -2113,13 +2113,14 @@ ${formatted}`,
                     value: taskId,
                     prTasks: this.prTasks,
                     jobs: this.jobs,
+                    agentSessions: this.agentSessions,
                 });
                 const dm = await this.app.client.conversations.open({
                     users: userId || this.config.ownerUserId,
                 });
                 await this.app.client.chat.postMessage({
                     channel: dm.channel.id,
-                    text: reply,
+                    ...(typeof reply === 'string' ? { text: reply } : reply),
                     unfurl_links: false,
                     unfurl_media: false,
                 });
@@ -2139,6 +2140,7 @@ ${formatted}`,
             'pr_discard',
             'pr_dismiss',
             'pr_merge',
+            'pr_process_with',
         ];
         for (const actionId of prActionIds) {
             this.app.action(actionId, async ({ ack, body, action }) => {
@@ -2154,6 +2156,7 @@ ${formatted}`,
                         value: action.value,
                         prTasks: this.prTasks,
                         jobs: this.jobs,
+                        agentSessions: this.agentSessions,
                     });
                     const dm = await this.app.client.conversations.open({
                         users: userId || this.config.ownerUserId,
@@ -2242,6 +2245,7 @@ ${formatted}`,
                     value: view.private_metadata,
                     prTasks: this.prTasks,
                     jobs: this.jobs,
+                    agentSessions: this.agentSessions,
                     instructions: view.state.values.revise.text.value || '',
                 });
                 const dm = await this.app.client.conversations.open({

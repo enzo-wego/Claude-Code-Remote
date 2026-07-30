@@ -53,6 +53,180 @@ describe('handlePrAction', () => {
     });
 });
 
+describe('pr_process', () => {
+    afterEach(() => {
+        jest.restoreAllMocks();
+    });
+
+    const agentSessions = sessions => ({
+        sessionsFor: jest.fn().mockReturnValue(sessions),
+        get: jest.fn(id => sessions.find(session => session.id === id)),
+        touch: jest.fn(),
+    });
+    const queuedPayload = jobs => {
+        const job = jobs.lease('mac');
+        return {
+            job,
+            payload: JSON.parse(job.payload_json),
+        };
+    };
+
+    test('starts fresh when the PR has no recorded session', async () => {
+        const { jobs, prTasks, task } = setup();
+        const sessions = agentSessions([]);
+
+        const reply = await handlePrAction({
+            actionId: 'pr_process',
+            value: String(task.id),
+            prTasks,
+            jobs,
+            agentSessions: sessions,
+        });
+
+        const { job, payload } = queuedPayload(jobs);
+        expect(job.kind).toBe('address_comments');
+        expect(payload).toEqual({
+            repo: 'wego/payments',
+            pr: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+            title: 'Fix tax rounding',
+            sessionKey: null,
+            cli: null,
+            threads: null,
+        });
+        expect(sessions.touch).not.toHaveBeenCalled();
+        expect(reply).toContain('Processing #412');
+    });
+
+    test('resumes and touches the only session, while a double tap dedupes', async () => {
+        const { jobs, prTasks, task } = setup();
+        const session = {
+            id: 71,
+            key: 'aaaa-1111',
+            cli: 'claude',
+            label: 'feature dev',
+            created_at: Date.now() - 86_400_000,
+            last_used_at: null,
+        };
+        const sessions = agentSessions([session]);
+
+        const first = await handlePrAction({
+            actionId: 'pr_process',
+            value: String(task.id),
+            prTasks,
+            jobs,
+            agentSessions: sessions,
+        });
+        const second = await handlePrAction({
+            actionId: 'pr_process',
+            value: String(task.id),
+            prTasks,
+            jobs,
+            agentSessions: sessions,
+        });
+
+        const { job, payload } = queuedPayload(jobs);
+        expect(job.kind).toBe('address_comments');
+        expect(payload).toEqual({
+            repo: 'wego/payments',
+            pr: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+            title: 'Fix tax rounding',
+            sessionKey: 'aaaa-1111',
+            cli: 'claude',
+            threads: null,
+        });
+        expect(sessions.touch).toHaveBeenCalledWith(71);
+        expect(first).toContain('Processing #412');
+        expect(second).toBe(
+            ':information_source: Processing for #412 is already queued.'
+        );
+    });
+
+    test('offers every candidate and enqueues nothing when more than one exists', async () => {
+        jest.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-07-30T12:00:00Z'));
+        const { jobs, prTasks, task } = setup();
+        const sessions = agentSessions([
+            {
+                id: 71,
+                key: 'aaaa-1111-rest-of-key',
+                cli: 'claude',
+                label: 'feature dev',
+                created_at: Date.parse('2026-07-29T12:00:00Z'),
+                last_used_at: Date.parse('2026-07-30T10:00:00Z'),
+            },
+            {
+                id: 72,
+                key: 'bbbb-2222-rest-of-key',
+                cli: 'claude',
+                label: null,
+                created_at: Date.parse('2026-07-27T12:00:00Z'),
+                last_used_at: null,
+            },
+        ]);
+
+        const reply = await handlePrAction({
+            actionId: 'pr_process',
+            value: String(task.id),
+            prTasks,
+            jobs,
+            agentSessions: sessions,
+        });
+
+        expect(jobs.recent()).toEqual([]);
+        expect(reply.text).toContain('Choose a session');
+        const buttons = reply.blocks
+            .find(block => block.type === 'actions')
+            .elements;
+        expect(buttons.map(button => ({
+            actionId: button.action_id,
+            value: button.value,
+            text: button.text.text,
+        }))).toEqual([
+            {
+                actionId: 'pr_process_with',
+                value: `${task.id}:71`,
+                text: 'feature dev · 2h ago',
+            },
+            {
+                actionId: 'pr_process_with',
+                value: `${task.id}:72`,
+                text: 'bbbb-222 · 3d ago',
+            },
+        ]);
+    });
+
+    test('the picker resumes exactly the chosen session and touches it', async () => {
+        const { jobs, prTasks, task } = setup();
+        const candidates = [
+            { id: 71, key: 'aaaa-1111', cli: 'claude', label: 'feature dev' },
+            { id: 72, key: 'bbbb-2222', cli: 'codex', label: 'review fixes' },
+        ];
+        const sessions = agentSessions(candidates);
+
+        const reply = await handlePrAction({
+            actionId: 'pr_process_with',
+            value: `${task.id}:72`,
+            prTasks,
+            jobs,
+            agentSessions: sessions,
+        });
+
+        const { payload } = queuedPayload(jobs);
+        expect(payload).toEqual({
+            repo: 'wego/payments',
+            pr: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+            title: 'Fix tax rounding',
+            sessionKey: 'bbbb-2222',
+            cli: 'codex',
+            threads: null,
+        });
+        expect(sessions.touch).toHaveBeenCalledWith(72);
+        expect(reply).toContain('Processing #412');
+    });
+});
+
 
 /**
  * Post, Edit and Exit all talk to the reviewer still sitting in its pane rather

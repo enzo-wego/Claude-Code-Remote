@@ -96,6 +96,104 @@ describe('executeJob', () => {
     });
 });
 
+describe('address_comments', () => {
+    const job = (id, payload) => ({
+        id,
+        kind: 'address_comments',
+        payload_json: JSON.stringify({
+            repo: 'wego/payments',
+            pr: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+            title: 'PAY-2208: train validation',
+            cli: 'claude',
+            threads: null,
+            ...payload,
+        }),
+    });
+    const config = jobsDir => ({
+        jobsDir,
+        repoRoot: '/tmp',
+        repoMap: { 'wego/payments': '/tmp/payments' },
+        cliCommand: 'claude --dangerously-skip-permissions',
+        jobTimeoutMs: 1234,
+    });
+
+    test('resumes the chosen session and compacts through submitTask first', async () => {
+        const jobsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'comments-'));
+        const herdr = paneStub({
+            createJobPane: jest.fn().mockReturnValue({ paneId: 'wN:p7' }),
+            readTail: jest.fn().mockReturnValue('draft ready'),
+        });
+
+        const result = await executeJob(
+            job(40, { sessionKey: 'aaaa-1111' }),
+            config(jobsDir),
+            herdr
+        );
+
+        expect(herdr.createJobPane).toHaveBeenCalledWith('wN', {
+            label: 'PAY-2208-pr412',
+            cwd: '/tmp/payments',
+        });
+        expect(herdr.startAgent).toHaveBeenCalledWith(
+            'wN:p7',
+            'claude --dangerously-skip-permissions --resume aaaa-1111'
+        );
+        expect(herdr.submitTask.mock.calls).toEqual([
+            ['wN:p7', '/compact'],
+            ['wN:p7', `Read ${path.join(jobsDir, '40', 'prompt.md')} and follow it exactly.`],
+        ]);
+        expect(herdr.waitDone.mock.calls).toEqual([
+            ['wN:p7', 1234],
+            ['wN:p7', 1234],
+        ]);
+        expect(result.pane_id).toBe('wN:p7');
+    });
+
+    test('starts fresh without compacting and writes a self-fetching prompt', async () => {
+        const jobsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'comments-'));
+        const herdr = paneStub({
+            readTail: jest.fn().mockReturnValue('fixed and verified'),
+        });
+
+        const result = await executeJob(
+            job(41, { sessionKey: null }),
+            config(jobsDir),
+            herdr
+        );
+
+        expect(herdr.startAgent).toHaveBeenCalledWith(
+            'wN:p2',
+            'claude --dangerously-skip-permissions'
+        );
+        expect(herdr.submitTask).toHaveBeenCalledTimes(1);
+        expect(herdr.submitTask).not.toHaveBeenCalledWith('wN:p2', '/compact');
+        expect(herdr.waitDone).toHaveBeenCalledTimes(1);
+
+        const promptPath = path.join(jobsDir, '41', 'prompt.md');
+        const prompt = fs.readFileSync(promptPath, 'utf8');
+        expect(prompt).toContain('wego/payments#412');
+        expect(prompt).toContain([
+            "gh api graphql -f query='",
+            '{ repository(owner:"wego", name:"payments") {',
+            '    pullRequest(number:412) {',
+            '      reviewThreads(first:100) { nodes {',
+            '        isResolved isOutdated path line',
+            '        comments(last:10) { nodes { author { login } body createdAt url } } } } } } }\'',
+        ].join('\n'));
+        expect(prompt).toMatch(
+            /isResolved.*isOutdated.*false.*last comment.*author.*not you/is
+        );
+        expect(prompt).toMatch(/do not post.*GitHub/i);
+        expect(prompt).toMatch(/do not push/i);
+        expect(prompt).toContain(path.join(jobsDir, '41', 'reply.md'));
+        expect(result).toEqual({
+            pane_id: 'wN:p2',
+            tail: 'fixed and verified',
+        });
+    });
+});
+
 /**
  * Post/Edit are relayed to the reviewer that is still sitting in its pane. It
  * holds the worktree, the diff and its own findings, so it places its own

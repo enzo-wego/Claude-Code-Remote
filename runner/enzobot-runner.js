@@ -19,6 +19,7 @@ const herdrDefault = require('./herdr-exec');
 const {
     buildReviewPrompt,
     buildApexReviewPrompt,
+    buildAddressCommentsPrompt,
 } = require('./prompts');
 
 function loadConfig() {
@@ -155,6 +156,43 @@ async function executeJob(
             merged: true,
             method: method.replace('--', ''),
             url: `https://github.com/${payload.repo}/pull/${payload.pr}`,
+        };
+    }
+
+    if (job.kind === 'address_comments') {
+        const checkout = repoPath(config, payload.repo);
+        const directory = path.join(config.jobsDir, String(job.id));
+        fs.mkdirSync(directory, { recursive: true });
+
+        const workspaceId = herdr.ensureWorkspace();
+        const { paneId } = herdr.createJobPane(workspaceId, {
+            label: jobLabel(payload.repo, payload.pr, payload.title),
+            cwd: checkout,
+        });
+        const cli = payload.sessionKey
+            ? `${config.cliCommand} --resume ${payload.sessionKey}`
+            : config.cliCommand;
+        herdr.startAgent(paneId, cli);
+
+        if (payload.sessionKey) {
+            herdr.submitTask(paneId, '/compact');
+            herdr.waitDone(paneId, config.jobTimeoutMs);
+        }
+
+        const promptPath = path.join(directory, 'prompt.md');
+        const replyPath = path.join(directory, 'reply.md');
+        fs.writeFileSync(
+            promptPath,
+            buildAddressCommentsPrompt(payload, replyPath)
+        );
+        herdr.submitTask(
+            paneId,
+            `Read ${promptPath} and follow it exactly.`
+        );
+        herdr.waitDone(paneId, config.jobTimeoutMs);
+        return {
+            pane_id: paneId,
+            tail: String(herdr.readTail(paneId, 40)).slice(-1200),
         };
     }
 

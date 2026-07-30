@@ -34,15 +34,6 @@ function button(actionId, text, taskId, style) {
     return element;
 }
 
-function linkButton(text, url) {
-    return {
-        type: 'button',
-        action_id: 'pr_open',
-        text: { type: 'plain_text', text },
-        url,
-    };
-}
-
 /**
  * A section takes exactly one accessory, so a row that needs several actions
  * puts them in an overflow menu — keeping the row to a single block. Option
@@ -248,7 +239,15 @@ function mineLaneBlocks(tasks) {
                         style: 'primary',
                     },
                 }
-                : linkButton('🔗 Open', task.url),
+                : overflow(task.id, [
+                    { text: '⚙️ Process', actionId: 'pr_process' },
+                    { text: '🗑 Dismiss', actionId: 'pr_dismiss' },
+                    {
+                        text: '🔗 Open on GitHub',
+                        actionId: 'pr_open',
+                        url: task.url,
+                    },
+                ]),
         }));
     }
     return blocks;

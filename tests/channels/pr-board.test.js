@@ -131,6 +131,59 @@ describe('board scope', () => {
     });
 });
 
+describe('My PR actions', () => {
+    const ownPr = overrides => ({
+        id: 9,
+        lane: 'mine',
+        repo: 'wego/payments',
+        number: 2210,
+        url: 'https://github.com/wego/payments/pull/2210',
+        title: 'PAY-2225: counters',
+        status: 'detected',
+        ...overrides,
+    });
+
+    test('a non-mergeable row offers Process, Dismiss, and Open in that order', () => {
+        const blocks = buildPrBoardBlocks([ownPr({
+            ci: 'pending',
+            review_decision: 'commented',
+        })]);
+        const menu = blocks.find(block => block.accessory?.type === 'overflow')
+            .accessory;
+
+        expect(menu.action_id).toBe('pr_menu');
+        expect(menu.options.map(option => ({
+            text: option.text.text,
+            value: option.value,
+            url: option.url,
+        }))).toEqual([
+            { text: '⚙️ Process', value: 'pr_process:9', url: undefined },
+            { text: '🗑 Dismiss', value: 'pr_dismiss:9', url: undefined },
+            {
+                text: '🔗 Open on GitHub',
+                value: 'pr_open:9',
+                url: 'https://github.com/wego/payments/pull/2210',
+            },
+        ]);
+    });
+
+    test('an approved green row keeps Merge with its confirm and no overflow', () => {
+        const blocks = buildPrBoardBlocks([ownPr({
+            ci: 'green',
+            review_decision: 'approved',
+        })]);
+        const row = blocks.find(block => block.accessory?.action_id === 'pr_merge');
+
+        expect(row.accessory.value).toBe('9');
+        expect(row.accessory.confirm).toEqual(expect.objectContaining({
+            title: { type: 'plain_text', text: 'Merge this PR?' },
+            confirm: { type: 'plain_text', text: 'Merge' },
+            deny: { type: 'plain_text', text: 'Cancel' },
+        }));
+        expect(blocks.some(block => block.accessory?.type === 'overflow')).toBe(false);
+    });
+});
+
 describe('draft buttons reflect the verdict', () => {
     const { buildPrDraftResultBlocks } = require('../../src/channels/slack/pr-board');
     const draft = (verdict, lane = 'team') => buildPrDraftResultBlocks(
