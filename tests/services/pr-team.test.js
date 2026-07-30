@@ -182,10 +182,14 @@ describe('board renders three lanes', () => {
         ]);
     });
 
-    test('empty lanes each say so instead of vanishing', () => {
+    // An empty lane says so, so the board never looks truncated — except the
+    // review lane, which vanishes entirely. A header plus "nothing is waiting
+    // on you" spent two lines of the Home tab announcing there was no news.
+    test('empty own/team lanes say so; an empty review lane renders nothing', () => {
         const text = JSON.stringify(buildPrBoardBlocks([]));
-        expect(text).toContain('Nothing is waiting on you');
         expect(text).toContain('No open PRs of yours');
         expect(text).toContain('No open PRs from your team');
+        expect(text).not.toContain('Needs my review');
+        expect(text).not.toContain('Nothing is waiting on you');
     });
 });

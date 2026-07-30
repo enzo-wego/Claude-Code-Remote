@@ -60,6 +60,16 @@ function uniqueRecent(rows) {
     });
 }
 
+// A typo'd PR ref or a forgotten --key is an expected way to use this wrong,
+// not a crash: print the reason and nothing else.
+try {
+    run();
+} catch (err) {
+    process.stderr.write(`${err.message}\n`);
+    process.exit(1);
+}
+
+function run() {
 switch (command) {
     case 'link': {
         const prRef = option('--pr');
@@ -123,4 +133,5 @@ switch (command) {
             + '[--issue PAY-2266] | issues\n'
         );
         process.exit(1);
+}
 }
