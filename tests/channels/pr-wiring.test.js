@@ -324,6 +324,7 @@ describe('PR board socket wiring', () => {
             repo: 'wego/payments',
             pr: 412,
         });
+        handler.prTasks.setPane(task.id, 'pane-apex-412');
         const leased = handler.jobs.lease('mac');
         handler.jobs.complete(leased.id, leased.lease_id, {});
 
@@ -332,6 +333,7 @@ describe('PR board socket wiring', () => {
         expect(handler.prTasks.get(task.id)).toMatchObject({
             slack_ts: '1712345678.000100',
             slack_permalink: null,
+            pane_id: null,
         });
         expect(handler.app.client.chat.postMessage).toHaveBeenCalledTimes(2);
         expect(handler.app.client.chat.postMessage.mock.calls[1][0])

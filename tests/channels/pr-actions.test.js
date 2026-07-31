@@ -297,6 +297,7 @@ describe('actions relay to the live review session', () => {
             body_md: 'LGTM', verdict, pane_id: paneId,
         });
         prTasks.setDraftJob(task.id, job.id);
+        prTasks.setPane(task.id, paneId);
         return { jobs, prTasks, task };
     };
 
@@ -348,6 +349,7 @@ describe('actions relay to the live review session', () => {
         const row = prTasks.get(task.id);
         expect(row.status).toBe('detected');
         expect(row.draft_job_id).toBeNull();
+        expect(row.pane_id).toBeNull();
         expect(reply).toContain('Nothing was posted');
     });
 

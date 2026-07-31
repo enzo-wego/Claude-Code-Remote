@@ -1958,6 +1958,9 @@ ${formatted}`,
                 const task = payload.repo && payload.pr
                     ? this.prTasks.byRepoNumber(payload.repo, payload.pr)
                     : null;
+                if (task) {
+                    this.prTasks.setPane(task.id, null);
+                }
                 const message = {
                     text: ':door: Review session closed. Nothing was posted.',
                 };

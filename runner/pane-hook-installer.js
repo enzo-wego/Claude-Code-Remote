@@ -1,4 +1,5 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const HOOK_TIMEOUT = 15;
@@ -39,4 +40,32 @@ function installPaneHook({ settingsPath, command }) {
     return { path: settingsPath, command, changed: true };
 }
 
-module.exports = { installPaneHook };
+function quotePath(value) {
+    return value.includes(' ') ? `"${value}"` : value;
+}
+
+function installDefaultPaneHook({
+    homeDir = os.homedir(),
+    nodeBin = process.execPath,
+} = {}) {
+    const settingsPath = path.join(homeDir, '.claude', 'settings.json');
+    const paneScript = path.join(__dirname, 'pane-notify.js');
+    const command = `${quotePath(nodeBin)} ${quotePath(paneScript)}`;
+    return installPaneHook({ settingsPath, command });
+}
+
+if (require.main === module) {
+    try {
+        const result = installDefaultPaneHook();
+        console.log(
+            result.changed
+                ? `Pane hook installed in ${result.path}`
+                : `Pane hook already installed in ${result.path}`
+        );
+    } catch (error) {
+        console.error(`Pane hook installation failed: ${error.message}`);
+        process.exitCode = 1;
+    }
+}
+
+module.exports = { installPaneHook, installDefaultPaneHook };

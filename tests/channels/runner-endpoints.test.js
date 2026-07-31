@@ -88,6 +88,30 @@ describe('runner endpoints', () => {
         expect(onPaneEvent).not.toHaveBeenCalled();
     });
 
+    test('pane-event fails closed when the server token is unset', async () => {
+        const jobs = new Jobs(new Database(':memory:'));
+        const onPaneEvent = jest.fn().mockResolvedValue(true);
+        const handlers = makeRunnerHandlers({
+            jobs,
+            token: '',
+            onPaneEvent,
+        });
+        const response = {
+            code: 200,
+            body: null,
+            status(code) { this.code = code; return this; },
+            json(body) { this.body = body; return this; },
+        };
+
+        await handlers.paneEvent({
+            headers: { 'x-runner-token': '' },
+            body: { job_id: 1, text: 'Waiting', kind: 'stop' },
+        }, response);
+
+        expect(response.code).toBe(401);
+        expect(onPaneEvent).not.toHaveBeenCalled();
+    });
+
     test('pane-event sends a known job to the Slack callback', async () => {
         const { jobs, handlers, res, onPaneEvent } = setup();
         const job = jobs.enqueue('apex_review', {

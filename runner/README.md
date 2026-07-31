@@ -44,13 +44,17 @@ On the Mac that runs EnzoBot jobs, the Claude Stop hook lets a live review pane
 speak in its PR's Slack thread:
 
 ```bash
-npm run hooks:install claude
+npm run hooks:install:pane
 ```
 
 The installer appends `runner/pane-notify.js` to `hooks.Stop` in
 `~/.claude/settings.json`; it does not replace existing Stop hooks. The hook is
 silent unless the runner launched the session with `ENZOBOT_JOB_ID`, and it
 uses `~/.enzobot-runner.json` for the VPS URL and runner token.
+
+Use the pane-only command on a runner Mac. `npm run hooks:install claude`
+installs Claude-Code-Remote's full global hook set and is intended for a host
+running the complete Slack session service.
 
 ## Run
 

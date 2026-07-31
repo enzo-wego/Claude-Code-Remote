@@ -236,6 +236,7 @@ async function handlePrAction({
                     dedupeKey: `pane_close:${result.pane_id}`,
                 });
             }
+            prTasks.setPane(task.id, null);
             // Back to actionable rather than dismissed: nothing was posted, so
             // the PR should stay reviewable.
             prTasks.failDraft(task.id);
