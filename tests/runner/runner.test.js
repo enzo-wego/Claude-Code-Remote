@@ -65,6 +65,10 @@ describe('executeJob', () => {
         expect(result.summary).toBe('1 blocking');
         // The pane the reviewer is left sitting in — Post talks to it later.
         expect(result.pane_id).toBe('wN:p9');
+        expect(herdr.startAgent).toHaveBeenCalledWith(
+            'wN:p9',
+            'ENZOBOT_JOB_ID=7 claude'
+        );
 
         // Submitted text must be ONE line: herdr types multi-line text into the
         // TUI without ever submitting it.
@@ -137,7 +141,7 @@ describe('address_comments', () => {
         });
         expect(herdr.startAgent).toHaveBeenCalledWith(
             'wN:p7',
-            'claude --dangerously-skip-permissions --resume aaaa-1111'
+            'ENZOBOT_JOB_ID=40 claude --dangerously-skip-permissions --resume aaaa-1111'
         );
         expect(herdr.submitTask.mock.calls).toEqual([
             ['wN:p7', '/compact'],
@@ -164,7 +168,7 @@ describe('address_comments', () => {
 
         expect(herdr.startAgent).toHaveBeenCalledWith(
             'wN:p2',
-            'claude --dangerously-skip-permissions'
+            'ENZOBOT_JOB_ID=41 claude --dangerously-skip-permissions'
         );
         expect(herdr.submitTask).toHaveBeenCalledTimes(1);
         expect(herdr.submitTask).not.toHaveBeenCalledWith('wN:p2', '/compact');

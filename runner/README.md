@@ -38,6 +38,20 @@ Create `~/.enzobot-runner.json`:
 `<repoRoot>/<repo-name>` if that directory exists. A job for a repo with no
 local checkout fails with a clear error rather than guessing.
 
+## Install the pane-to-Slack hook (Mac runner only)
+
+On the Mac that runs EnzoBot jobs, the Claude Stop hook lets a live review pane
+speak in its PR's Slack thread:
+
+```bash
+npm run hooks:install claude
+```
+
+The installer appends `runner/pane-notify.js` to `hooks.Stop` in
+`~/.claude/settings.json`; it does not replace existing Stop hooks. The hook is
+silent unless the runner launched the session with `ENZOBOT_JOB_ID`, and it
+uses `~/.enzobot-runner.json` for the VPS URL and runner token.
+
 ## Run
 
 **Foreground (recommended while testing — you see every poll):**

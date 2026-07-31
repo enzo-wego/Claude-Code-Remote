@@ -1814,6 +1814,43 @@ ${formatted}`,
         });
     }
 
+    async _onPaneEvent(job, event) {
+        const payload = JSON.parse(job.payload_json || '{}');
+        const task = payload.repo && payload.pr
+            ? this.prTasks.byRepoNumber(payload.repo, payload.pr)
+            : null;
+        if (!task) return false;
+
+        const text = String(event.text || '').slice(-1000);
+        await this._postForPr(task, {
+            text: `:speech_balloon: *#${task.number} session:* ${text}`,
+        });
+        return true;
+    }
+
+    async _relayPrThreadReply(event) {
+        if ((this.config.appMode || 'all') === 'local') return false;
+        if (!event
+            || event.subtype
+            || event.bot_id
+            || (event.app_id && !event.user)
+            || event.user !== this.config.ownerUserId
+            || !event.thread_ts
+            || typeof event.text !== 'string') {
+            return false;
+        }
+
+        const task = this.prTasks.bySlackTs(event.thread_ts);
+        if (!task || !task.pane_id) return false;
+        const job = this.jobs.enqueue('pane_message', {
+            pane_id: task.pane_id,
+            repo: task.repo,
+            pr: task.number,
+            text: event.text,
+        });
+        return Boolean(job);
+    }
+
     async _onJobResult(job) {
         try {
             if (!this.config.ownerUserId) return;
@@ -1845,6 +1882,10 @@ ${formatted}`,
                         `apex review job ${job.id} has no linked active PR task`
                     );
                     return;
+                }
+                const result = JSON.parse(job.result_json || '{}');
+                if (result.pane_id) {
+                    this.prTasks.setPane(task.id, result.pane_id);
                 }
                 this.prTasks.setStatus(task.id, 'drafted');
                 const drafted = this.prTasks.get(task.id);
@@ -1896,6 +1937,9 @@ ${formatted}`,
                 const task = payload.repo && payload.pr
                     ? this.prTasks.byRepoNumber(payload.repo, payload.pr)
                     : null;
+                if (task && result.pane_id) {
+                    this.prTasks.setPane(task.id, result.pane_id);
+                }
                 const pane = result.pane_id
                     ? ` in pane \`${result.pane_id}\``
                     : '';
@@ -2029,6 +2073,8 @@ ${formatted}`,
                         this._reapOrphanedSession(event.channel, deletedTs);
                         return;
                     }
+
+                    if (await this._relayPrThreadReply(event)) return;
 
                     // Owner DM keyword: "reseed" → mint a fresh SSO device-code
                     // URL on demand (same as tapping the button on an SSO DM).
@@ -7062,11 +7108,14 @@ ${formatted}`,
             token: process.env.RUNNER_TOKEN || '',
             onResult: (job) => this._onJobResult(job),
             onFail: (job) => this._onJobFailed(job),
+            onPaneEvent: (job, event) => this._onPaneEvent(job, event),
         });
         httpApp.post('/runner/lease', (req, res) => runnerHandlers.lease(req, res));
         httpApp.post('/runner/complete', (req, res) => runnerHandlers.complete(req, res));
         httpApp.post('/runner/fail', (req, res) => runnerHandlers.fail(req, res));
         httpApp.post('/jobs', (req, res) => runnerHandlers.enqueue(req, res));
+        httpApp.post('/pane-event', (req, res) =>
+            runnerHandlers.paneEvent(req, res));
 
         httpApp.get('/sso-status', (req, res) => {
             if (!this.ssoPrewarm) {

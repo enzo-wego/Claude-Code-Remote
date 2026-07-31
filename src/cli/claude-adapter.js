@@ -7,10 +7,15 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const RUNTIME_FATAL_PATTERNS = require('./runtime-fatal-patterns');
+const { installPaneHook } = require('../../runner/pane-hook-installer');
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
-const HOOK_MARKERS = ['cli-hook-notify', 'claude-hook-notify'];
+const HOOK_MARKERS = [
+    'cli-hook-notify',
+    'claude-hook-notify',
+    'pane-notify',
+];
 const HOOK_TIMEOUT = 15;
 
 // Per-session MCP configs live here so each tmux session points Claude at
@@ -366,12 +371,30 @@ module.exports = {
         if (JSON.stringify(settings.hooks.PreToolUse) !== preToolBefore) changed = true;
 
         if (changed) saveSettings(settings);
+        // Mac-runner panes have no tmux-session row in the VPS database, so
+        // they use a second Stop hook addressed by ENZOBOT_JOB_ID. The
+        // installer appends it to Stop; it must never replace another
+        // project's existing hooks.
+        const paneScript = path.join(REPO_ROOT, 'runner', 'pane-notify.js');
+        const paneQuoted = paneScript.includes(' ')
+            ? `"${paneScript}"`
+            : paneScript;
+        const paneCommand = `${nodeQuoted} ${paneQuoted}`;
+        const paneInstall = installPaneHook({
+            settingsPath: SETTINGS_PATH,
+            command: paneCommand,
+        });
+        if (paneInstall.changed) changed = true;
         // Surface PreToolUse in the install summary too (it's installed outside
         // the matcher='*' loop above, so merge it in for display).
         return {
             path: SETTINGS_PATH,
             changed,
-            commands: { ...commands, 'PreToolUse[AskUserQuestion]': `${nodeQuoted} ${quoted} ask-question` },
+            commands: {
+                ...commands,
+                'Stop[Mac runner]': paneCommand,
+                'PreToolUse[AskUserQuestion]': `${nodeQuoted} ${quoted} ask-question`,
+            },
         };
     },
 

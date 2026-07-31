@@ -172,7 +172,10 @@ async function executeJob(
         const cli = payload.sessionKey
             ? `${config.cliCommand} --resume ${payload.sessionKey}`
             : config.cliCommand;
-        herdr.startAgent(paneId, cli);
+        herdr.startAgent(
+            paneId,
+            `ENZOBOT_JOB_ID=${job.id} ${cli}`
+        );
 
         if (payload.sessionKey) {
             herdr.submitTask(paneId, '/compact');
@@ -208,7 +211,10 @@ async function executeJob(
             label: jobLabel(payload.repo, payload.pr, payload.title),
             cwd: checkout,
         });
-        herdr.startAgent(paneId, config.cliCommand);
+        const cli = job.kind === 'apex_review'
+            ? `ENZOBOT_JOB_ID=${job.id} ${config.cliCommand}`
+            : config.cliCommand;
+        herdr.startAgent(paneId, cli);
 
         // The prompt goes to a file and only a one-line pointer is submitted:
         // herdr types multi-line text into the TUI without ever sending it.

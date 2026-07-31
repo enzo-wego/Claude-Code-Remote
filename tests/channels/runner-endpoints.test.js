@@ -5,7 +5,13 @@ const { makeRunnerHandlers } = require('../../src/channels/slack/runner-endpoint
 function setup() {
     const jobs = new Jobs(new Database(':memory:'));
     const onResult = jest.fn().mockResolvedValue();
-    const handlers = makeRunnerHandlers({ jobs, token: 'sekret', onResult });
+    const onPaneEvent = jest.fn().mockResolvedValue(true);
+    const handlers = makeRunnerHandlers({
+        jobs,
+        token: 'sekret',
+        onResult,
+        onPaneEvent,
+    });
     const res = () => {
         const response = { code: 200, body: null };
         response.status = (code) => {
@@ -18,7 +24,7 @@ function setup() {
         };
         return response;
     };
-    return { jobs, handlers, res, onResult };
+    return { jobs, handlers, res, onResult, onPaneEvent };
 }
 
 describe('runner endpoints', () => {
@@ -63,6 +69,57 @@ describe('runner endpoints', () => {
         expect(response.body.ok).toBe(true);
         expect(jobs.get(leased.id).status).toBe('done');
         expect(onResult).toHaveBeenCalledWith(expect.objectContaining({ id: leased.id }));
+    });
+
+    test('pane-event rejects a bad token without posting', async () => {
+        const { jobs, handlers, res, onPaneEvent } = setup();
+        const job = jobs.enqueue('apex_review', {
+            repo: 'wego/payments',
+            pr: 412,
+        });
+        const response = res();
+
+        await handlers.paneEvent({
+            headers: { 'x-runner-token': 'nope' },
+            body: { job_id: job.id, text: 'Waiting', kind: 'stop' },
+        }, response);
+
+        expect(response.code).toBe(401);
+        expect(onPaneEvent).not.toHaveBeenCalled();
+    });
+
+    test('pane-event sends a known job to the Slack callback', async () => {
+        const { jobs, handlers, res, onPaneEvent } = setup();
+        const job = jobs.enqueue('apex_review', {
+            repo: 'wego/payments',
+            pr: 412,
+        });
+        const response = res();
+
+        await handlers.paneEvent({
+            headers: { 'x-runner-token': 'sekret' },
+            body: { job_id: job.id, text: 'Waiting', kind: 'stop' },
+        }, response);
+
+        expect(response.code).toBe(200);
+        expect(response.body).toEqual({ ok: true });
+        expect(onPaneEvent).toHaveBeenCalledWith(
+            expect.objectContaining({ id: job.id }),
+            { text: 'Waiting', kind: 'stop' }
+        );
+    });
+
+    test('pane-event returns 404 for an unknown job', async () => {
+        const { handlers, res, onPaneEvent } = setup();
+        const response = res();
+
+        await handlers.paneEvent({
+            headers: { 'x-runner-token': 'sekret' },
+            body: { job_id: 999, text: 'Waiting', kind: 'stop' },
+        }, response);
+
+        expect(response.code).toBe(404);
+        expect(onPaneEvent).not.toHaveBeenCalled();
     });
 });
 

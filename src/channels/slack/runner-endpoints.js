@@ -14,7 +14,13 @@ function tokenOk(req, token) {
         && crypto.timingSafeEqual(actual, expected);
 }
 
-function makeRunnerHandlers({ jobs, token, onResult, onFail }) {
+function makeRunnerHandlers({
+    jobs,
+    token,
+    onResult,
+    onFail,
+    onPaneEvent,
+}) {
     // `jobs` may be a thunk. The daily restart closes the SQLite handle and
     // _initDb() builds a new Jobs instance; a handler that captured the old one
     // would keep running prepared statements bound to a closed connection.
@@ -73,6 +79,21 @@ function makeRunnerHandlers({ jobs, token, onResult, onFail }) {
                 target: target || 'mac',
             });
             return res.json({ job: row, deduped: row === null });
+        }),
+
+        paneEvent: guard(async (req, res) => {
+            const { job_id, text, kind } = req.body || {};
+            const job = getJobs().get(job_id);
+            if (!job) {
+                return res.status(404).json({ error: 'job not found' });
+            }
+            const posted = onPaneEvent
+                ? await onPaneEvent(job, { text, kind })
+                : false;
+            if (!posted) {
+                return res.status(404).json({ error: 'PR destination not found' });
+            }
+            return res.json({ ok: true });
         }),
     };
 }

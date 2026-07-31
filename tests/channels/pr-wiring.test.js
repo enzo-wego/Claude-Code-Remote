@@ -8,6 +8,7 @@ jest.mock('../../src/services/daily-summary', () => ({
 const SlackSocketHandler = require('../../src/channels/slack/socket');
 const Jobs = require('../../src/services/jobs');
 const PrTasks = require('../../src/services/pr-tasks');
+const { makeRunnerHandlers } = require('../../src/channels/slack/runner-endpoints');
 
 function makeHandler() {
     const db = new Database(':memory:');
@@ -160,6 +161,7 @@ describe('PR board socket wiring', () => {
         handler.jobs.complete(leased.id, leased.lease_id, {
             summary: '1 blocking',
             body_md: '## Blocking\n- Fix this',
+            pane_id: 'pane-apex-412',
         });
 
         await handler._onJobResult(handler.jobs.get(job.id));
@@ -167,6 +169,7 @@ describe('PR board socket wiring', () => {
         const stored = handler.prTasks.get(task.id);
         expect(stored).toMatchObject({
             status: 'drafted',
+            pane_id: 'pane-apex-412',
             slack_ts: '1712345678.000100',
             slack_permalink: 'https://slack.example/archives/DOWNER/p1712345678000100',
         });
@@ -264,6 +267,7 @@ describe('PR board socket wiring', () => {
         expect(message).not.toHaveProperty('blocks');
         expect(handler.app.client.chat.getPermalink).not.toHaveBeenCalled();
         expect(handler._publishHome).toHaveBeenCalledWith('UOWNER');
+        expect(handler.prTasks.get(task.id).pane_id).toBe('pane-enzobot-412');
     });
 
     test('address-comments without a reply draft warns in the PR thread', async () => {
@@ -386,5 +390,136 @@ describe('PR board socket wiring', () => {
         expect(message).not.toHaveProperty('blocks');
         expect(handler.app.client.chat.getPermalink).not.toHaveBeenCalled();
         expect(handler._publishHome).toHaveBeenCalledWith('UOWNER');
+    });
+
+    test('pane-event posts a known job into its PR thread and truncates the text', async () => {
+        const handler = makeHandler();
+        const task = handler.prTasks.upsert({
+            repo: 'wego/payments',
+            number: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+        });
+        handler.prTasks.setSlackThread(
+            task.id,
+            '1712345678.000100',
+            'https://slack.example/archives/DOWNER/p1712345678000100'
+        );
+        const job = handler.jobs.enqueue('apex_review', {
+            repo: 'wego/payments',
+            pr: 412,
+        });
+        const handlers = makeRunnerHandlers({
+            jobs: handler.jobs,
+            token: 'sekret',
+            onPaneEvent: (row, event) => handler._onPaneEvent(row, event),
+        });
+        const response = {
+            code: 200,
+            body: null,
+            status(code) { this.code = code; return this; },
+            json(body) { this.body = body; return this; },
+        };
+
+        await handlers.paneEvent({
+            headers: { 'x-runner-token': 'sekret' },
+            body: {
+                job_id: job.id,
+                text: 'discarded-prefix' + 'x'.repeat(1000),
+                kind: 'stop',
+            },
+        }, response);
+
+        expect(response.code).toBe(200);
+        expect(handler.app.client.chat.postMessage).toHaveBeenCalledWith(
+            expect.objectContaining({
+                thread_ts: '1712345678.000100',
+                text: `:speech_balloon: *#412 session:* ${'x'.repeat(1000)}`,
+            })
+        );
+    });
+
+    test('pane-event returns 404 when the job has no known PR destination', async () => {
+        const handler = makeHandler();
+        const job = handler.jobs.enqueue('apex_review', {
+            repo: 'wego/payments',
+            pr: 999,
+        });
+        const handlers = makeRunnerHandlers({
+            jobs: handler.jobs,
+            token: 'sekret',
+            onPaneEvent: (row, event) => handler._onPaneEvent(row, event),
+        });
+        const response = {
+            code: 200,
+            body: null,
+            status(code) { this.code = code; return this; },
+            json(body) { this.body = body; return this; },
+        };
+
+        await handlers.paneEvent({
+            headers: { 'x-runner-token': 'sekret' },
+            body: { job_id: job.id, text: 'Waiting', kind: 'stop' },
+        }, response);
+
+        expect(response.code).toBe(404);
+        expect(handler.app.client.chat.postMessage).not.toHaveBeenCalled();
+    });
+
+    test('an owner reply in the PR thread enqueues a pane message', async () => {
+        const handler = makeHandler();
+        const task = handler.prTasks.upsert({
+            repo: 'wego/payments',
+            number: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+        });
+        handler.prTasks.setSlackThread(task.id, '1712345678.000100', null);
+        handler.prTasks.setPane(task.id, 'pane-apex-412');
+
+        const relayed = await handler._relayPrThreadReply({
+            user: 'UOWNER',
+            thread_ts: '1712345678.000100',
+            text: 'Go ahead and write reply.md.',
+        });
+
+        expect(relayed).toBe(true);
+        const queued = handler.jobs.recent(1)[0];
+        expect(queued.kind).toBe('pane_message');
+        expect(JSON.parse(queued.payload_json)).toEqual({
+            pane_id: 'pane-apex-412',
+            repo: 'wego/payments',
+            pr: 412,
+            text: 'Go ahead and write reply.md.',
+        });
+    });
+
+    test('non-owner, bot, and local-instance replies enqueue nothing', async () => {
+        const handler = makeHandler();
+        const task = handler.prTasks.upsert({
+            repo: 'wego/payments',
+            number: 412,
+            url: 'https://github.com/wego/payments/pull/412',
+        });
+        handler.prTasks.setSlackThread(task.id, '1712345678.000100', null);
+        handler.prTasks.setPane(task.id, 'pane-apex-412');
+
+        await handler._relayPrThreadReply({
+            user: 'UOTHER',
+            thread_ts: '1712345678.000100',
+            text: 'Send this',
+        });
+        await handler._relayPrThreadReply({
+            user: 'UOWNER',
+            bot_id: 'BENZOBOT',
+            thread_ts: '1712345678.000100',
+            text: 'Bot echo',
+        });
+        handler.config.appMode = 'local';
+        await handler._relayPrThreadReply({
+            user: 'UOWNER',
+            thread_ts: '1712345678.000100',
+            text: 'Local duplicate',
+        });
+
+        expect(handler.jobs.recent(10)).toEqual([]);
     });
 });

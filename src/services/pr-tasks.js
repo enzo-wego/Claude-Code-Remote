@@ -63,6 +63,9 @@ class PrTasks {
         // the menu entry is conditional rather than always present.
         this._addColumn('slack_ts', 'TEXT');
         this._addColumn('slack_permalink', 'TEXT');
+        // Live Mac-runner pane for this PR. Slack thread replies are relayed
+        // back into this pane while the review/comment session remains open.
+        this._addColumn('pane_id', 'TEXT');
 
         // Board preferences (draft visibility, and whatever the page grows
         // next). One row per key; the board belongs to one owner.
@@ -125,6 +128,9 @@ class PrTasks {
             byKey: db.prepare(
                 'SELECT * FROM pr_tasks WHERE repo=? AND number=?'
             ),
+            bySlackTs: db.prepare(
+                'SELECT * FROM pr_tasks WHERE slack_ts=?'
+            ),
             get: db.prepare('SELECT * FROM pr_tasks WHERE id=?'),
             listActive: db.prepare(`
                 SELECT * FROM pr_tasks
@@ -177,6 +183,9 @@ class PrTasks {
                 SET slack_ts=?, slack_permalink=?, updated_at=?
                 WHERE id=?
             `),
+            setPane: db.prepare(
+                'UPDATE pr_tasks SET pane_id=?, updated_at=? WHERE id=?'
+            ),
             getPref: db.prepare('SELECT value FROM board_prefs WHERE key=?'),
             setPref: db.prepare(`
                 INSERT INTO board_prefs (key, value) VALUES (?, ?)
@@ -234,6 +243,10 @@ class PrTasks {
         return this._s.byKey.get(repo, number);
     }
 
+    bySlackTs(slackTs) {
+        return this._s.bySlackTs.get(slackTs);
+    }
+
     /** All active rows, or just one lane's. */
     listActive(lane) {
         return lane
@@ -287,6 +300,10 @@ class PrTasks {
 
     setSlackThread(id, ts, permalink) {
         this._s.setSlackThread.run(ts, permalink, Date.now(), id);
+    }
+
+    setPane(id, paneId) {
+        this._s.setPane.run(paneId || null, Date.now(), id);
     }
 
     setDraftJob(id, jobId) {

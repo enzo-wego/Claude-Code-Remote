@@ -52,6 +52,7 @@ describe('PrTasks', () => {
         expect(tasks.get(task.id)).toMatchObject({
             slack_ts: null,
             slack_permalink: null,
+            pane_id: null,
         });
 
         tasks.setSlackThread(task.id, '123.456', 'https://slack.example/thread');
@@ -61,5 +62,18 @@ describe('PrTasks', () => {
             slack_permalink: 'https://slack.example/thread',
         });
         expect(tasks.byRepoNumber('r', 3).id).toBe(task.id);
+    });
+
+    test('pane and Slack thread identify the live PR session', () => {
+        const tasks = create();
+        const task = tasks.upsert({ repo: 'r', number: 4, url: 'u' });
+        tasks.setSlackThread(task.id, '456.789', null);
+        tasks.setPane(task.id, 'wN:p4');
+
+        expect(tasks.bySlackTs('456.789')).toMatchObject({
+            id: task.id,
+            pane_id: 'wN:p4',
+        });
+        expect(tasks.bySlackTs('missing')).toBeUndefined();
     });
 });
