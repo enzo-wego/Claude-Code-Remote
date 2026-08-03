@@ -226,12 +226,13 @@ describe('refreshMine', () => {
     };
 
     /**
-     * The whole point of the feature, end to end: an approved PR that still has
-     * a bot thread waiting is not finished. Every other thread test works on the
-     * counter directly, so without this one nothing proves a sweep writes a real
-     * count through GraphQL — the case #458 was rendering wrong.
+     * The end-to-end path for the thread count: every other thread test works
+     * on the counter directly, so without this one nothing proves a sweep
+     * writes a real count through GraphQL — the case #458 was rendering wrong.
+     * The count now only lands on the row as a column; it no longer decides the
+     * glyph, so an approved PR reads 'done' even with live threads still open.
      */
-    test('a live thread someone else spoke in last outranks the approval', async () => {
+    test('a sweep writes the live thread count, but approval owns the turn', async () => {
         const tasks = createTasks();
         const task = tasks.upsert({ repo: 'a/b', number: 1, url: 'u', lane: 'mine' });
         const live = author => ({
@@ -256,7 +257,7 @@ describe('refreshMine', () => {
         expect(tasks.get(task.id)).toEqual(expect.objectContaining({
             review_decision: 'approved',
             open_threads: 2,
-            turn: 'mine',
+            turn: 'done',
         }));
     });
 

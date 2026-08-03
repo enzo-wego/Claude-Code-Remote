@@ -396,10 +396,11 @@ async function fetchActivity({ repo, number, token, viewerLogin }) {
 /**
  * Whose move it is.
  *
- * The board exists to answer "does this need me", and that is decided by who
- * spoke last, not by CI or by how the PR looks. If the author spoke last the
- * ball is with the reviewers; if a reviewer spoke last it is back with the
- * author. A PR nobody has said anything on is waiting for its first review.
+ * The board exists to answer "does this need me". An approved PR is done; past
+ * that it is decided by who spoke last, not by CI, how the PR looks, or whether
+ * review threads are still open. If the author spoke last the ball is with the
+ * reviewers; if a reviewer spoke last it is back with the author. A PR nobody
+ * has said anything on is waiting for its first review.
  *
  * Returns 'done' | 'mine' | 'theirs'.
  */
@@ -408,9 +409,7 @@ function turnFor({
     author,
     lastSpeaker,
     viewerLogin,
-    openThreads = 0,
 }) {
-    if (Number(openThreads) > 0) return 'mine';
     if (decision === 'approved') return 'done';
     const ballWithAuthor = Boolean(lastSpeaker) && lastSpeaker !== author;
     const viewerIsAuthor = Boolean(viewerLogin) && viewerLogin === author;
@@ -624,7 +623,6 @@ async function refreshAll(prTasks, token, viewerLogin, viewerTeams = []) {
                     author: state.author,
                     lastSpeaker: activity.lastSpeaker,
                     viewerLogin,
-                    openThreads,
                 }));
             } catch (err) {
                 // Keep the previous decision, but say so — a swallowed failure
@@ -703,7 +701,6 @@ async function refreshMine(prTasks, token, viewerLogin) {
             author: state.author,
             lastSpeaker: activity.lastSpeaker,
             viewerLogin,
-            openThreads,
         }));
 
         const newComments = Math.max(0, humanComments - (task.seen_comments || 0));

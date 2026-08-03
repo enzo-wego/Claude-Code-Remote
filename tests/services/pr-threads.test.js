@@ -118,42 +118,52 @@ describe('countOpenThreads', () => {
         expect(countOpenThreads(nodes, '')).toBeNull();
         expect(countOpenThreads(nodes, 'enzo-wego')).toBe(1);
     });
-
-    test('an unknown count leaves the turn to the existing rules', () => {
-        expect(turnFor({
-            decision: 'approved',
-            author: 'enzo-wego',
-            lastSpeaker: 'reviewer',
-            viewerLogin: 'enzo-wego',
-            openThreads: null,
-        })).toBe('done');
-    });
 });
 
-describe('thread-aware turns', () => {
-    test('open threads outrank an approved decision when computing the turn', () => {
-        expect(turnFor({
-            decision: 'approved',
-            author: 'enzo-wego',
-            lastSpeaker: 'reviewer',
-            viewerLogin: 'enzo-wego',
-            openThreads: 3,
-        })).toBe('mine');
+describe('turn ignores the open-thread count entirely', () => {
+    // turnFor no longer takes open threads into account. Each row is asserted
+    // with openThreads 0 and 3 in the argument object: both are ignored today,
+    // so re-introducing the parameter makes the `3` variant start failing.
+    const cases = [
+        { case: 1, author: 'enzo-wego', lastSpeaker: 'enzo-wego', decision: undefined, expected: 'theirs' },
+        { case: 2, author: 'enzo-wego', lastSpeaker: 'reviewer', decision: 'approved', expected: 'done' },
+        { case: 3, author: 'enzo-wego', lastSpeaker: 'reviewer', decision: undefined, expected: 'mine' },
+        { case: 4, author: 'teammate', lastSpeaker: 'teammate', decision: undefined, expected: 'mine' },
+        { case: 5, author: 'teammate', lastSpeaker: 'teammate', decision: 'approved', expected: 'done' },
+        { case: 5, author: 'teammate', lastSpeaker: 'enzo-wego', decision: undefined, expected: 'theirs' },
+        // The gaps the five rules leave open, which must not regress.
+        { case: 'fresh review request', author: 'teammate', lastSpeaker: null, decision: undefined, expected: 'mine' },
+        { case: 'own PR, nobody spoke', author: 'enzo-wego', lastSpeaker: null, decision: undefined, expected: 'theirs' },
+    ];
+
+    for (const row of cases) {
+        for (const openThreads of [0, 3]) {
+            const name = `case ${row.case}: ${row.author}/${row.lastSpeaker}`
+                + `${row.decision ? `/${row.decision}` : ''} → ${row.expected}`
+                + ` (open_threads: ${openThreads})`;
+            test(name, () => {
+                expect(turnFor({
+                    decision: row.decision,
+                    author: row.author,
+                    lastSpeaker: row.lastSpeaker,
+                    viewerLogin: 'enzo-wego',
+                    openThreads,
+                })).toBe(row.expected);
+            });
+        }
+    }
+
+    test('turnOf surfaces the stored turn verbatim for any open_threads value', () => {
+        for (const open_threads of [0, 3, null, undefined]) {
+            expect(turnOf(mineTask({ turn: 'done', open_threads }))).toBe('done');
+            expect(turnOf(mineTask({ turn: 'mine', open_threads }))).toBe('mine');
+            expect(turnOf(mineTask({ turn: 'theirs', open_threads }))).toBe('theirs');
+        }
     });
 
-    test('open threads outrank an approved stored turn when rendering', () => {
-        expect(turnOf(mineTask({ open_threads: 3 }))).toBe('mine');
-    });
-
-    test('zero open threads preserves the existing turn', () => {
-        expect(turnOf(mineTask({ open_threads: 0 }))).toBe('done');
-        expect(turnFor({
-            decision: 'approved',
-            author: 'enzo-wego',
-            lastSpeaker: 'reviewer',
-            viewerLogin: 'enzo-wego',
-            openThreads: 0,
-        })).toBe('done');
+    test('turnOf falls back to mine only when the stored turn is missing or unknown', () => {
+        expect(turnOf(mineTask({ turn: undefined, open_threads: 3 }))).toBe('mine');
+        expect(turnOf(mineTask({ turn: 'nonsense', open_threads: 3 }))).toBe('mine');
     });
 });
 
@@ -180,7 +190,7 @@ describe('open thread persistence and board rows', () => {
         ]).find(block => block.text?.text?.includes('#458'));
 
         expect(row.text.text).toContain('3 threads open');
-        expect(row.text.text).toContain('your move');
+        expect(row.text.text).toContain('approved');
         expect(row.accessory.action_id).toBe('pr_merge');
     });
 

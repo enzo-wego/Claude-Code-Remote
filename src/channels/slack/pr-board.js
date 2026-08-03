@@ -54,10 +54,11 @@ function overflow(taskId, entries) {
     };
 }
 
-/** Fall back to 'mine' when a row predates the turn column — better to be
- *  asked about a PR that does not need you than to hide one that does. */
+/** Surface the stored turn as computed by turnFor; the open-thread count no
+ *  longer decides it. Fall back to 'mine' when a row predates the turn column
+ *  — better to be asked about a PR that does not need you than to hide one
+ *  that does. */
 function turnOf(task) {
-    if (Number(task.open_threads) > 0) return 'mine';
     return TURN_GLYPHS[task.turn] ? task.turn : 'mine';
 }
 
