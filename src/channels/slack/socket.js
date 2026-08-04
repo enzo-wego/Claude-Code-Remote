@@ -4135,7 +4135,11 @@ ${formatted}`,
         const tmpFile = path.join(os.tmpdir(), `cli-local-inject-${sessionName}-${Date.now()}.txt`);
         try {
             fs.writeFileSync(tmpFile, text);
-            const probe = text.split('\n')[0].trim().substring(0, 40);
+            // Whitespace-squashed match for the same reason as _injectCommand's
+            // probe: the composer word-wraps, so a contiguous substring match
+            // can miss a paste that is sitting right there in the input box.
+            const squash = (s) => (s || '').replace(/\s+/g, '');
+            const probe = squash(text.split('\n')[0].trim().substring(0, 40));
             let pasteLanded = false;
             for (let attempt = 0; attempt < 4; attempt++) {
                 execSync(`tmux send-keys -t ${sessionName} C-u`);
@@ -4143,7 +4147,7 @@ ${formatted}`,
                 execSync(`tmux load-buffer ${tmpFile}`);
                 execSync(`tmux paste-buffer -t ${sessionName}`);
                 await new Promise(r => setTimeout(r, 1000 + attempt * 500));
-                if (probe.length >= 2 && this._captureOutput(sessionName).includes(probe)) {
+                if (probe.length >= 2 && squash(this._captureOutput(sessionName)).includes(probe)) {
                     pasteLanded = true;
                     break;
                 }
@@ -4568,6 +4572,64 @@ ${formatted}`,
         );
     }
 
+    // The CLI's input box as rendered: the last line starting with a prompt
+    // char, plus the wrapped continuation lines under it, up to the box's
+    // closing rule. Used to tell "something is sitting in the composer" from
+    // "the composer is empty" without depending on the pasted text being
+    // matchable — the box word-wraps, scrolls internally once the content is
+    // taller than the box, and collapses big pastes behind a placeholder, so
+    // no substring probe is reliable on its own.
+    _composerBlock(output) {
+        const lines = (output || '').split('\n');
+        let start = -1;
+        for (let i = lines.length - 1; i >= 0; i--) {
+            if (/^\s*[❯>›)]/.test(lines[i])) { start = i; break; }
+        }
+        if (start === -1) return null;
+        const block = [];
+        for (let i = start; i < lines.length; i++) {
+            if (i > start && /^\s*─{20,}\s*$/.test(lines[i])) break;
+            block.push(i === start ? lines[i].replace(/^\s*[❯>›)]\s?/, '') : lines[i]);
+        }
+        const flat = block.join('').replace(/\s+/g, '');
+        // The ghost placeholder ("Try \"write a test for …\"") means the box is
+        // EMPTY. Its hint text rotates between renders, so treating it as
+        // content would fake a "composer changed" signal on every retry.
+        if (!flat || /^Try"/.test(flat)) return '';
+        return flat;
+    }
+
+    // Empty the CLI's input box. `C-u` alone cannot do it: it kills the
+    // CURRENT VISUAL LINE, and once the cursor sits at the start of a line it
+    // is a no-op — measured on Claude Code 2.1.221, 40 consecutive C-u presses
+    // left a 7-line paste half-standing. Pairing each C-u with a BSpace joins
+    // the emptied line onto the previous one so the next C-u has something to
+    // kill, which does walk the whole buffer back.
+    //
+    // Stop condition is "the box stopped changing", not "the box is empty":
+    // Claude pre-fills a dim next-action suggestion after each turn, and the
+    // pane can't distinguish that from typed text. Real content shrinks every
+    // batch; a suggestion stays byte-identical.
+    async _clearComposer(sessionName, maxBatches = 12) {
+        let prev = this._composerBlock(this._captureOutput(sessionName));
+        for (let batch = 0; batch < maxBatches; batch++) {
+            if (!prev) return;
+            try {
+                for (let i = 0; i < 5; i++) {
+                    execSync(`tmux send-keys -t ${sessionName} C-u`);
+                    execSync(`tmux send-keys -t ${sessionName} BSpace`);
+                    await new Promise(r => setTimeout(r, 60));
+                }
+            } catch {
+                return; // pane gone — the caller's own checks will surface it
+            }
+            await new Promise(r => setTimeout(r, 300));
+            const now = this._composerBlock(this._captureOutput(sessionName));
+            if (!now || now === prev) return;
+            prev = now;
+        }
+    }
+
     async _injectCommand(sessionName, command, cliType = 'claude') {
         const os = require('os');
         const adapter = getCliAdapter(cliType);
@@ -4601,8 +4663,8 @@ ${formatted}`,
             // and is sitting in the input box (incident 2026-06-15). The input
             // box always renders the TAIL of a long paste, so also probe the
             // LAST non-empty line. Lines are trimmed (the pane indents pasted
-            // input) and 40-char-capped (avoids wrap breaks); probes shorter
-            // than 4 chars are dropped so a bare `}` can't false-match.
+            // input) and 40-char-capped; probes shorter than 4 chars are
+            // dropped so a bare `}` can't false-match.
             const probeLines = (() => {
                 const lines = command.split('\n').map(l => l.trim()).filter(Boolean);
                 if (lines.length === 0) return [];
@@ -4611,15 +4673,46 @@ ${formatted}`,
                 if (last && last !== probes[0]) probes.push(last);
                 return probes.filter(p => p.length >= 4);
             })();
-            const probeVisible = (out) => probeLines.some(p => out.includes(p));
+            // Match with ALL whitespace squashed out. The composer word-wraps,
+            // so a 40-char probe routinely straddles a wrap and never appears
+            // contiguously in the capture — capping the probe is not enough
+            // (incident 1785808680, 2026-08-04: an 80-col detached pane broke
+            // `could you get file from <https://…` right after "from", the
+            // first-line probe had already scrolled out of the input box, and
+            // the paste was too small to collapse behind a "Pasted text"
+            // placeholder, so all three landing signals missed a paste that
+            // was plainly sitting in the composer). Squashing also absorbs the
+            // pane's leading indent on pasted input.
+            const squash = (s) => (s || '').replace(/\s+/g, '');
+            const probeNeedles = probeLines.map(squash).filter(p => p.length >= 4);
+            const probeVisible = (out) => {
+                const flat = squash(out);
+                return probeNeedles.some(p => flat.includes(p));
+            };
 
             // Paste with verification — Claude Code renders ❯ before its TUI input handler
             // finishes initializing. If we paste during that window, tcsetattr(TCSAFLUSH)
             // flushes the pty buffer and our paste is silently lost. Retry until it lands.
             const pasteMaxAttempts = 5;
             let pasteLanded = false;
+            // Composer state before the paste. `C-u` kills only the input box's
+            // CURRENT VISUAL LINE, so it cannot be relied on to empty a wrapped
+            // multi-line paste — comparing against this baseline is how a retry
+            // knows the previous attempt actually landed instead of stacking
+            // another copy on top of it (2026-08-04: five retries left five
+            // truncated copies, and the user's manual Enter submitted them all).
+            let composerBefore = this._composerBlock(preInjectOutput);
+            if (composerBefore) {
+                // Leftovers from an earlier failed inject are still unsent, and
+                // one C-u can't remove them — Enter would submit them glued to
+                // this prompt. Knock the box down with a bounded burst (one kill
+                // per visual line), then re-read the baseline.
+                this.logger.warn(`Composer not empty before inject (${composerBefore.length} chars visible) — clearing leftovers for ${sessionName}`);
+                await this._clearComposer(sessionName);
+                composerBefore = this._composerBlock(this._captureOutput(sessionName));
+            }
             for (let attempt = 0; attempt < pasteMaxAttempts; attempt++) {
-                // Clear current input
+                // Clear current input (best effort — see composerBefore above)
                 execSync(`tmux send-keys -t ${sessionName} C-u`);
                 await new Promise(r => setTimeout(r, 200));
 
@@ -4636,17 +4729,24 @@ ${formatted}`,
                 // 1. Adapter-declared paste banner (Claude: "Pasted text",
                 //    Codex: "[Pasted Content N chars]" — different TUIs render
                 //    different placeholders, so each adapter declares its own).
-                // 2. The first line of the command appears verbatim in the
-                //    visible pane (works only when the TUI doesn't collapse
-                //    pastes behind a placeholder; harmless when it does).
+                // 2. The first or last line of the command appears in the
+                //    visible pane, whitespace-squashed (works only when the TUI
+                //    doesn't collapse pastes behind a placeholder; harmless
+                //    when it does).
                 // 3. The CLI already started working (paste + auto-submit succeeded).
+                // 4. The input box now holds something it didn't hold before the
+                //    paste. Last-resort signal, but the one that survives word
+                //    wrap, internal scrolling and placeholder collapse alike:
+                //    if the composer changed and isn't empty, our text is in it.
                 const output = this._captureOutput(sessionName);
                 const isAlreadyWorking = indicatorHit(output);
                 const pasteIndicators = adapter.pasteLandedIndicators || [/Pasted text/i];
                 const pasteIndicatorMatched = pasteIndicators.some(p =>
                     typeof p === 'string' ? output.includes(p) : p.test(output)
                 );
-                if (pasteIndicatorMatched || probeVisible(output) || isAlreadyWorking) {
+                const composerNow = this._composerBlock(output);
+                const composerGrew = !!composerNow && composerNow !== composerBefore;
+                if (pasteIndicatorMatched || probeVisible(output) || isAlreadyWorking || composerGrew) {
                     if (attempt > 0) {
                         this.logger.info(`Paste landed on attempt ${attempt + 1} for ${sessionName}${isAlreadyWorking ? ' (already working)' : ''}`);
                     }
