@@ -3840,7 +3840,115 @@ ${formatted}`,
     //                                        session is killed so caller can retry
     //                                        with the next CLI in the chain.
     //   { ok: false, fatalError: null }    — tmux itself failed to launch.
+    //
+    // Wraps the boot with an input-liveness gate. A CLI can paint a complete,
+    // idle-looking TUI and still never read its terminal: on 2026-08-04 three
+    // fresh Claude Code 2.1.221 sessions came up with banner, footer, `⏵⏵
+    // bypass permissions on` and an empty `❯` box, `session:0m`, ~1.7% CPU —
+    // and ignored every keystroke for good, literal `send-keys` included. The
+    // readiness probe only reads the pane, so it passes, and then every paste
+    // is thrown into a process that will never see it. The user gets "Paste
+    // failed after 5 attempts" and has to attach to tmux for nothing, because
+    // the box really is empty. So prove the TUI echoes a keystroke before
+    // handing the session over, and give a wedged boot one clean relaunch.
     async _createTmuxSessionDetailed(sessionName, repoPath, cliCmd, sessionKey = null, cliType = 'claude', extraEnv = {}) {
+        const maxBoots = 2;
+        for (let boot = 1; boot <= maxBoots; boot++) {
+            const result = await this._bootTmuxSessionOnce(sessionName, repoPath, cliCmd, sessionKey, cliType, extraEnv);
+            if (!result.ok) return result;
+            if (await this._probeInputLiveness(sessionName, cliType)) return result;
+            this.logger.error(`${cliType} booted with an unresponsive TUI (boot ${boot}/${maxBoots}) — killing ${sessionName}`);
+            try {
+                execSync(`tmux kill-session -t ${sessionName} 2>/dev/null`);
+            } catch {
+                // already gone
+            }
+            if (boot === maxBoots) {
+                // Report as fatal so the chain walker posts a Slack notice and,
+                // on a multi-CLI chain, tries the next provider.
+                return { ok: false, fatalError: `${cliType} booted but never accepted input (${maxBoots} attempts)` };
+            }
+            this.logger.info(`Relaunching ${sessionName} (cli=${cliType}) after unresponsive boot`);
+        }
+        // Unreachable — the loop either returns or exhausts maxBoots above.
+        return { ok: false, fatalError: null };
+    }
+
+    // Type one harmless character and require the input box to change. Cheap,
+    // CLI-agnostic (each adapter's prompt char is handled by _composerBlock)
+    // and decisive: a live TUI echoes within a frame or two. The sentinel is
+    // cleared afterwards so the caller starts from an empty composer.
+    async _echoesKeystroke(sessionName, timeoutMs = 6000) {
+        const before = this._composerBlock(this._captureOutput(sessionName));
+        try {
+            execSync(`tmux send-keys -t ${sessionName} -l "."`);
+        } catch {
+            return false; // pane already gone
+        }
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 400));
+            const now = this._composerBlock(this._captureOutput(sessionName));
+            if (now !== null && now !== before) {
+                await this._clearComposer(sessionName);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    async _probeInputLiveness(sessionName, cliType = 'claude', timeoutMs = 6000) {
+        if (await this._echoesKeystroke(sessionName, timeoutMs)) {
+            this.logger.debug(`Input liveness confirmed for ${sessionName} (cli=${cliType})`);
+            return true;
+        }
+
+        // Not echoing — but a startup approval dialog swallows keystrokes
+        // exactly like a wedged TUI does, and unlike a wedge it is recoverable:
+        // Enter accepts the highlighted option (always the "yes, I trust …"
+        // one). Claude's managed-settings and folder-trust dialogs are TALLER
+        // than an 80x24 detached pane, so their `1. Yes …` lines render BELOW
+        // the fold — invisible to the adapter's confirmationPrompts and to
+        // _autoApprove, which is why the poller never rescued these boots.
+        // Match the header text that does stay on screen. Accepting is
+        // consistent with how these sessions are launched anyway
+        // (--dangerously-skip-permissions).
+        const startupDialogs = [
+            /Managed settings require approval/i,
+            /Only accept if you trust your organization/i,
+            /trust (this|the) folder/i,
+            /Is this a project you created or one you trust\?/i,
+        ];
+        const output = this._captureOutput(sessionName);
+        const matched = startupDialogs.find(re => re.test(output));
+        if (matched) {
+            this.logger.warn(`Startup approval dialog blocking input in ${sessionName} (${matched}) — accepting the highlighted option`);
+            try {
+                execSync(`tmux send-keys -t ${sessionName} Enter`);
+            } catch {
+                return false;
+            }
+            await new Promise(r => setTimeout(r, 1500));
+            if (await this._echoesKeystroke(sessionName, timeoutMs)) {
+                this.logger.info(`Input liveness confirmed for ${sessionName} after clearing a startup dialog`);
+                return true;
+            }
+        }
+
+        // No input box anywhere in the capture — this CLI's pane shape isn't
+        // one _composerBlock can read, so there is nothing to compare and no
+        // verdict to give. Assume live: killing a session we cannot judge would
+        // turn an unparsed pane layout into an outage for that whole CLI.
+        if (this._composerBlock(output) === null) {
+            this.logger.warn(`No input box found in ${sessionName} pane (cli=${cliType}) — skipping the liveness verdict`);
+            return true;
+        }
+
+        this.logger.warn(`No keystroke echo within ${timeoutMs}ms for ${sessionName} (cli=${cliType}) — TUI is not reading input`);
+        return false;
+    }
+
+    async _bootTmuxSessionOnce(sessionName, repoPath, cliCmd, sessionKey = null, cliType = 'claude', extraEnv = {}) {
         try {
             execSync('which tmux', { stdio: 'ignore' });
         } catch {
