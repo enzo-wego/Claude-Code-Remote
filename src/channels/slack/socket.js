@@ -68,6 +68,30 @@ const CREDENTIAL_HONESTY_PREAMBLE = [
     'fallback. If you did not test it, do not mention its status at all.',
 ].join('\n');
 
+// ─── Startup approval dialogs ──────────────────────────────────────────────
+//
+// Blocking prompts a fresh CLI can park on before it will read anything else:
+// server-delivered managed settings (Claude Team pushes these; a non-benign
+// key like OTEL_EXPORTER_OTLP_ENDPOINT triggers the consent dialog) and
+// folder trust. They never time out — they wait for a decision — and in an
+// 80x24 detached pane they are TALLER than the pane, so their `1. Yes …`
+// option lines render below the fold where the adapter's confirmationPrompts
+// and _autoApprove cannot see them. Matched on the header text, which stays
+// on screen. Two places need this: the readiness poll (the footer it waits
+// for cannot render while a dialog is up, so it would burn its full 60s
+// budget for nothing) and the liveness gate (which clears the dialog with a
+// single Enter — accepting is consistent with --dangerously-skip-permissions,
+// and it must be a real Enter, never a paste: pasting multi-line text into a
+// dialog delivers CR and accepts the highlighted option as a side effect,
+// which is what tripped Claude Code 2.1.221's freeze-after-accept bug and
+// killed three sessions on 2026-08-04).
+const STARTUP_APPROVAL_DIALOGS = [
+    /Managed settings require approval/i,
+    /Only accept if you trust your organization/i,
+    /trust (this|the) folder/i,
+    /Is this a project you created or one you trust\?/i,
+];
+
 // ─── Claude Code built-in LOCAL slash commands ─────────────────────────────
 //
 // Classification from an empirical survey of Claude Code 2.1.198 driven over
@@ -3913,14 +3937,8 @@ ${formatted}`,
         // Match the header text that does stay on screen. Accepting is
         // consistent with how these sessions are launched anyway
         // (--dangerously-skip-permissions).
-        const startupDialogs = [
-            /Managed settings require approval/i,
-            /Only accept if you trust your organization/i,
-            /trust (this|the) folder/i,
-            /Is this a project you created or one you trust\?/i,
-        ];
         const output = this._captureOutput(sessionName);
-        const matched = startupDialogs.find(re => re.test(output));
+        const matched = STARTUP_APPROVAL_DIALOGS.find(re => re.test(output));
         if (matched) {
             this.logger.warn(`Startup approval dialog blocking input in ${sessionName} (${matched}) — accepting the highlighted option`);
             try {
@@ -4012,6 +4030,20 @@ ${formatted}`,
                                 // Already dead
                             }
                             resolve({ ok: false, fatalError: fatal.reason });
+                            return;
+                        }
+                        // Parked on a blocking approval dialog: the footer this
+                        // loop waits for cannot render while one is up, so
+                        // polling on would just burn the whole readiness budget
+                        // (60s of dead waiting, measured 2026-08-04) before the
+                        // caller's liveness gate gets its turn. Hand over now —
+                        // the gate clears the dialog with one Enter and then
+                        // proves the TUI reads input, which is a stricter check
+                        // than this pane match anyway.
+                        const dialog = STARTUP_APPROVAL_DIALOGS.find(re => re.test(output));
+                        if (dialog) {
+                            this.logger.warn(`${cliType} parked on a startup approval dialog after ${elapsed}ms (${dialog}) — handing over to the liveness gate`);
+                            resolve({ ok: true, fatalError: null });
                             return;
                         }
                         if (readyAdapter.isReady && readyAdapter.isReady(output)) {
