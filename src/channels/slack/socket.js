@@ -3898,14 +3898,25 @@ ${formatted}`,
         return { ok: false, fatalError: null };
     }
 
-    // Type one harmless character and require the input box to change. Cheap,
-    // CLI-agnostic (each adapter's prompt char is handled by _composerBlock)
-    // and decisive: a live TUI echoes within a frame or two. The sentinel is
-    // cleared afterwards so the caller starts from an empty composer.
+    // Type a harmless sentinel and require the input box to COME BACK WITH IT.
+    // Cheap, CLI-agnostic (each adapter's prompt char is handled by
+    // _composerBlock) and decisive: a live TUI echoes within a frame or two.
+    // The sentinel is cleared afterwards so the caller starts from an empty
+    // composer.
+    //
+    // Requiring our own characters back — not merely "the box changed" — is
+    // what makes this a liveness test. Claude renders a dialog's options as
+    // `❯ 1. Yes, I trust these settings`, and `_composerBlock` locks onto the
+    // bottom-most prompt-char line, so while a dialog is up the "composer" it
+    // reads is the dialog's highlighted row: any repaint of it satisfied the
+    // old `changed` check for free. On 2026-08-05 a managed-settings dialog
+    // passed the gate that way in 3s, and the session it green-lit ate five
+    // pastes and stayed wedged for good (thread p1785914345748989).
     async _echoesKeystroke(sessionName, timeoutMs = 6000) {
+        const sentinel = 'zqx';
         const before = this._composerBlock(this._captureOutput(sessionName));
         try {
-            execSync(`tmux send-keys -t ${sessionName} -l "."`);
+            execSync(`tmux send-keys -t ${sessionName} -l "${sentinel}"`);
         } catch {
             return false; // pane already gone
         }
@@ -3913,7 +3924,7 @@ ${formatted}`,
         while (Date.now() < deadline) {
             await new Promise(r => setTimeout(r, 400));
             const now = this._composerBlock(this._captureOutput(sessionName));
-            if (now !== null && now !== before) {
+            if (now && now !== before && now.includes(sentinel)) {
                 await this._clearComposer(sessionName);
                 return true;
             }
@@ -3922,47 +3933,86 @@ ${formatted}`,
     }
 
     async _probeInputLiveness(sessionName, cliType = 'claude', timeoutMs = 6000) {
-        if (await this._echoesKeystroke(sessionName, timeoutMs)) {
-            this.logger.debug(`Input liveness confirmed for ${sessionName} (cli=${cliType})`);
-            return true;
-        }
-
-        // Not echoing — but a startup approval dialog swallows keystrokes
-        // exactly like a wedged TUI does, and unlike a wedge it is recoverable:
-        // Enter accepts the highlighted option (always the "yes, I trust …"
-        // one). Claude's managed-settings and folder-trust dialogs are TALLER
-        // than an 80x24 detached pane, so their `1. Yes …` lines render BELOW
-        // the fold — invisible to the adapter's confirmationPrompts and to
+        // Clear a startup approval dialog BEFORE probing. A dialog swallows
+        // keystrokes exactly like a wedged TUI does, and unlike a wedge it is
+        // recoverable: Enter accepts the highlighted option (always the
+        // "yes, I trust …" one), which is consistent with how these sessions
+        // are launched anyway (--dangerously-skip-permissions). It must be a
+        // real Enter, never a paste — see STARTUP_APPROVAL_DIALOGS.
+        //
+        // Claude's managed-settings and folder-trust dialogs are TALLER than
+        // an 80x24 detached pane, so their `1. Yes …` lines render BELOW the
+        // fold — invisible to the adapter's confirmationPrompts and to
         // _autoApprove, which is why the poller never rescued these boots.
-        // Match the header text that does stay on screen. Accepting is
-        // consistent with how these sessions are launched anyway
-        // (--dangerously-skip-permissions).
-        const output = this._captureOutput(sessionName);
-        const matched = STARTUP_APPROVAL_DIALOGS.find(re => re.test(output));
-        if (matched) {
-            this.logger.warn(`Startup approval dialog blocking input in ${sessionName} (${matched}) — accepting the highlighted option`);
+        // Match the header text that does stay on screen.
+        //
+        // Ordering is the whole point: probing first and only looking for a
+        // dialog after a failed probe (the shape this had until 2026-08-05)
+        // never reached the dialog branch at all, because the probe *passed*
+        // on dialog chrome. Claude Code 2.1.222 made that reachable daily —
+        // the org's remote managed settings (~/.claude/remote-settings.json)
+        // need approval, and the approval snapshot lives in process memory,
+        // so every fresh boot parks on the dialog.
+        // One Enter per dialog, and each one waits for its dialog to actually
+        // go away before the next is considered — accepting takes several
+        // seconds to repaint (Claude applies the settings and reloads plugins
+        // first), so a fixed short sleep sends surplus Enters into a TUI that
+        // has already gone live. The retries exist for STACKED dialogs
+        // (managed settings, then folder trust), not for impatience.
+        const maxAccepts = 3;
+        const dialogUp = () => STARTUP_APPROVAL_DIALOGS.find(re => re.test(this._captureOutput(sessionName)));
+        let lastDialog = null;
+        for (let attempt = 1; attempt <= maxAccepts; attempt++) {
+            const dialog = dialogUp();
+            if (!dialog) break;
+            lastDialog = dialog;
+            this.logger.warn(`Startup approval dialog blocking input in ${sessionName} (${dialog}) — accepting the highlighted option (${attempt}/${maxAccepts})`);
             try {
                 execSync(`tmux send-keys -t ${sessionName} Enter`);
             } catch {
-                return false;
+                return false; // pane gone
             }
-            await new Promise(r => setTimeout(r, 1500));
-            if (await this._echoesKeystroke(sessionName, timeoutMs)) {
-                this.logger.info(`Input liveness confirmed for ${sessionName} after clearing a startup dialog`);
-                return true;
+            const deadline = Date.now() + 8000;
+            while (Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 400));
+                if (!dialogUp()) break;
             }
+        }
+
+        // The echo probe is the authority, not the pane match: a live echo
+        // proves the TUI reads input even if the accepted dialog's header is
+        // still on screen (measured: it lingers ~5-7s after Enter). Rejecting
+        // on the lingering text alone would fail perfectly good boots.
+        if (await this._echoesKeystroke(sessionName, timeoutMs)) {
+            // Logged at info, not debug: when this gate misjudges a boot, the
+            // service log is the only record of which branch it took.
+            this.logger.info(`Input liveness confirmed for ${sessionName} (cli=${cliType})`);
+            return true;
+        }
+
+        const output = this._captureOutput(sessionName);
+        const stuckDialog = STARTUP_APPROVAL_DIALOGS.find(re => re.test(output));
+        if (stuckDialog) {
+            // Not echoing AND still parked. Never hand this session to the
+            // injector: every paste would be delivered into the dialog (each
+            // one accepting the highlighted option as a CR side effect — the
+            // 2026-08-05 wedge), and the user would get "Paste failed after 5
+            // attempts" with no hint that a dialog was up.
+            this.logger.error(`Startup approval dialog would not clear in ${sessionName} (${stuckDialog}) after ${maxAccepts} accepts`);
+            return false;
         }
 
         // No input box anywhere in the capture — this CLI's pane shape isn't
         // one _composerBlock can read, so there is nothing to compare and no
         // verdict to give. Assume live: killing a session we cannot judge would
-        // turn an unparsed pane layout into an outage for that whole CLI.
+        // turn an unparsed pane layout into an outage for that whole CLI. Safe
+        // only because a blocking dialog has been ruled out immediately above.
         if (this._composerBlock(output) === null) {
             this.logger.warn(`No input box found in ${sessionName} pane (cli=${cliType}) — skipping the liveness verdict`);
             return true;
         }
 
-        this.logger.warn(`No keystroke echo within ${timeoutMs}ms for ${sessionName} (cli=${cliType}) — TUI is not reading input`);
+        this.logger.warn(`No keystroke echo within ${timeoutMs}ms for ${sessionName} (cli=${cliType})${lastDialog ? ' after clearing a startup dialog' : ''} — TUI is not reading input`);
         return false;
     }
 
