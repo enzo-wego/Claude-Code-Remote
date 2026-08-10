@@ -325,7 +325,10 @@ async function handleViewSubmission({ body, view, client }) {
     askUserTool.resolvePending(requestId, { answers, status: 'ok' });
 
     if (client && channel && slackTs) {
-        await updateBootstrapWithAnswers(client, channel, slackTs, answers, body).catch((err) =>
+        // Not awaited: Slack's view_submission ack budget is 3s, and a slow
+        // chat.update (429/5xx retry backoff) would otherwise surface as a
+        // "trouble connecting" error on an answer resolvePending already recorded.
+        updateBootstrapWithAnswers(client, channel, slackTs, answers, body).catch((err) =>
             logger.warn(`failed to update bootstrap after modal submit: ${err.message}`),
         );
     }
