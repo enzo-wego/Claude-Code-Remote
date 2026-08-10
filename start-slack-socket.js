@@ -8,6 +8,10 @@
 const path = require('path');
 const fs = require('fs');
 const dotenv = require('dotenv');
+
+// Must run before any WebClient / Bolt App is constructed — see the module docs.
+require('./src/utils/slack-no-unfurl').installNoUnfurl();
+
 const Logger = require('./src/core/logger');
 const SlackSocketHandler = require('./src/channels/slack/socket');
 const { runDailySummary, parseChannelsConfig } = require('./src/services/daily-summary');

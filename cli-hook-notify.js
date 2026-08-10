@@ -16,6 +16,10 @@ const fs = require('fs');
 const crypto = require('crypto');
 const dotenv = require('dotenv');
 const { execSync } = require('child_process');
+
+// Must run before any WebClient is constructed — see the module docs.
+require('./src/utils/slack-no-unfurl').installNoUnfurl();
+
 const { postOncallDoubleCheck } = require('./src/services/oncall-mention');
 
 // Load environment variables from the project directory

@@ -8,6 +8,9 @@ const path = require('path');
 const envPath = path.join(__dirname, '.env');
 require('dotenv').config({ path: envPath });
 
+// Must run before any WebClient is constructed — see the module docs.
+require('./src/utils/slack-no-unfurl').installNoUnfurl();
+
 const Logger = require('./src/core/logger');
 const Notifier = require('./src/core/notifier');
 const ConfigManager = require('./src/core/config');
